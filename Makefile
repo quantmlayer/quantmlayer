@@ -2,7 +2,7 @@
 #
 # These targets are the project's CI gates. Every PR must pass `make check`.
 
-.PHONY: all check test test-priv fmt fmt-fix clippy benchmark bench-build clean \
+.PHONY: all check test test-priv fmt fmt-fix clippy benchmark bench-build overhead clean \
         build-release install uninstall install-apparmor uninstall-apparmor
 
 # Install layout (override with `make install PREFIX=/opt/quantmlayer`).
@@ -113,3 +113,12 @@ uninstall-apparmor:
 	-apparmor_parser -R $(APPARMOR_DST)
 	-rm -f $(APPARMOR_DST)
 	@echo "Removed AppArmor profile $(APPARMOR_DST)."
+
+# Measure per-call containment overhead (cold start, no pooling). Build first
+# with `make bench-build` (as your user); run under sudo for all walls.
+overhead:
+	@test -x target/release/ql-overhead || { \
+	  echo "Build the benchmark binaries first (as your normal user): make bench-build"; \
+	  exit 1; \
+	}
+	./target/release/ql-overhead

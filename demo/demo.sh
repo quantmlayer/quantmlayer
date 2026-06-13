@@ -112,4 +112,4 @@ good "^ the key is simply not there inside the cell. Blast radius: contained."
 sleep "$BEAT"
 
 headline "Containment is LEARNED from behavior and holds regardless of intent."
-note "github.com/quantmlayer/quantmlayer"
+note "github.com/<your-org>/quantmlayer"

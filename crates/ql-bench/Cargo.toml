@@ -28,3 +28,7 @@ path = "src/bin/ql-syscallprobe.rs"
 [[bin]]
 name = "ql-netprobe"
 path = "src/bin/ql-netprobe.rs"
+
+[[bin]]
+name = "ql-overhead"
+path = "src/bin/ql-overhead.rs"

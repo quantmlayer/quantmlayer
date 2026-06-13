@@ -4,9 +4,10 @@
 
 An autonomous coding agent runs with your shell's privileges: it can read `~/.ssh/id_rsa`, exfiltrate secrets, exhaust the host, ptrace other processes, or hit the cloud-metadata endpoint to steal cloud credentials. QuantmLayer wraps the agent in a kernel-enforced containment cell built from a portable, declarative profile, so a compromised or prompt-injected agent can't reach anything it wasn't explicitly granted.
 
-> **▶ See it in 45 seconds:** [`demo/`](demo/) runs the whole loop — *learn* a least-privilege profile by watching a coding agent, then watch the **same** profile block an SSH-key theft the agent never performed.
+> **▶ See it in 90 seconds:** [`demo/`](demo/) runs the whole loop — *learn* a least-privilege profile by watching a coding agent, then watch the **same** profile block an SSH-key theft the agent never performed.
 >
-> ![QuantmLayer demo](demo/quantmlayer-demo.gif)
+> <!-- After recording (see demo/README.md): drop the GIF in and uncomment -->
+> <!-- ![QuantmLayer demo](demo/quantmlayer-demo.gif) -->
 
 The defensible idea is the **learning**: enforcement alone is infrastructure, but automatically deriving a correct least-privilege profile from an agent's real behavior — so no human writes the rules — is what makes the containment usable at scale.
 
@@ -54,7 +55,7 @@ A default container blocks the two filesystem attacks (separate container filesy
 
 ## How this differs from cloud sandboxes (E2B, Daytona)
 
-Cloud sandboxes solve a related problem a different way: they run the agent on a **separate remote machine**. That gives strong host isolation — your laptop's files, SSH keys, and other secrets are never present on the remote sandbox, so there is nothing there to steal, and a runaway process is contained to a rented machine rather than yours. For running untrusted, AI-*generated* code, that model is a great fit.
+Cloud sandboxes like [E2B](https://e2b.dev) and [Daytona](https://daytona.io) solve a related problem a different way: they run the agent on a **separate remote machine**. That gives strong host isolation — your laptop's files, SSH keys, and other secrets are never present on the remote sandbox, so there is nothing there to steal, and a runaway process is contained to a rented machine rather than yours. For running untrusted, AI-*generated* code, that model is a great fit.
 
 The trade-offs are the other side of the same coin:
 
@@ -69,7 +70,7 @@ QuantmLayer is built for the opposite situation: contain an agent running **loca
 The system is a small Cargo workspace of focused crates:
 
 - **`ql-profile`** — the portable, OS-independent policy model (pure data; no OS dependencies). A profile declares filesystem, network, syscall, capability, and resource rules.
-- **`ql-learn`** — the *learning* half. It traces an agent's real syscalls (`openat`/`open` with read/write intent, `execve`, `connect`) via `ptrace`, then synthesizes a least-privilege profile from what the agent actually needed. Enforcement is mechanical; deciding *what* to enforce is the defensible part.
+- **`ql-learn`** — the *learning* half, and the moat. It traces an agent's real syscalls (`openat`/`open` with read/write intent, `execve`, `connect`) via `ptrace`, then synthesizes a least-privilege profile from what the agent actually needed. Enforcement is mechanical; deciding *what* to enforce is the defensible part. This is the dynamic counterpart to Decap's static capability derivation.
 - **`ql-enforce`** — the Linux enforcement engine. Each containment mechanism is an `Enforcer` (mount, namespaces, cgroups, seccomp, network), composed into a `Cell` that forks, applies the walls, and execs the agent. Fail-closed: if a wall can't be applied, the agent doesn't run.
 - **`ql-broker`** — an egress broker (HTTP `CONNECT` proxy) that enforces the profile's domain allow-list and refuses private/link-local addresses. Pure userspace, not Linux-specific.
 - **`ql-bench`** — the benchmark harness ("credibility engine") that runs the attack catalog against each backend and emits the scorecard above.
@@ -112,6 +113,9 @@ make test        # workspace tests
 make test-priv   # includes the privileged namespace integration tests
 make benchmark   # run the attack benchmark and render the scorecard
 ```
+
+Every source file begins with a comment naming its path, and the enforcement path contains no panics — a wall that can't be applied returns a structured error and the cell fails closed.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
