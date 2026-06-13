@@ -1,0 +1,17 @@
+[package]
+name = "ql-broker"
+description = "QuantmLayer egress broker: an HTTP CONNECT proxy that enforces a profile's domain allow-list and refuses private/link-local addresses (anti-SSRF). Pure userspace; not Linux-specific."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Pure-std implementation (threads, no async runtime) so the broker has a tiny
+# dependency surface and could run on any OS — it is the OS-portable half of
+# the network story, complementing the Linux-only netns floor in ql-enforce.
+[dependencies]
+ql-profile = { workspace = true }
+
+[[bin]]
+name = "ql-broker"
+path = "src/main.rs"

@@ -1,0 +1,24 @@
+# Rust build output
+/target
+
+# asciinema recordings — the final GIF is committed, raw casts are not
+*.cast
+
+# Generated benchmark artifacts — RESULTS.md is committed; these regenerate
+/benchmark/results.json
+/benchmark/results.csv
+/benchmark/results.png
+/benchmark/daytona_results.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets / local env
+.env
+*.key
+*.pem
+
+# OS / editor cruft
+.DS_Store
+*.swp

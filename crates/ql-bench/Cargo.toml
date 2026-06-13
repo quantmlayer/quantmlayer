@@ -1,0 +1,30 @@
+[package]
+name = "ql-bench"
+description = "QuantmLayer attack benchmark harness: runs a catalog of agent-escape attacks against each containment backend and reports which are blocked. The credibility engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "ql-bench"
+
+[dependencies]
+ql-profile = { workspace = true }
+ql-enforce = { workspace = true }
+libc = "0.2"
+nix = { workspace = true }
+
+[[bin]]
+name = "ql-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "ql-forkprobe"
+path = "src/bin/ql-forkprobe.rs"
+
+[[bin]]
+name = "ql-syscallprobe"
+path = "src/bin/ql-syscallprobe.rs"
+
+[[bin]]
+name = "ql-netprobe"
+path = "src/bin/ql-netprobe.rs"

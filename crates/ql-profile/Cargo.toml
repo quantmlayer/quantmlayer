@@ -1,0 +1,17 @@
+[package]
+name = "ql-profile"
+description = "QuantmLayer agent permission profiles: the pure, OS-independent, portable data model for least-privilege agent boundaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# INVARIANT: this crate must have ZERO OS-specific dependencies.
+# It must compile on Linux, macOS, Windows, and WASM. It is the portable
+# governance/export layer that survives even when we don't own the kernel.
+# Do not add `nix`, `libc`, `landlock`, `caps`, or any platform crate here.
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

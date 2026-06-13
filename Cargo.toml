@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ql-profile",
+    "crates/ql-enforce",
+    "crates/ql-bench",
+    "crates/ql-broker",
+    "crates/ql-cli",
+    "crates/ql-learn",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+# Shared dependency versions live here so every crate stays in lockstep.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+thiserror = "1"
+# OS-interface crate. Used ONLY by enforcement crates, never by ql-profile.
+nix = { version = "0.27", features = ["sched", "mount", "process", "user", "fs", "ptrace"] }
+libc = "0.2"
+ql-profile = { path = "crates/ql-profile" }
+ql-enforce = { path = "crates/ql-enforce" }
+ql-broker = { path = "crates/ql-broker" }
+ql-learn = { path = "crates/ql-learn" }

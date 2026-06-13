@@ -1,0 +1,20 @@
+[package]
+name = "ql-cli"
+description = "QuantmLayer command-line front door: `ql run` executes a command inside a containment cell, `ql validate` checks a profile, `ql broker` runs the egress proxy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The single binary that ties the libraries together for an operator. Argument
+# parsing is hand-rolled (no clap) to keep the dependency surface minimal and
+# consistent with the rest of the workspace.
+[dependencies]
+ql-profile = { workspace = true }
+ql-enforce = { workspace = true }
+ql-broker = { workspace = true }
+ql-learn = { workspace = true }
+
+[[bin]]
+name = "ql"
+path = "src/main.rs"

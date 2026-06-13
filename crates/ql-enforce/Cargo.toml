@@ -1,0 +1,25 @@
+[package]
+name = "ql-enforce"
+description = "QuantmLayer enforcement engine: constructs kernel-level containment cells from a portable ql-profile. Platform-specific (Linux)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# This crate is where ALL OS-specific code lives. It depends on the pure
+# `ql-profile` data model and translates it into real kernel enforcement.
+# New enforcement mechanisms are added here as new `Enforcer` implementations
+# WITHOUT modifying existing ones (see the `enforcers` module).
+[dependencies]
+ql-profile = { workspace = true }
+nix = { workspace = true }
+thiserror = { workspace = true }
+libc = "0.2"
+# Pure-Rust seccomp BPF filter generation (no libseccomp C dependency).
+# Targets classic seccomp-bpf, available on every enterprise kernel (3.5+).
+seccompiler = "0.4"
+
+# Linux-only crate. Guard the build so a mistaken macOS/Windows build fails
+# loudly rather than compiling a non-functional stub.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# (intentionally empty: see the compile_error! guard in lib.rs)
