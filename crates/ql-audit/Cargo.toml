@@ -1,0 +1,15 @@
+[package]
+name = "ql-audit"
+description = "QuantmLayer tamper-evident audit log: hash-chained records of containment-relevant actions (egress decisions, session lifecycle), independently verifiable."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Pure data + hashing — no OS dependencies, like ql-profile. The audit log is
+# part of the portable governance layer.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"

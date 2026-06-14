@@ -178,6 +178,6 @@ cgroup /sys/fs/cgroup/memory cgroup rw,memory 0 0
 none /tmp/p cgroup rw,pids 0 0
 cgroup2 /sys/fs/cgroup cgroup2 rw 0 0
 ";
-        assert!(matches!(CgroupBackend::find_v2(mounts), Some(_)));
+        assert!(CgroupBackend::find_v2(mounts).is_some());
     }
 }

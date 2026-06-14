@@ -63,11 +63,39 @@ pub fn cmd(args: &[String]) -> ExitCode {
         profile.filesystem.readwrite.push(format!("{ws}/**"));
     }
 
-    if brokered {
+    // Register this run so `ql ps` can list it and `ql kill` can revoke it
+    // from another shell. We record THIS process's pid — the parent of the
+    // contained agent — so revoking the tree takes the agent down with it.
+    let id = std::env::var("QL_CELL_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{:08x}", (std::process::id() as u128 ^ nanos()) as u32));
+    let handle = crate::registry::Handle {
+        id: id.clone(),
+        pid: std::process::id(),
+        command: command.join(" "),
+        profile: path.clone(),
+        started_ms: now_ms(),
+        brokered,
+    };
+    let _ = crate::registry::register(&handle);
+    eprintln!("ql: cell `{id}` running (revoke from another shell: ql kill {id})");
+
+    let code = if brokered {
         run_brokered(profile, command, verbose)
     } else {
         run_default(profile, command, verbose)
-    }
+    };
+    crate::registry::deregister(&id);
+    code
+}
+
+/// Current Unix time in milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Standard run: full containment with default-deny network.

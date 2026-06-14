@@ -1,0 +1,11 @@
+# Pins the exact toolchain used to build and gate QuantmLayer so `make check`
+# (rustfmt + clippy + tests) is reproducible on every machine and in CI.
+#
+# Clippy lints change between Rust releases, so without this pin the same code
+# can pass on one version and fail on another (which is exactly what bit us:
+# code that was clean on 1.75 tripped new idiom lints on 1.96). The *minimum*
+# version the code itself supports is tracked separately as `rust-version` in
+# Cargo.toml; this file pins the version the project is developed and linted on.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

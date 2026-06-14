@@ -49,12 +49,20 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
     if reader.read_line(&mut request_line)? == 0 {
         return Ok(()); // client closed
     }
-    // Drain the remaining request headers (up to the blank line).
+    // Drain the remaining request headers (up to the blank line), capturing the
+    // QuantmLayer authorization header (the agent's signed delegation token) if
+    // present.
+    let mut auth: Option<String> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
         if n == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("x-ql-authorization") {
+                auth = Some(value.trim().to_string());
+            }
         }
     }
 
@@ -77,10 +85,13 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
         None => return write_status(&mut client, 400, "Bad Request", "malformed authority"),
     };
 
-    // Allow-list check first — a denied host never triggers a DNS lookup.
-    if !policy.host_allowed(&host) {
-        log_decision(&host, port, "DENY (allow-list)");
-        return write_status(&mut client, 403, "Forbidden", "host not in allow-list");
+    // Authorize the connection: token-gated (a signed delegation token in the
+    // X-QL-Authorization header) when enabled, otherwise the static allow-list.
+    // A denied host never triggers a DNS lookup, and the decision is audited.
+    let now = ql_audit::AuditLog::now_millis();
+    if let Decision::Deny(reason) = policy.authorize_connect(&host, port, auth.as_deref(), now) {
+        log_decision(&host, port, "DENY (authorization)");
+        return write_status(&mut client, 403, "Forbidden", reason);
     }
 
     // Resolve, then apply the private-range check against every resolved IP.

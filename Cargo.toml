@@ -7,6 +7,8 @@ members = [
     "crates/ql-broker",
     "crates/ql-cli",
     "crates/ql-learn",
+    "crates/ql-audit",
+    "crates/ql-token",
 ]
 
 [workspace.package]
@@ -28,3 +30,5 @@ ql-profile = { path = "crates/ql-profile" }
 ql-enforce = { path = "crates/ql-enforce" }
 ql-broker = { path = "crates/ql-broker" }
 ql-learn = { path = "crates/ql-learn" }
+ql-audit = { path = "crates/ql-audit" }
+ql-token = { path = "crates/ql-token" }

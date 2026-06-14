@@ -1,0 +1,17 @@
+[package]
+name = "ql-token"
+description = "QuantmLayer agent identity and capability-attenuating delegation tokens (Ed25519): authority that only narrows down the agent tree, plus signed tool calls."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Pure crypto/data — no OS dependencies. ed25519-compact keeps the dependency
+# tree minimal (pure-Rust Ed25519) and builds on the project's pinned Rust.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+ed25519-compact = { version = "2", default-features = false }
+getrandom = "0.2"

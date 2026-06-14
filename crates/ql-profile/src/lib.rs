@@ -25,9 +25,13 @@
 #![forbid(unsafe_code)] // this crate is pure data; it must never need unsafe
 
 mod error;
+mod export;
 mod policy;
 
 pub use error::{ProfileError, Result};
+pub use export::{
+    to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,
+};
 pub use policy::{
     AgentType, CapPolicy, FsPolicy, NetPolicy, ProcPolicy, ResourceLimits, SeccompDefault,
     SyscallPolicy,
@@ -251,8 +255,10 @@ mod tests {
     }
 
     fn minimal_valid_coding() -> Profile {
-        let mut p = Profile::default();
-        p.agent_type = AgentType::Coding;
+        let mut p = Profile {
+            agent_type: AgentType::Coding,
+            ..Default::default()
+        };
         p.processes.allow_exec.push("/usr/bin/git".to_string());
         p
     }

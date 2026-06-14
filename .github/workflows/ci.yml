@@ -1,0 +1,36 @@
+# .github/workflows/ci.yml
+#
+# Runs the project's gate (`make check` = fmt + clippy + tests) on every push
+# and pull request, using the toolchain pinned in rust-toolchain.toml (1.96.0).
+# This is what catches formatting/lint/build drift BEFORE it reaches a machine —
+# the privileged containment tests (namespaces, mounts) are `#[ignore]`-gated and
+# run separately via `make test-priv` on a host where they're permitted.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel an in-progress run if a newer commit is pushed to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup honors rust-toolchain.toml and installs the pinned version plus
+      # its listed components (rustfmt, clippy). `rustup show` triggers that.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # Cache the cargo registry and target dir to keep runs fast.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the gate (fmt, clippy, tests)
+        run: make check

@@ -126,6 +126,35 @@ impl MountEnforcer {
     }
 }
 
+impl Enforcer for MountEnforcer {
+    fn name(&self) -> &'static str {
+        "mount"
+    }
+
+    /// Phase 2b (in-namespace): with the mount namespace already created and
+    /// the user namespace mapped to root, hide each denied path.
+    fn apply_in_namespace(&self, profile: &Profile, _ctx: &ChildContext) -> Result<()> {
+        // Step 1: detach our mount view from the host's propagation.
+        Self::make_root_private()?;
+
+        // Step 2: hide each denied path. A failure to hide ANY existing denied
+        // path is fail-closed: we return Err, the cell aborts, and the agent
+        // never runs. Better to refuse to start than to start with a leaky cage.
+        // A pattern that matches nothing on this host is fine (nothing to leak).
+        for pattern in &profile.filesystem.denied {
+            for target in Self::expand(pattern) {
+                match target.symlink_metadata() {
+                    Ok(meta) if meta.is_dir() => Self::hide_dir(&target)?,
+                    Ok(_) => Self::hide_file(&target)?,
+                    Err(_) => {} // vanished between expand and now; nothing to hide
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,34 +188,5 @@ mod tests {
     #[test]
     fn expand_nonexistent_is_empty() {
         assert!(MountEnforcer::expand("/no/such/path/*/x/**").is_empty());
-    }
-}
-
-impl Enforcer for MountEnforcer {
-    fn name(&self) -> &'static str {
-        "mount"
-    }
-
-    /// Phase 2b (in-namespace): with the mount namespace already created and
-    /// the user namespace mapped to root, hide each denied path.
-    fn apply_in_namespace(&self, profile: &Profile, _ctx: &ChildContext) -> Result<()> {
-        // Step 1: detach our mount view from the host's propagation.
-        Self::make_root_private()?;
-
-        // Step 2: hide each denied path. A failure to hide ANY existing denied
-        // path is fail-closed: we return Err, the cell aborts, and the agent
-        // never runs. Better to refuse to start than to start with a leaky cage.
-        // A pattern that matches nothing on this host is fine (nothing to leak).
-        for pattern in &profile.filesystem.denied {
-            for target in Self::expand(pattern) {
-                match target.symlink_metadata() {
-                    Ok(meta) if meta.is_dir() => Self::hide_dir(&target)?,
-                    Ok(_) => Self::hide_file(&target)?,
-                    Err(_) => {} // vanished between expand and now; nothing to hide
-                }
-            }
-        }
-
-        Ok(())
     }
 }

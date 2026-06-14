@@ -11,6 +11,8 @@ rust-version.workspace = true
 # the network story, complementing the Linux-only netns floor in ql-enforce.
 [dependencies]
 ql-profile = { workspace = true }
+ql-token = { workspace = true }
+ql-audit = { workspace = true }
 
 [[bin]]
 name = "ql-broker"

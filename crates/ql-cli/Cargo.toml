@@ -14,6 +14,11 @@ ql-profile = { workspace = true }
 ql-enforce = { workspace = true }
 ql-broker = { workspace = true }
 ql-learn = { workspace = true }
+ql-audit = { workspace = true }
+ql-token = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
 
 [[bin]]
 name = "ql"

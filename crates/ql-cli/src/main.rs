@@ -13,9 +13,14 @@
 //! Argument parsing is intentionally hand-rolled to keep the dependency
 //! surface minimal; each subcommand lives in its own module.
 
+mod audit;
 mod broker;
+mod export;
+mod kill;
 mod learn;
+mod registry;
 mod run;
+mod token;
 mod validate;
 
 use std::process::ExitCode;
@@ -29,6 +34,11 @@ fn main() -> ExitCode {
         Some("run") => run::cmd(&args[1..]),
         Some("learn") => learn::cmd(&args[1..]),
         Some("validate") => validate::cmd(&args[1..]),
+        Some("export") => export::cmd(&args[1..]),
+        Some("audit") => audit::cmd(&args[1..]),
+        Some("ps") => kill::cmd_ps(&args[1..]),
+        Some("kill") => kill::cmd_kill(&args[1..]),
+        Some("token") => token::cmd(&args[1..]),
         Some("broker") => broker::cmd(&args[1..]),
         Some("version") | Some("--version") | Some("-V") => {
             println!("ql {VERSION}");
@@ -55,6 +65,11 @@ fn print_usage() {
          \x20 ql run      --profile <p.yaml> [--workspace <dir>] [--verbose] [--broker] -- <cmd...>\n\
          \x20 ql learn    [--out <p.yaml>] [--verbose] -- <cmd...>\n\
          \x20 ql validate --profile <p.yaml>\n\
+         \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
+         \x20 ql audit    verify <log.jsonl> | append <log.jsonl> ...\n\
+         \x20 ql ps\n\
+         \x20 ql kill     <id> [--audit <log.jsonl>]\n\
+         \x20 ql token    demo | keygen\n\
          \x20 ql broker   --profile <p.yaml> [--listen 127.0.0.1:8080]\n\
          \x20 ql version\n\
          \n\

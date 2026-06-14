@@ -22,3 +22,5 @@ __pycache__/
 # OS / editor cruft
 .DS_Store
 *.swp
+run.log
+*.jsonl

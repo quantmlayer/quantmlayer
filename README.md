@@ -1,13 +1,14 @@
 # QuantmLayer
 
+[![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
+
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
 
 An autonomous coding agent runs with your shell's privileges: it can read `~/.ssh/id_rsa`, exfiltrate secrets, exhaust the host, ptrace other processes, or hit the cloud-metadata endpoint to steal cloud credentials. QuantmLayer wraps the agent in a kernel-enforced containment cell built from a portable, declarative profile, so a compromised or prompt-injected agent can't reach anything it wasn't explicitly granted.
 
 > **▶ See it in 90 seconds:** [`demo/`](demo/) runs the whole loop — *learn* a least-privilege profile by watching a coding agent, then watch the **same** profile block an SSH-key theft the agent never performed.
 >
-> <!-- After recording (see demo/README.md): drop the GIF in and uncomment -->
-> <!-- ![QuantmLayer demo](demo/quantmlayer-demo.gif) -->
+> ![QuantmLayer demo](demo/quantmlayer-demo.gif)
 
 The defensible idea is the **learning**: enforcement alone is infrastructure, but automatically deriving a correct least-privilege profile from an agent's real behavior — so no human writes the rules — is what makes the containment usable at scale.
 
@@ -32,6 +33,30 @@ ql run --broker --profile profiles/coding.yaml -- my-agent --task "..."
 
 # Inspect what a profile will enforce:
 ql validate --profile profiles/coding.yaml
+
+# Export the learned policy to a portable format other runtimes consume — an
+# OCI/Docker seccomp profile, or a `docker run` invocation. Each export is
+# explicit about what the target can and can't enforce (the gaps are where
+# local containment still matters):
+ql export --profile agent.yaml --format seccomp --out ql-seccomp.json
+ql export --profile agent.yaml --format docker  --out run.sh
+
+# Tamper-evident audit log: append hash-chained records of what the agent
+# attempted (e.g. egress decisions), then verify the chain. Anyone you hand the
+# log to can verify it wasn't altered — they don't have to trust the producer:
+ql audit append run.log --actor broker --action egress.connect \
+  --target 169.254.169.254:80 --decision deny --detail "cloud metadata blocked"
+ql audit verify run.log
+
+# Kill switch: list running cells, then revoke one instantly and completely —
+# the agent and every process it spawned — recording the revocation in the log:
+ql ps
+ql kill <id> --audit run.log
+
+# Agent identity + delegation tokens: authority that only narrows down the
+# agent tree (Ed25519). The demo issues a grant, attenuates it to a sub-agent,
+# and shows a broadening attempt rejected:
+ql token demo
 
 # Run the egress broker on its own (allow-listed network access):
 ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
@@ -72,7 +97,7 @@ The system is a small Cargo workspace of focused crates:
 - **`ql-profile`** — the portable, OS-independent policy model (pure data; no OS dependencies). A profile declares filesystem, network, syscall, capability, and resource rules.
 - **`ql-learn`** — the *learning* half, and the moat. It traces an agent's real syscalls (`openat`/`open` with read/write intent, `execve`, `connect`) via `ptrace`, then synthesizes a least-privilege profile from what the agent actually needed. Enforcement is mechanical; deciding *what* to enforce is the defensible part. This is the dynamic counterpart to Decap's static capability derivation.
 - **`ql-enforce`** — the Linux enforcement engine. Each containment mechanism is an `Enforcer` (mount, namespaces, cgroups, seccomp, network), composed into a `Cell` that forks, applies the walls, and execs the agent. Fail-closed: if a wall can't be applied, the agent doesn't run.
-- **`ql-broker`** — an egress broker (HTTP `CONNECT` proxy) that enforces the profile's domain allow-list and refuses private/link-local addresses. Pure userspace, not Linux-specific.
+- **`ql-broker`** — an egress broker (HTTP `CONNECT` proxy) that enforces the profile's domain allow-list and refuses private/link-local addresses. Optionally *token-gated*: with `--trust`, egress requires a valid signed delegation token (`ql-token`) whose capability permits the destination, and every decision is written to a tamper-evident audit log (`ql-audit`). Pure userspace, not Linux-specific.
 - **`ql-bench`** — the benchmark harness ("credibility engine") that runs the attack catalog against each backend and emits the scorecard above.
 - **`ql-cli`** — the `ql` command-line front door over all of the above.
 
