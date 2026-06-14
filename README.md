@@ -10,7 +10,6 @@ An autonomous coding agent runs with your shell's privileges: it can read `~/.ss
 >
 > ![QuantmLayer demo](demo/quantmlayer-demo.gif)
 
-The defensible idea is the **learning**: enforcement alone is infrastructure, but automatically deriving a correct least-privilege profile from an agent's real behavior — so no human writes the rules — is what makes the containment usable at scale.
 
 ## Quickstart
 
