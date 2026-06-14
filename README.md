@@ -77,9 +77,9 @@ Every row below is measured by a reproducible benchmark (`make benchmark`) — n
 
 A default container blocks the two filesystem attacks (separate container filesystem) but is exposed to the fork bomb, cross-process `ptrace`, and metadata SSRF — each of which needs a flag the operator must know to add (`--pids-limit`, a tightened seccomp profile, `--network none`). QuantmLayer derives and applies the equivalent restrictions automatically, from the agent's observed behavior, on the real host filesystem with no separate image.
 
-## How this differs from cloud sandboxes (E2B, Daytona)
+## How this differs from cloud sandboxes
 
-Cloud sandboxes like [E2B](https://e2b.dev) and [Daytona](https://daytona.io) solve a related problem a different way: they run the agent on a **separate remote machine**. That gives strong host isolation — your laptop's files, SSH keys, and other secrets are never present on the remote sandbox, so there is nothing there to steal, and a runaway process is contained to a rented machine rather than yours. For running untrusted, AI-*generated* code, that model is a great fit.
+Cloud sandboxes solve a related problem a different way: they run the agent on a **separate remote machine**. That gives strong host isolation — your laptop's files, SSH keys, and other secrets are never present on the remote sandbox, so there is nothing there to steal, and a runaway process is contained to a rented machine rather than yours. For running untrusted, AI-*generated* code, that model is a great fit.
 
 The trade-offs are the other side of the same coin:
 
