@@ -80,6 +80,12 @@ A default container blocks the two filesystem attacks (separate container filesy
 
 The exec row needs more than the others to reproduce: a kernel with BPF-LSM + IMA (check with [`scripts/ql-kernel-probe.sh`](scripts/ql-kernel-probe.sh)), an `lsm`-feature build, and root to load the BPF program — `cargo build --release -p ql-bench --features lsm && sudo ./target/release/ql-bench`. A default (toolchain-free) `make benchmark` runs the other five rows and honestly reports the exec row's QuantmLayer cell as `unsupported` rather than a fake block.
 
+### What it costs
+
+Containment this thorough is cheap enough to apply per invocation. On our dev VM (root, all walls), full least-privilege adds roughly **0.6 ms** per agent run over launching the binary uncontained — the five standard walls (mount, namespace, cgroup, seccomp, network) are effectively free. The content-addressed exec wall is the one cost driver: loading and attaching its BPF-LSM program adds about **15 ms** per cold cell. Even so, the heaviest configuration — all six walls — cold-starts roughly **9× faster than a fresh `docker run`** (~16 ms vs ~150 ms, container image pre-pulled); without the exec wall a cell starts well over 100× faster than a container.
+
+These are per-invocation *cold-start* numbers: every call builds a fresh cell, with no pooling. The exec wall's BPF program is loaded per cell today; a long-lived broker that loads it once and attaches it to each cell's cgroup drives that ~15 ms toward zero — just as `docker exec` into a long-lived container amortizes a container's startup. The figures are host-specific and generated, never asserted: see [`benchmark/OVERHEAD.md`](benchmark/OVERHEAD.md) and reproduce with `make overhead` (or, for the exec row, an `lsm` build run as root).
+
 ## How this differs from cloud sandboxes
 
 Cloud sandboxes solve a related problem a different way: they run the agent on a **separate remote machine**. That gives strong host isolation — your laptop's files, SSH keys, and other secrets are never present on the remote sandbox, so there is nothing there to steal, and a runaway process is contained to a rented machine rather than yours. For running untrusted, AI-*generated* code, that model is a great fit.
