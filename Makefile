@@ -114,11 +114,19 @@ uninstall-apparmor:
 	-rm -f $(APPARMOR_DST)
 	@echo "Removed AppArmor profile $(APPARMOR_DST)."
 
-# Measure per-call containment overhead (cold start, no pooling). Build first
-# with `make bench-build` (as your user); run under sudo for all walls.
+# Measure per-invocation containment overhead (cold start, no pooling) and
+# write benchmark/OVERHEAD.md. Build first with `make bench-build` (as your
+# user); run under sudo so all walls (incl. cgroups) are applied.
+#
+# The +exec row needs an `lsm` build + root + a BPF-LSM/IMA kernel. For the
+# FULL labeled table (all walls incl. content-addressed exec):
+#   cargo build --release -p ql-bench --features lsm
+#   sudo ./target/release/ql-overhead --md benchmark/OVERHEAD.md
+# A plain `make bench-build && sudo make overhead` writes the same file with the
+# exec row marked `unsupported` — honest for a toolchain-free build.
 overhead:
 	@test -x target/release/ql-overhead || { \
 	  echo "Build the benchmark binaries first (as your normal user): make bench-build"; \
 	  exit 1; \
 	}
-	./target/release/ql-overhead
+	./target/release/ql-overhead --md benchmark/OVERHEAD.md

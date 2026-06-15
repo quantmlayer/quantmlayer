@@ -143,6 +143,7 @@ make test-priv   # includes the privileged namespace integration tests
 make benchmark   # run the attack benchmark and render the scorecard
 ```
 
+Every source file begins with a comment naming its path, and the enforcement path contains no panics — a wall that can't be applied returns a structured error and the cell fails closed.
 
 ## License
 
