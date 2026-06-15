@@ -93,6 +93,19 @@ fn supervise(root: Pid) -> Result<Observation> {
         | Options::PTRACE_O_EXITKILL;
     ptrace::setoptions(root, opts).map_err(|e| LearnError::Trace(e.to_string()))?;
 
+    // Record the entry binary itself. Its `execve` is the initial post-`traceme`
+    // stop consumed just above, so it never passes through `decode_entry` — but
+    // it is the first thing the agent runs and the first `execve` enforcement
+    // will gate, so it must be in the learned exec set or a profile enforced
+    // from this run would deny the agent's own entry point. Resolve it from
+    // `/proc/<pid>/exe`, the real file the kernel exec'd (PATH- and symlink-
+    // resolved), so its content digest matches what the kernel hashes later.
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", root.as_raw())) {
+        if let Some(p) = exe.to_str() {
+            obs.record_exec(p.to_string());
+        }
+    }
+
     // Per-pid state: are we at a syscall *entry* (true) or *exit* (false next)?
     let mut at_entry: HashMap<Pid, bool> = HashMap::new();
     at_entry.insert(root, true);

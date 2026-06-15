@@ -10,3 +10,4 @@ rust-version.workspace = true
 ql-profile = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+sha2 = "0.10"

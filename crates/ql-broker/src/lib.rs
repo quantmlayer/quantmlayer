@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod nonce;
 mod policy;
 mod proxy;
 

@@ -43,22 +43,12 @@ impl CgroupEnforcer {
         CgroupEnforcer
     }
 
-    /// A unique leaf name for this cell instance, so concurrent cells don't
-    /// collide. Uses pid + a nanosecond suffix.
-    fn leaf_name() -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("quantmlayer-{}-{}", std::process::id(), nanos)
-    }
-
     /// Apply limits on a unified cgroup **v2** hierarchy.
     ///
     /// Returns `Ok(true)` if at least one limit was enforced, `Ok(false)` if
     /// the hierarchy advertised none of our controllers (nothing to do). Only
     /// genuine, unexpected I/O errors propagate as `Err`.
-    fn apply_v2(root: &Path, profile: &Profile, my_pid: u32) -> Result<bool> {
+    fn apply_v2(root: &Path, profile: &Profile, leaf_name: &str, my_pid: u32) -> Result<bool> {
         let available = fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
         let has = |c: &str| available.split_whitespace().any(|a| a == c);
 
@@ -81,7 +71,7 @@ impl CgroupEnforcer {
         // cgroup delegation), report "not applied" so the cell degrades to a
         // loud Unsupported warning and the other walls still protect the agent,
         // rather than failing the whole cell closed.
-        let leaf = root.join(Self::leaf_name());
+        let leaf = root.join(leaf_name);
         if fs::create_dir_all(&leaf).is_err() {
             return Ok(false);
         }
@@ -114,6 +104,7 @@ impl CgroupEnforcer {
         pids_mount: &Option<PathBuf>,
         memory_mount: &Option<PathBuf>,
         profile: &Profile,
+        leaf_name: &str,
         my_pid: u32,
     ) -> Result<bool> {
         let mut applied = false;
@@ -122,7 +113,7 @@ impl CgroupEnforcer {
         // best-effort: if we lack permission (unprivileged, no delegation) we
         // simply leave this controller unapplied rather than failing the cell.
         if let (Some(mount), Some(limit)) = (pids_mount, profile.resources.pids_max) {
-            let leaf = mount.join(Self::leaf_name());
+            let leaf = mount.join(leaf_name);
             if fs::create_dir_all(&leaf).is_ok() {
                 let _ = write_control(&leaf.join("pids.max"), &limit.to_string());
                 if write_control(&leaf.join("cgroup.procs"), &my_pid.to_string()).is_ok() {
@@ -133,7 +124,7 @@ impl CgroupEnforcer {
 
         // memory controller: create a leaf, set the limit, join (best-effort).
         if let (Some(mount), Some(limit)) = (memory_mount, profile.resources.memory_max_bytes) {
-            let leaf = mount.join(Self::leaf_name());
+            let leaf = mount.join(leaf_name);
             if fs::create_dir_all(&leaf).is_ok() {
                 let _ = write_control(&leaf.join("memory.limit_in_bytes"), &limit.to_string());
                 if write_control(&leaf.join("cgroup.procs"), &my_pid.to_string()).is_ok() {
@@ -154,16 +145,23 @@ impl Enforcer for CgroupEnforcer {
     /// Phase 2a (pre-userns, real root): set up and join the cgroup before the
     /// process enters a child user namespace and loses the ability to write
     /// host-owned cgroup files.
-    fn apply_pre_userns(&self, profile: &Profile, _ctx: &ChildContext) -> Result<()> {
-        // If the profile sets no limits, there is nothing to enforce.
-        if profile.resources.pids_max.is_none() && profile.resources.memory_max_bytes.is_none() {
+    fn apply_pre_userns(&self, profile: &Profile, ctx: &ChildContext) -> Result<()> {
+        // The cell decides — before fork — whether a cgroup is needed and, if
+        // so, its single shared leaf name. `None` means no cell cgroup is
+        // wanted (no resource limits and no exec enforcement): nothing to do.
+        // `Some(name)` means create and join that leaf even if the profile sets
+        // no resource limits, because a wall that needs the cgroup to exist
+        // (exec enforcement attaches an lsm_cgroup program to it) asked for it.
+        let Some(leaf_name) = ctx.cgroup_leaf.as_deref() else {
             return Ok(());
-        }
+        };
 
         let my_pid = std::process::id();
         let applied = match CgroupBackend::detect()? {
-            CgroupBackend::V2 { root } => Self::apply_v2(&root, profile, my_pid)?,
-            CgroupBackend::V1 { pids, memory } => Self::apply_v1(&pids, &memory, profile, my_pid)?,
+            CgroupBackend::V2 { root } => Self::apply_v2(&root, profile, leaf_name, my_pid)?,
+            CgroupBackend::V1 { pids, memory } => {
+                Self::apply_v1(&pids, &memory, profile, leaf_name, my_pid)?
+            }
         };
 
         // If the host advertised a backend but none of our controllers were

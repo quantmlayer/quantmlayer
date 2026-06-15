@@ -18,7 +18,7 @@ cargo build --release
 
 # THE MOAT — learn a least-privilege profile by observing an agent, then
 # enforce it. The generated profile reruns the agent fine but denies everything
-# it never needed (SSH keys, ptrace, network, ...):
+# it never needed (SSH keys, ptrace, network, binaries it never ran, ...):
 ql learn --out agent.yaml -- ./my-agent build
 ql run   --profile agent.yaml -- ./my-agent build
 
@@ -65,7 +65,7 @@ ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
 
 ## What it blocks
 
-Every row below is measured by a reproducible benchmark (`make benchmark`) — never asserted. **Docker** is a default `docker run` with the workspace mounted (no hardening flags); see the Methodology note in [`benchmark/RESULTS.md`](benchmark/RESULTS.md) for the exact configuration each tool is given and why.
+Every row below is measured by a reproducible benchmark (`make benchmark`) — never asserted. **Docker** is a default `docker run` with the workspace mounted (no hardening flags); each attack's exact scenario and target wall is documented under [`benchmark/`](benchmark/), and the live scorecard is regenerated into [`benchmark/RESULTS.md`](benchmark/RESULTS.md) on every run.
 
 | Attack | Wall | No containment | Docker | QuantmLayer |
 |---|---|---|---|---|
@@ -74,8 +74,11 @@ Every row below is measured by a reproducible benchmark (`make benchmark`) — n
 | Resource exhaustion (fork bomb) | cgroups | vulnerable | vulnerable | blocked |
 | Cross-process memory read / ptrace | seccomp | vulnerable | vulnerable | blocked |
 | Cloud-metadata SSRF | network | vulnerable | vulnerable | blocked |
+| Run an unauthorized tool (content-addressed exec) | exec | vulnerable | vulnerable | blocked |
 
-A default container blocks the two filesystem attacks (separate container filesystem) but is exposed to the fork bomb, cross-process `ptrace`, and metadata SSRF — each of which needs a flag the operator must know to add (`--pids-limit`, a tightened seccomp profile, `--network none`). QuantmLayer derives and applies the equivalent restrictions automatically, from the agent's observed behavior, on the real host filesystem with no separate image.
+A default container blocks the two filesystem attacks (separate container filesystem) but is exposed to the fork bomb, cross-process `ptrace`, and metadata SSRF — each of which needs a flag the operator must know to add (`--pids-limit`, a tightened seccomp profile, `--network none`). The last row is the sharpest: **content-addressed execution has no container flag to add.** A default container runs any binary it ships; QuantmLayer hashes every binary at `execve` and admits only those on the learned allow-list, so a tool the agent never used — a freshly dropped payload, a `curl` pulled in by a prompt injection — cannot start, denied by the kernel on content. QuantmLayer derives and applies all of these restrictions automatically, from the agent's observed behavior, on the real host filesystem with no separate image.
+
+The exec row needs more than the others to reproduce: a kernel with BPF-LSM + IMA (check with [`scripts/ql-kernel-probe.sh`](scripts/ql-kernel-probe.sh)), an `lsm`-feature build, and root to load the BPF program — `cargo build --release -p ql-bench --features lsm && sudo ./target/release/ql-bench`. A default (toolchain-free) `make benchmark` runs the other five rows and honestly reports the exec row's QuantmLayer cell as `unsupported` rather than a fake block.
 
 ## How this differs from cloud sandboxes
 
@@ -95,7 +98,8 @@ The system is a small Cargo workspace of focused crates:
 
 - **`ql-profile`** — the portable, OS-independent policy model (pure data; no OS dependencies). A profile declares filesystem, network, syscall, capability, and resource rules.
 - **`ql-learn`** — the *learning* half, and the moat. It traces an agent's real syscalls (`openat`/`open` with read/write intent, `execve`, `connect`) via `ptrace`, then synthesizes a least-privilege profile from what the agent actually needed. Enforcement is mechanical; deciding *what* to enforce is the defensible part. This is the dynamic counterpart to Decap's static capability derivation.
-- **`ql-enforce`** — the Linux enforcement engine. Each containment mechanism is an `Enforcer` (mount, namespaces, cgroups, seccomp, network), composed into a `Cell` that forks, applies the walls, and execs the agent. Fail-closed: if a wall can't be applied, the agent doesn't run.
+- **`ql-enforce`** — the Linux enforcement engine. Each containment mechanism is an `Enforcer` (mount, namespaces, cgroups, seccomp, network, and — behind the `lsm` feature — content-addressed `execve`), composed into a `Cell` that forks, applies the walls, and execs the agent. Fail-closed: if a wall can't be applied, the agent doesn't run.
+- **`ql-lsm`** — the content-addressed exec wall: a sleepable BPF-LSM program that hashes each binary at `execve` (via the kernel's IMA) and permits only the digests on the profile's allow-list, so a binary the agent never ran is denied by content, not by name. Built behind `ql-enforce`'s `lsm` feature and excluded from the default workspace because it needs a BPF/`clang` toolchain to compile — every other crate builds with no special tooling.
 - **`ql-broker`** — an egress broker (HTTP `CONNECT` proxy) that enforces the profile's domain allow-list and refuses private/link-local addresses. Optionally *token-gated*: with `--trust`, egress requires a valid signed delegation token (`ql-token`) whose capability permits the destination, and every decision is written to a tamper-evident audit log (`ql-audit`). Pure userspace, not Linux-specific.
 - **`ql-bench`** — the benchmark harness ("credibility engine") that runs the attack catalog against each backend and emits the scorecard above.
 - **`ql-cli`** — the `ql` command-line front door over all of the above.
@@ -104,7 +108,7 @@ The split is deliberate: `ql-profile` is the portable contract, `ql-enforce` is 
 
 ## Platform support
 
-The kernel containment layer targets Linux and works on every current enterprise kernel (RHEL 8/9, all current Ubuntu LTS, Amazon Linux) — namespaces, mount isolation, classic seccomp-bpf, and cgroups (both v1 and v2 are supported). Where a host lacks a specific control, that wall degrades to a clearly-reported "unsupported" rather than failing the whole cell. The broker is pure userspace and runs anywhere. Brokered egress (`ql run --broker`) additionally uses `iproute2` (the ubiquitous `ip` tool) to wire the veth uplink.
+The kernel containment layer targets Linux and works on every current enterprise kernel (RHEL 8/9, all current Ubuntu LTS, Amazon Linux) — namespaces, mount isolation, classic seccomp-bpf, and cgroups (both v1 and v2 are supported). Where a host lacks a specific control, that wall degrades to a clearly-reported "unsupported" rather than failing the whole cell. The content-addressed exec wall is the one with stricter requirements: it needs a kernel built with BPF-LSM and IMA (Linux ≥ 5.7 with `bpf` in the active LSM list) and is compiled only in an `lsm`-feature build; where either is missing, exec enforcement reports "unsupported" like any other wall while the rest of the cell holds. The broker is pure userspace and runs anywhere. Brokered egress (`ql run --broker`) additionally uses `iproute2` (the ubiquitous `ip` tool) to wire the veth uplink.
 
 Both **x86-64** and **aarch64** (ARM64) are supported, including profile learning: syscall numbers are resolved per-architecture and the tracer reads registers via the architecture's native ptrace interface, so `ql learn` works on Apple Silicon VMs and AWS Graviton as well as on x86-64 hosts.
 
@@ -126,8 +130,9 @@ Which walls are active in each posture:
 | Syscall denial (seccomp) | ✅ | ✅ |
 | Network default-deny / egress broker | ✅ | ✅ |
 | Resource limits (cgroups: pids/memory) | ⚠️ only with cgroup delegation | ✅ |
+| Content-addressed exec (BPF-LSM) | ❌ needs root + `lsm` build | ✅ with a BPF-LSM/IMA kernel |
 
-The cgroup wall is the one exception to rootless parity: writing cgroup limits needs either root or a delegated cgroup subtree (e.g. a `systemd` user slice with `Delegate=yes`). Without it, that wall degrades to a clearly-printed "unavailable" warning and the cell continues — so on a stock rootless host the file/syscall/network containment is fully in force, but the fork-bomb / memory limits are not. Run under root (or set up delegation) when resource limits matter.
+The cgroup wall is the one exception to rootless parity: writing cgroup limits needs either root or a delegated cgroup subtree (e.g. a `systemd` user slice with `Delegate=yes`). Without it, that wall degrades to a clearly-printed "unavailable" warning and the cell continues — so on a stock rootless host the file/syscall/network containment is fully in force, but the fork-bomb / memory limits are not. Run under root (or set up delegation) when resource limits matter. The exec wall is gated similarly: loading its BPF-LSM program needs root and a BPF-LSM/IMA kernel, and it is compiled only in an `lsm`-feature build — so it is inactive in the default rootless posture and active when you run a `--features lsm` build as root.
 
 ## Development
 
@@ -138,7 +143,6 @@ make test-priv   # includes the privileged namespace integration tests
 make benchmark   # run the attack benchmark and render the scorecard
 ```
 
-Every source file begins with a comment naming its path, and the enforcement path contains no panics — a wall that can't be applied returns a structured error and the cell fails closed.
 
 ## License
 

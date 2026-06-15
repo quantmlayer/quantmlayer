@@ -12,6 +12,14 @@ ql-profile = { workspace = true }
 ql-enforce = { workspace = true }
 libc = "0.2"
 nix = { workspace = true }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+# Forwards to ql-enforce's exec wall (BPF-LSM) and pulls in sha2 for hashing
+# the authorized binary in the unauthorized-exec benchmark row. Off by default
+# so `make check` stays toolchain-free; build `--features lsm` to measure the
+# exec row on a host with the kernel features and root.
+lsm = ["ql-enforce/lsm", "dep:sha2"]
 
 [[bin]]
 name = "ql-bench"

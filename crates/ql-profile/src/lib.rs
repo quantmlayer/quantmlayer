@@ -33,8 +33,8 @@ pub use export::{
     to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,
 };
 pub use policy::{
-    AgentType, CapPolicy, FsPolicy, NetPolicy, ProcPolicy, ResourceLimits, SeccompDefault,
-    SyscallPolicy,
+    AgentType, CapPolicy, ExecDigest, ExecDigestError, ExecPolicy, FsPolicy, HashAlgo, NetPolicy,
+    ProcPolicy, ResourceLimits, SeccompDefault, SyscallPolicy,
 };
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,11 @@ pub struct Profile {
     /// Child-process policy.
     #[serde(default)]
     pub processes: ProcPolicy,
+
+    /// Content-addressed execution policy (approved binary content digests).
+    /// Additive over `processes`; off unless `exec.enforce` is set.
+    #[serde(default)]
+    pub exec: ExecPolicy,
 }
 
 impl Profile {
@@ -128,6 +133,17 @@ impl Profile {
             ));
         }
 
+        // Content-addressed exec, when enabled, is strictly allow-listed. An
+        // enabled-but-empty digest set would deny every exec — almost always a
+        // mistake, since the digests are normally produced by `ql learn`.
+        if self.exec.enforce && self.exec.allow_digests.is_empty() {
+            return Err(ProfileError::validation(
+                "exec.allow_digests",
+                "exec.enforce=true with no allow_digests would deny every exec; \
+                 add approved digests (e.g. via `ql learn`) or set enforce=false",
+            ));
+        }
+
         // If network is not default-deny, we require an explicit acknowledgement
         // via a non-empty allow list; an "allow everything" profile must be
         // deliberate, not the result of an empty section.
@@ -171,6 +187,7 @@ impl Default for Profile {
             syscalls: SyscallPolicy::default(),
             resources: ResourceLimits::default(),
             processes: ProcPolicy::default(),
+            exec: ExecPolicy::default(),
         }
     }
 }
@@ -252,6 +269,70 @@ mod tests {
         p.network.default_deny = false;
         p.network.allow_domains.clear();
         assert!(p.validate().is_err());
+    }
+
+    /// Content-addressed exec is inactive by default and grants no digests.
+    #[test]
+    fn exec_policy_inactive_by_default() {
+        let p = Profile::default();
+        assert!(!p.exec.enforce);
+        assert!(p.exec.allow_digests.is_empty());
+    }
+
+    /// An ExecDigest round-trips through its `"<algo>:<hex>"` string form, both
+    /// standalone and inside a profile (YAML and JSON).
+    #[test]
+    fn exec_digest_roundtrips_as_string() {
+        let s = "sha256:bf7c7360f1d567ad9dfeee7a8749c601c351a46fd60bb6e735aa65883435590c";
+        let d: ExecDigest = s.parse().expect("valid digest parses");
+        assert_eq!(d.algo(), HashAlgo::Sha256);
+        assert_eq!(d.to_string(), s);
+        assert_eq!(d.to_bytes().len(), 32);
+        assert_eq!(d.to_bytes()[0], 0xbf);
+
+        let mut p = minimal_valid_coding();
+        p.exec.enforce = true;
+        p.exec.allow_digests.push(d);
+        p.validate().expect("profile with a digest is valid");
+
+        let yaml = p.to_yaml().expect("to yaml");
+        assert_eq!(Profile::from_yaml(&yaml).expect("from yaml"), p);
+        let json = p.to_json().expect("to json");
+        assert_eq!(Profile::from_json(&json).expect("from json"), p);
+    }
+
+    /// Malformed digests are rejected at construction, never stored.
+    #[test]
+    fn exec_digest_rejects_malformed() {
+        assert!("bf7c7360".parse::<ExecDigest>().is_err()); // no algo prefix
+        assert!("md5:abcd".parse::<ExecDigest>().is_err()); // unknown algo
+        assert!("sha256:zzzz".parse::<ExecDigest>().is_err()); // non-hex + short
+        assert!("sha256:bf7c".parse::<ExecDigest>().is_err()); // too short
+        assert!(ExecDigest::new(HashAlgo::Sha256, "a".repeat(64)).is_ok());
+        assert!(ExecDigest::new(HashAlgo::Sha256, "a".repeat(63)).is_err());
+        // Uppercase hex is accepted and normalized to lowercase.
+        let d = ExecDigest::new(HashAlgo::Sha256, "A".repeat(64)).expect("uppercase ok");
+        assert_eq!(d.hex(), "a".repeat(64).as_str());
+    }
+
+    /// enforce=true with an empty allow-list is a trap and must be rejected.
+    #[test]
+    fn rejects_enforced_exec_with_no_digests() {
+        let mut p = minimal_valid_coding();
+        p.exec.enforce = true;
+        p.exec.allow_digests.clear();
+        assert!(p.validate().is_err());
+    }
+
+    /// The IMA algorithm ids must match the kernel contract (SHA-256 == 4),
+    /// or the enforcement layer would misinterpret a digest.
+    #[test]
+    fn hash_algo_ima_ids_match_kernel() {
+        assert_eq!(HashAlgo::Sha1.ima_id(), 2);
+        assert_eq!(HashAlgo::Sha256.ima_id(), 4);
+        assert_eq!(HashAlgo::Sha384.ima_id(), 5);
+        assert_eq!(HashAlgo::Sha512.ima_id(), 6);
+        assert_eq!(HashAlgo::Sha256.digest_len(), 32);
     }
 
     fn minimal_valid_coding() -> Profile {

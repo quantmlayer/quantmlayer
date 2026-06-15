@@ -20,6 +20,7 @@
 
 #![deny(missing_docs)]
 
+mod digest;
 mod error;
 mod observation;
 mod synth;
@@ -32,8 +33,20 @@ pub use synth::{synthesize, SynthResult};
 /// Trace `command` to completion and synthesize a least-privilege profile from
 /// what it did. Returns the profile, the notes, and the raw observation.
 pub fn learn(command: &[String]) -> Result<LearnOutcome> {
-    let observation = trace::trace(command)?;
-    let SynthResult { profile, notes } = synthesize(&observation);
+    let mut observation = trace::trace(command)?;
+
+    // Turn the observed exec *paths* into content digests before synthesis, so
+    // the learned profile can pin the agent's executable set by content. This
+    // is the bridge to kernel-side content-addressed exec enforcement.
+    let (digests, mut notes) = digest::hash_executables(&observation.execs);
+    observation.exec_digests = digests;
+
+    let SynthResult {
+        profile,
+        notes: synth_notes,
+    } = synthesize(&observation);
+    notes.extend(synth_notes);
+
     Ok(LearnOutcome {
         profile,
         notes,

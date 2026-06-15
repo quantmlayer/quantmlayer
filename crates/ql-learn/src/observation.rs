@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use ql_profile::ExecDigest;
+
 /// Everything the tracer learned from one (or more) processes in a run.
 #[derive(Debug, Default, Clone)]
 pub struct Observation {
@@ -21,6 +23,9 @@ pub struct Observation {
     pub writes: BTreeSet<PathBuf>,
     /// Program paths passed to `execve`.
     pub execs: BTreeSet<String>,
+    /// SHA-256 content digests of the binaries in `execs`, keyed by path.
+    /// Filled by the hashing pass after tracing; empty until then.
+    pub exec_digests: BTreeMap<String, ExecDigest>,
     /// Network endpoints the agent attempted to `connect` to.
     pub connects: BTreeSet<(IpAddr, u16)>,
     /// Raw syscall numbers observed, with a human-readable name when known.

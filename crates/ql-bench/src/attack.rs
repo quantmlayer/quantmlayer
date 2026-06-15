@@ -73,5 +73,11 @@ pub fn catalog() -> Vec<Attack> {
             target_wall: "network",
             status: Status::Runnable,
         },
+        Attack {
+            id: "unauthorized_exec",
+            title: "Run an unauthorized tool (content-addressed exec)",
+            target_wall: "exec",
+            status: Status::Runnable,
+        },
     ]
 }

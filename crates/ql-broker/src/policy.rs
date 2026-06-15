@@ -19,6 +19,7 @@
 //! relying on unstable standard-library helpers, because this is exactly the
 //! kind of security-critical logic that should be auditable at a glance.
 
+use crate::nonce::{NonceCheck, NonceStore};
 use ql_audit::{AuditEvent, AuditLog, Decision as AuditDecision};
 use ql_profile::NetPolicy;
 use ql_token::{authorize, Action, AuthzRequest, PublicId};
@@ -78,6 +79,10 @@ pub struct BrokerPolicy {
     trusted_roots: Vec<PublicId>,
     /// Optional tamper-evident audit sink for egress decisions.
     audit: Option<Arc<AuditSink>>,
+    /// Per-leaf-token anti-replay state for token-gated egress, shared across
+    /// connection threads. A signed action is admitted only if its nonce is
+    /// fresh for its leaf token (see [`crate::nonce`]).
+    nonce_store: Arc<NonceStore>,
 }
 
 impl BrokerPolicy {
@@ -89,6 +94,7 @@ impl BrokerPolicy {
             block_private_ranges: np.block_private_ranges,
             trusted_roots: Vec::new(),
             audit: None,
+            nonce_store: Arc::new(NonceStore::new()),
         }
     }
 
@@ -130,7 +136,9 @@ impl BrokerPolicy {
                     Err(_) => Decision::Deny("malformed authorization token"),
                     Ok(req) => match authorize(&req, &self.trusted_roots, now_ms) {
                         Ok(Action::NetConnect { domain }) if host_matches(host, &domain) => {
-                            Decision::Allow
+                            // Chain and action are valid and authorize this
+                            // host; the final gate is per-leaf anti-replay.
+                            self.admit_unless_replay(&req, now_ms)
                         }
                         Ok(_) => Decision::Deny("token does not authorize this host"),
                         Err(_) => Decision::Deny("invalid authorization token"),
@@ -158,6 +166,26 @@ impl BrokerPolicy {
             });
         }
         decision
+    }
+
+    /// Per-leaf anti-replay gate. The signed action commits to its leaf token,
+    /// so `(leaf hash, nonce)` is the replay key: admit the action iff that
+    /// nonce is fresh for the leaf, otherwise refuse it as a replayed token.
+    /// Assumes the chain was already verified by `authorize` (hence non-empty).
+    fn admit_unless_replay(&self, req: &AuthzRequest, now_ms: u64) -> Decision {
+        let leaf = req
+            .chain
+            .last()
+            .expect("authorize verified a non-empty chain");
+        match self.nonce_store.check_and_record(
+            &leaf.hash(),
+            req.action.body.nonce,
+            leaf.body.not_after_ms,
+            now_ms,
+        ) {
+            NonceCheck::Fresh => Decision::Allow,
+            NonceCheck::Replay => Decision::Deny("replayed authorization token"),
+        }
     }
 
     /// Is this host permitted by the allow-list (ignoring its resolved IPs)?
@@ -304,6 +332,7 @@ mod tests {
             block_private_ranges: true,
             trusted_roots: vec![],
             audit: None,
+            nonce_store: Arc::new(NonceStore::new()),
         };
         assert!(p.host_allowed("pypi.org"));
         assert!(p.host_allowed("files.pypi.org"));
@@ -319,6 +348,7 @@ mod tests {
             block_private_ranges: true,
             trusted_roots: vec![],
             audit: None,
+            nonce_store: Arc::new(NonceStore::new()),
         };
         // Allowed host, public IP → allow.
         assert_eq!(
@@ -350,6 +380,7 @@ mod token_gating_tests {
             block_private_ranges: true,
             trusted_roots: roots,
             audit: None,
+            nonce_store: Arc::new(NonceStore::new()),
         }
     }
 
@@ -387,6 +418,71 @@ mod token_gating_tests {
         assert_eq!(
             p.authorize_connect("pypi.org", 443, Some(&blob), 0),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn replayed_authorization_is_rejected() {
+        let root = Identity::generate().unwrap();
+        let agent = Identity::generate().unwrap();
+        let p = gated_policy(vec![root.public()]);
+        // authz mints nonce 1; this first presentation is fresh and allowed.
+        let blob = authz(&root, &agent, "pypi.org", "pypi.org");
+        assert_eq!(
+            p.authorize_connect("pypi.org", 443, Some(&blob), 0),
+            Decision::Allow
+        );
+        // Re-presenting the identical signed action (same leaf, same nonce) is a
+        // replay and is refused — even though the token itself is still valid.
+        assert_eq!(
+            p.authorize_connect("pypi.org", 443, Some(&blob), 0),
+            Decision::Deny("replayed authorization token")
+        );
+    }
+
+    #[test]
+    fn fresh_nonce_admitted_then_old_nonce_replays() {
+        let root = Identity::generate().unwrap();
+        let agent = Identity::generate().unwrap();
+        let p = gated_policy(vec![root.public()]);
+
+        // Several actions on the SAME leaf token, signed with rising nonces.
+        let cap = Capability {
+            net_domains: vec!["pypi.org".into()],
+            ..Default::default()
+        };
+        let rt = issue_root(&root, &agent.public(), cap, 0).unwrap();
+        let blob_with = |nonce: u64| {
+            let action = sign_action(
+                &agent,
+                Action::NetConnect {
+                    domain: "pypi.org".into(),
+                },
+                &rt.hash(),
+                nonce,
+            )
+            .unwrap();
+            ql_token::AuthzRequest {
+                chain: vec![rt.clone()],
+                action,
+            }
+            .to_hex()
+            .unwrap()
+        };
+
+        // nonce 1 then nonce 2: both fresh, both admitted.
+        assert_eq!(
+            p.authorize_connect("pypi.org", 443, Some(&blob_with(1)), 0),
+            Decision::Allow
+        );
+        assert_eq!(
+            p.authorize_connect("pypi.org", 443, Some(&blob_with(2)), 0),
+            Decision::Allow
+        );
+        // Returning to nonce 1 is now a replay (below the high-water mark).
+        assert_eq!(
+            p.authorize_connect("pypi.org", 443, Some(&blob_with(1)), 0),
+            Decision::Deny("replayed authorization token")
         );
     }
 

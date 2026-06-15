@@ -79,13 +79,20 @@ use ql_profile::Profile;
 ///   denies `mount`/`unshare`/etc., so it must run after those setup steps or
 ///   it would block the cell's own construction.
 pub fn standard_coding_cell(profile: Profile) -> Result<Cell> {
-    Cell::builder(profile)
+    // Fail closed: a profile that requests exec enforcement requires this crate
+    // to be built with the `lsm` feature (see `ensure_exec_supported`).
+    ensure_exec_supported(&profile)?;
+    let builder = Cell::builder(profile.clone())
         .with_enforcer(Box::new(CgroupEnforcer::new()))
         .with_enforcer(Box::new(NamespaceEnforcer::new()))
         .with_enforcer(Box::new(MountEnforcer::new()))
         .with_enforcer(Box::new(NetworkEnforcer::new()))
-        .with_enforcer(Box::new(SeccompEnforcer::new()))
-        .build()
+        .with_enforcer(Box::new(SeccompEnforcer::new()));
+    // When exec enforcement is enabled (and `lsm` is built in), this adds a
+    // host-side hook that attaches the content-addressed exec wall to the
+    // cell's cgroup in the same sync window the veth hook uses; otherwise it is
+    // a no-op and the cell keeps its no-hook fast path.
+    with_exec_wall(builder, &profile).build()
 }
 
 /// Build a coding-agent cell with **brokered** network egress.
@@ -101,12 +108,133 @@ pub fn brokered_coding_cell(
     plan: veth::VethPlan,
     proxy_url: String,
 ) -> Result<Cell> {
-    Cell::builder(profile)
+    ensure_exec_supported(&profile)?;
+    Cell::builder(profile.clone())
         .with_enforcer(Box::new(CgroupEnforcer::new()))
         .with_enforcer(Box::new(NamespaceEnforcer::new()))
         .with_enforcer(Box::new(MountEnforcer::new()))
         .with_enforcer(Box::new(NetworkEnforcer::with_proxy(proxy_url)))
         .with_enforcer(Box::new(SeccompEnforcer::new()))
-        .with_parent_hook(Box::new(move |pid| veth::wire(pid, &plan)))
+        .with_parent_hook(brokered_parent_hook(plan, &profile))
         .build()
+}
+
+// --- exec-enforcement integration (feature `lsm`) -------------------------
+//
+// The content-addressed exec wall is attached host-side, in the parent hook,
+// after the child has joined its cgroup (the pre-userns phase) and signaled
+// ready but before it execs the agent — so the agent's first exec is already
+// gated. Because the hook's `Err` path is fail-closed (the child sees EOF on
+// the go-pipe and refuses to exec), a failed attach refuses the run rather
+// than letting the agent escape the wall.
+
+/// Fail-closed guard tying the runtime policy (`exec.enforce`) to the build.
+/// With `lsm` on, exec enforcement is available, so this is a no-op. With it
+/// off, a profile that asks for the wall is refused rather than silently run
+/// without it.
+#[cfg(feature = "lsm")]
+fn ensure_exec_supported(_profile: &Profile) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "lsm"))]
+fn ensure_exec_supported(profile: &Profile) -> Result<()> {
+    if profile.exec.enforce {
+        return Err(EnforceError::Unsupported {
+            feature: "exec",
+            reason: "exec enforcement requested but the `lsm` feature is not built in".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Add the standalone exec-enforcement hook to a builder when the profile
+/// enables it. No-op when `lsm` is off (a requested wall is already rejected by
+/// `ensure_exec_supported`, so reaching here with `enforce` set is impossible).
+#[cfg(feature = "lsm")]
+fn with_exec_wall(builder: CellBuilder, profile: &Profile) -> CellBuilder {
+    if !profile.exec.enforce {
+        return builder;
+    }
+    let prof = profile.clone();
+    builder.with_parent_hook(Box::new(move |pid| attach_exec_wall(pid, &prof)))
+}
+
+#[cfg(not(feature = "lsm"))]
+fn with_exec_wall(builder: CellBuilder, _profile: &Profile) -> CellBuilder {
+    builder
+}
+
+/// Build the brokered cell's single parent hook. It always wires the veth pair;
+/// when exec enforcement is enabled (and `lsm` is built in) it also attaches the
+/// exec wall in the same host-side step. The fail-closed wrapper in `Cell::run`
+/// covers both — if either returns `Err`, the child refuses to exec.
+#[cfg(feature = "lsm")]
+fn brokered_parent_hook(plan: veth::VethPlan, profile: &Profile) -> cell::ParentHook {
+    if profile.exec.enforce {
+        let prof = profile.clone();
+        Box::new(move |pid| {
+            veth::wire(pid, &plan)?;
+            attach_exec_wall(pid, &prof)
+        })
+    } else {
+        Box::new(move |pid| veth::wire(pid, &plan))
+    }
+}
+
+#[cfg(not(feature = "lsm"))]
+fn brokered_parent_hook(plan: veth::VethPlan, _profile: &Profile) -> cell::ParentHook {
+    Box::new(move |pid| veth::wire(pid, &plan))
+}
+
+/// Attach the content-addressed exec wall to the cell's cgroup, then keep the
+/// BPF link alive for the cell's lifetime by leaking it (unpinned).
+#[cfg(feature = "lsm")]
+fn attach_exec_wall(pid: nix::unistd::Pid, profile: &Profile) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let dir = cell_cgroup_dir_for_pid(pid.as_raw())?;
+    let cgroup = std::fs::File::open(&dir).map_err(|e| {
+        EnforceError::enforcer(
+            "exec",
+            format!("opening cell cgroup {}: {e}", dir.display()),
+        )
+    })?;
+    let enforcer = ql_lsm::ExecEnforcer::attach(profile, cgroup.as_raw_fd())
+        .map_err(|e| EnforceError::enforcer("exec", format!("attaching exec wall: {e}")))?;
+
+    // Hold the link WITHOUT pinning to bpffs: an unpinned link auto-detaches
+    // when this process exits, which is exactly right for the one-shot `ql run`
+    // model. TODO: a long-lived process running many cells should own this
+    // handle and drop it per-cell instead of leaking it here.
+    std::mem::forget(enforcer);
+    Ok(())
+}
+
+/// Resolve the cell's cgroup-v2 directory from a pid via the unified (`0::`)
+/// entry of `/proc/<pid>/cgroup`. Read by the parent in the host cgroup
+/// namespace, so the path is absolute from the v2 root. Exec enforcement is a
+/// cgroup-v2 mechanism (`lsm_cgroup`); a v1-only host is reported Unsupported.
+#[cfg(feature = "lsm")]
+fn cell_cgroup_dir_for_pid(pid: i32) -> Result<std::path::PathBuf> {
+    let root = match cgroups::CgroupBackend::detect()? {
+        cgroups::CgroupBackend::V2 { root } => root,
+        cgroups::CgroupBackend::V1 { .. } => {
+            return Err(EnforceError::Unsupported {
+                feature: "exec",
+                reason: "exec enforcement requires cgroup v2 (lsm_cgroup)".into(),
+            })
+        }
+    };
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map_err(|e| EnforceError::enforcer("exec", format!("reading /proc/{pid}/cgroup: {e}")))?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            return Ok(root.join(rest.trim_start_matches('/')));
+        }
+    }
+    Err(EnforceError::enforcer(
+        "exec",
+        "no cgroup v2 entry in /proc/<pid>/cgroup for the cell",
+    ))
 }

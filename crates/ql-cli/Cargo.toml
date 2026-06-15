@@ -23,3 +23,9 @@ libc = { workspace = true }
 [[bin]]
 name = "ql"
 path = "src/main.rs"
+
+[features]
+# Forward the exec-enforcement wall down to ql-enforce. Off by default so the
+# default workspace build stays toolchain-free; build with the eBPF toolchain:
+#   cargo build -p ql-cli --features lsm
+lsm = ["ql-enforce/lsm"]

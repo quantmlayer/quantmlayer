@@ -1,0 +1,29 @@
+# crates/ql-lsm/Cargo.toml
+#
+# Standalone (workspace-excluded) crate: kernel-side content-addressed exec
+# enforcement via BPF-LSM. It is excluded from the workspace because building it
+# requires the eBPF toolchain (clang, and libelf/zlib for the vendored libbpf in
+# libbpf-sys). Build it directly:  `cd crates/ql-lsm && cargo build`.
+#
+# Because it is excluded, dependency/version inheritance from the workspace is
+# not available, so versions are pinned explicitly here.
+
+[package]
+name = "ql-lsm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+description = "QuantmLayer kernel-side content-addressed exec enforcement (Linux BPF-LSM)."
+
+[dependencies]
+ql-profile = { path = "../ql-profile" }
+libbpf-rs = "0.24"
+thiserror = "1"
+
+[build-dependencies]
+libbpf-cargo = "0.24"
+
+[dev-dependencies]
+sha2 = "0.10" # the runtime demo hashes /bin/true to build an allow-list
+libc = "0.2"  # EPERM, to recognize a denied exec

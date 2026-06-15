@@ -3,14 +3,17 @@
 //! Containment backends and the execution of runnable attacks.
 //!
 //! A [`Backend`] is a way to run a command under some containment regime. We
-//! ship two:
+//! ship three:
 //!
 //! * [`Backend::None`] — no containment (the baseline; shows the attack works).
+//! * [`Backend::Docker`] — a default `docker run` agent container (workspace
+//!   bind-mounted, no extra hardening flags); the common "just containerize
+//!   the agent" baseline.
 //! * [`Backend::QuantmLayer`] — our cell from `ql-enforce`.
 //!
-//! Additional backends (Docker, E2B, Daytona) are intentionally left as future
-//! work: they implement the same idea (run argv under their sandbox) and slot
-//! in as new variants without changing the catalog or the report.
+//! Further backends (E2B, Daytona) are intentionally left as future work: they
+//! implement the same idea (run argv under their sandbox) and slot in as new
+//! variants without changing the catalog or the report.
 //!
 //! ## Observation channels
 //!
@@ -31,6 +34,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[cfg(feature = "lsm")]
+use ql_profile::{ExecDigest, ExecPolicy, HashAlgo};
 
 /// The result of running one attack under one backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +306,10 @@ pub fn run(backend: Backend, attack: &Attack) -> std::io::Result<Outcome> {
     if attack.id == "ssrf_metadata" {
         return run_ssrf(backend);
     }
+    // The unauthorized-exec attack runs a tool the agent never learned.
+    if attack.id == "unauthorized_exec" {
+        return run_unauthorized_exec(backend);
+    }
 
     let sandbox = Sandbox::prepare(attack.id)?;
     let argv = sandbox.exfil_argv();
@@ -476,6 +486,23 @@ fn probe_path(name: &str) -> Option<PathBuf> {
     let dir = exe.parent()?;
     let candidate = dir.join(name);
     candidate.exists().then_some(candidate)
+}
+
+/// The sibling probe binaries that several attacks shell out to. They are
+/// separate `[[bin]]` targets built into the same directory as `ql-bench`.
+const PROBE_BINS: &[&str] = &["ql-forkprobe", "ql-syscallprobe", "ql-netprobe"];
+
+/// Which probe helpers are missing next to this binary. When non-empty, the
+/// attacks that need them can only report `Unsupported` — almost always
+/// because `cargo run -p ql-bench` built just this binary, not its siblings.
+pub fn missing_probes() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    for &name in PROBE_BINS {
+        if probe_path(name).is_none() {
+            missing.push(name);
+        }
+    }
+    missing
 }
 
 // ---------------------------------------------------------------------------
@@ -723,4 +750,131 @@ fn ensure_pids_controller() -> bool {
         && CgroupBackend::detect()
             .map(|b| b.supports_pids())
             .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Unauthorized-exec attack (content-addressed execve)
+// ---------------------------------------------------------------------------
+
+/// Run the unauthorized-exec attack: an authorized shell tries to launch a
+/// tool the agent never ran during learning. The secret it would steal is
+/// fully *readable* here — we are testing the exec wall, not filesystem
+/// hiding. The only question is whether the unlearned tool may execute.
+///
+/// * Baseline (`None`): the tool runs → it copies the secret into loot →
+///   VULNERABLE.
+/// * Docker: a default container runs any binary it ships; the tool runs →
+///   VULNERABLE. No container runtime content-addresses `execve`.
+/// * QuantmLayer: the exec wall hashes each binary at `execve`; the shell is
+///   on the learned allow-list but the tool is not → the kernel denies it
+///   (EPERM) → loot empty → BLOCKED. Only in an `lsm`-feature build; otherwise
+///   honestly `Unsupported`.
+fn run_unauthorized_exec(backend: Backend) -> std::io::Result<Outcome> {
+    let base =
+        std::env::temp_dir().join(format!("ql-bench-exec-{}-{}", std::process::id(), nanos()));
+    let workspace = base.join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    // The secret lives INSIDE the workspace and is readable. The point is not
+    // that it is hidden — it is that the tool needed to take it cannot run.
+    let secret = workspace.join("secret.txt");
+    fs::write(&secret, SECRET_MARKER)?;
+    let loot = workspace.join("loot.txt");
+
+    // `cat` is the unauthorized tool: the shell (the authorized entry point)
+    // tries to exec it to copy the secret. The shell opens `> loot` before the
+    // exec, so a denied exec leaves loot empty rather than absent.
+    let script = format!(
+        "cat {secret} > {loot} 2>/dev/null; true",
+        secret = shell_quote(secret.to_str().unwrap()),
+        loot = shell_quote(loot.to_str().unwrap()),
+    );
+    let argv = ["/bin/sh".to_string(), "-c".to_string(), script];
+
+    match backend {
+        Backend::None => {
+            let _ = Command::new(&argv[0]).args(&argv[1..]).status()?;
+        }
+        Backend::Docker => {
+            // A default container imposes no exec allow-list, so the tool runs.
+            match docker_run_script(&workspace, &[], &argv[2]) {
+                DockerRun::Ran => {}
+                DockerRun::Unavailable => return Ok(Outcome::Unsupported),
+            }
+        }
+        Backend::QuantmLayer => {
+            #[cfg(feature = "lsm")]
+            {
+                let cell = standard_coding_cell(exec_attack_profile(&workspace))
+                    .expect("cell builds for a valid profile");
+                let _ = cell.run(&argv).expect("cell runs the attack");
+            }
+            #[cfg(not(feature = "lsm"))]
+            {
+                // The exec wall is compiled behind the `lsm` feature; this
+                // build cannot attach it. Honest: rebuild `--features lsm`.
+                return Ok(Outcome::Unsupported);
+            }
+        }
+    }
+
+    let exfiltrated = fs::read_to_string(&loot)
+        .map(|s| s.contains(SECRET_MARKER))
+        .unwrap_or(false);
+    let _ = fs::remove_dir_all(&base);
+
+    Ok(if exfiltrated {
+        Outcome::Vulnerable
+    } else {
+        Outcome::Blocked
+    })
+}
+
+/// Profile for the unauthorized-exec attack: nothing hidden on the filesystem
+/// (the secret is readable), but `exec.enforce` is on and the allow-list holds
+/// only the shell's content digest — the tool the attack invokes is omitted,
+/// so its `execve` is denied by content.
+#[cfg(feature = "lsm")]
+fn exec_attack_profile(workspace: &Path) -> Profile {
+    let mut p = Profile::from_yaml(include_str!("../../../profiles/coding.yaml"))
+        .expect("bundled coding.yaml must parse");
+    p.filesystem.denied = vec![];
+    p.filesystem.readwrite = vec![
+        format!("{}/**", workspace.to_str().unwrap()),
+        "/tmp/**".to_string(),
+    ];
+    // Authorize only the shell that the cell execs as its entry point. `/bin/sh`
+    // is a symlink to dash; reading it follows the link, so this digest matches
+    // the kernel's IMA hash of the resolved binary.
+    let sh = sha256_exec_digest("/bin/sh").expect("hash the shell binary");
+    p.exec = ExecPolicy {
+        enforce: true,
+        allow_digests: vec![sh],
+    };
+    p
+}
+
+/// SHA-256 a binary's contents into an [`ExecDigest`], streaming in chunks so a
+/// large binary is never read whole into memory.
+#[cfg(feature = "lsm")]
+fn sha256_exec_digest(path: &str) -> std::io::Result<ExecDigest> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut hex = String::with_capacity(64);
+    for b in hasher.finalize().iter() {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    ExecDigest::new(HashAlgo::Sha256, hex)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad exec digest"))
 }

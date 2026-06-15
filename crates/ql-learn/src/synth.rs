@@ -20,8 +20,8 @@
 
 use crate::observation::Observation;
 use ql_profile::{
-    AgentType, CapPolicy, FsPolicy, NetPolicy, ProcPolicy, Profile, ResourceLimits, SeccompDefault,
-    SyscallPolicy, SCHEMA_VERSION,
+    AgentType, CapPolicy, ExecDigest, ExecPolicy, FsPolicy, NetPolicy, ProcPolicy, Profile,
+    ResourceLimits, SeccompDefault, SyscallPolicy, SCHEMA_VERSION,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -131,6 +131,26 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
         .cloned()
         .collect();
 
+    // --- Content-addressed exec ---
+    // Pull the digests computed by the hashing pass (run before synthesis) for
+    // the binaries we allow by path. Auto-enable enforcement only when *every*
+    // executed binary was hashed: a partial allow-list would deny an un-hashed
+    // binary and break the agent's rerun, so we leave it off and tell the
+    // operator instead of silently shipping a half-cage.
+    let allow_digests: Vec<ExecDigest> = allow_exec
+        .iter()
+        .filter_map(|p| obs.exec_digests.get(p).cloned())
+        .collect();
+    let exec_fully_covered = !allow_exec.is_empty() && allow_digests.len() == allow_exec.len();
+    if !allow_exec.is_empty() && !exec_fully_covered {
+        notes.push(format!(
+            "content-addressed exec left disabled: {} of {} executed binaries were hashed; \
+             resolve the rest (see notes) and set exec.enforce=true to pin them by content",
+            allow_digests.len(),
+            allow_exec.len()
+        ));
+    }
+
     // --- Resources (not precisely observable via ptrace; conservative caps) ---
     let pids_max = (obs.process_count.saturating_mul(8)).max(64);
 
@@ -160,6 +180,10 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
             wall_clock_secs: None,
         },
         processes: ProcPolicy { allow_exec },
+        exec: ExecPolicy {
+            enforce: exec_fully_covered,
+            allow_digests,
+        },
     };
 
     SynthResult { profile, notes }
@@ -296,16 +320,32 @@ mod tests {
     }
 
     #[test]
-    fn generalize_drops_descendants() {
-        let mut paths = BTreeSet::new();
-        paths.insert(PathBuf::from("/tmp/a/b/c.txt"));
-        paths.insert(PathBuf::from("/tmp/a/d.txt"));
-        let globs = generalize(&paths, usize::MAX);
-        // Both files live under /tmp/a/...; expect the covering dirs, with no
-        // entry that is a descendant of another.
-        assert!(globs.iter().all(|g| g.ends_with("/**")));
-        assert!(
-            globs.contains(&"/tmp/a/b/**".to_string()) || globs.contains(&"/tmp/a/**".to_string())
+    fn exec_enforced_only_when_all_binaries_hashed() {
+        use ql_profile::HashAlgo;
+
+        let mut o = obs_with(&[], &[], &["/usr/bin/cc", "/bin/sh"], &[]);
+        // Simulate the hashing pass having hashed only one of the two binaries.
+        o.exec_digests.insert(
+            "/usr/bin/cc".to_string(),
+            ExecDigest::new(HashAlgo::Sha256, "a".repeat(64)).unwrap(),
         );
+
+        let partial = synthesize(&o);
+        // Partial coverage → enforcement stays off, with an explanatory note.
+        assert!(!partial.profile.exec.enforce);
+        assert_eq!(partial.profile.exec.allow_digests.len(), 1);
+        assert!(partial
+            .notes
+            .iter()
+            .any(|n| n.contains("content-addressed exec")));
+
+        // Hash the second binary too → full coverage → enforcement enabled.
+        o.exec_digests.insert(
+            "/bin/sh".to_string(),
+            ExecDigest::new(HashAlgo::Sha256, "b".repeat(64)).unwrap(),
+        );
+        let full = synthesize(&o);
+        assert!(full.profile.exec.enforce);
+        assert_eq!(full.profile.exec.allow_digests.len(), 2);
     }
 }

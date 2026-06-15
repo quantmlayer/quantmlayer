@@ -10,6 +10,10 @@ members = [
     "crates/ql-audit",
     "crates/ql-token",
 ]
+# ql-lsm needs the BPF build toolchain (clang + libelf/zlib via libbpf-sys), so
+# it is kept out of the default workspace build and built standalone. This keeps
+# `make check` runnable on machines without the eBPF toolchain.
+exclude = ["crates/ql-lsm"]
 
 [workspace.package]
 version = "0.1.0"

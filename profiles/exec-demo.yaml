@@ -1,0 +1,70 @@
+# QuantmLayer demo profile: content-addressed exec enforcement.
+#
+# Approves ONLY /bin/true, by content digest. Built with the `lsm` feature,
+# `ql run` attaches a kernel BPF-LSM wall to the cell's cgroup that hashes
+# every binary at execve and permits it only if its digest is listed here.
+# Deny-by-default and path-independent: an approved binary runs no matter
+# where it lives; any other binary is denied at execve (EPERM), so the cell
+# refuses to run it.
+#
+# seccomp is left permissive (default allow, no execve notify) on purpose, so
+# this demo isolates the *exec* wall — the only thing gating execve here is the
+# content digest, not the syscall filter.
+#
+# The digest below is sha256(/bin/true) on this VM. Verify or replace with:
+#   printf 'sha256:%s\n' "$(sha256sum /bin/true | cut -d' ' -f1)"
+
+schema_version: 1
+agent_type: coding
+
+exec:
+  enforce: true
+  allow_digests:
+    - "sha256:bf7c7360f1d567ad9dfeee7a8749c601c351a46fd60bb6e735aa65883435590c"
+
+filesystem:
+  readwrite:
+    - "/tmp/agent/**"
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+  denied:
+    - "/home/**"
+    - "/root/**"
+    - "/sys/**"
+
+network:
+  default_deny: true
+  block_private_ranges: true
+  allow_domains: []
+
+capabilities:
+  retain: []
+
+syscalls:
+  default_action: allow
+  deny:
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+  notify: []
+
+resources:
+  memory_max_bytes: 1073741824   # 1 GiB
+  cpu_max_percent: 100           # 1 core
+  pids_max: 128
+  wall_clock_secs: 60
+
+processes:
+  allow_exec:
+    - "/bin/true"

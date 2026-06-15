@@ -32,6 +32,19 @@ fn main() {
 
     let attacks = attack::catalog();
 
+    // Preflight: several attacks shell out to sibling probe binaries that
+    // `cargo run -p ql-bench` does NOT build (it builds only this binary). If
+    // they're absent, those rows can only report `unsupported`; say why.
+    let missing = backends::missing_probes();
+    if !missing.is_empty() {
+        eprintln!(
+            "ql-bench: missing probe helper(s): {}. \
+             Run `cargo build -p ql-bench`, then `./target/debug/ql-bench`. \
+             Without them, those attacks report `unsupported`, not a real result.",
+            missing.join(", ")
+        );
+    }
+
     // Run the full matrix, collecting outcomes as we go.
     // results[i] = (attack, [outcome per backend]).
     let mut results: Vec<(attack::Attack, Vec<Outcome>)> = Vec::new();

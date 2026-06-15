@@ -18,6 +18,18 @@ libc = "0.2"
 # Pure-Rust seccomp BPF filter generation (no libseccomp C dependency).
 # Targets classic seccomp-bpf, available on every enterprise kernel (3.5+).
 seccompiler = "0.4"
+# Optional: the content-addressed exec-enforcement wall. Pulls in `ql-lsm`
+# (libbpf-rs + a BPF build), so it is gated behind the `lsm` feature and OFF by
+# default — the default-feature workspace build (`make check`) compiles without
+# it and needs no eBPF toolchain. `ql-lsm` is excluded from the workspace for
+# the same reason; it is referenced here only by path and built solely when
+# `lsm` is enabled.
+ql-lsm = { path = "../ql-lsm", optional = true }
+
+[features]
+# Compile the exec-enforcement wall into the cell. Build/verify only on a host
+# with the eBPF toolchain: `cargo build -p ql-enforce --features lsm`.
+lsm = ["dep:ql-lsm"]
 
 # Linux-only crate. Guard the build so a mistaken macOS/Windows build fails
 # loudly rather than compiling a non-functional stub.

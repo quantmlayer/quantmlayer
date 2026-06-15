@@ -71,6 +71,19 @@ impl Cell {
         })
     }
 
+    /// The cell's single shared cgroup leaf name, computed once **before**
+    /// `fork` so the parent and the contained child agree on one identity. The
+    /// child creates and joins it (see [`crate::enforcers::CgroupEnforcer`]);
+    /// host-side walls that must act on the cell's cgroup reference the same
+    /// name. Unique per launch (pid + nanosecond suffix).
+    fn cell_cgroup_leaf_name() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("quantmlayer-cell-{}-{}", std::process::id(), nanos)
+    }
+
     /// Run `command` (argv form; `command[0]` is the program) inside the cell.
     ///
     /// Returns the child's exit code on normal exit. The agent command is only
@@ -86,6 +99,16 @@ impl Cell {
         let host_gid = Gid::current().as_raw();
 
         let ns_flags = self.required_namespaces();
+
+        // Decide the cell's cgroup identity BEFORE fork, so the parent and the
+        // child agree on one name. A cgroup is needed when the profile sets a
+        // resource limit OR when exec enforcement is on (the exec wall attaches
+        // an lsm_cgroup program to this leaf). When neither holds, no cgroup is
+        // created and the leaf is `None` — behavior is unchanged from before.
+        let needs_cgroup = self.profile.resources.pids_max.is_some()
+            || self.profile.resources.memory_max_bytes.is_some()
+            || self.profile.exec.enforce;
+        let cgroup_leaf: Option<String> = needs_cgroup.then(Self::cell_cgroup_leaf_name);
 
         // A sync channel is created ONLY when a parent hook is registered.
         // Without a hook this is `None` and the fork path below is identical to
@@ -141,19 +164,25 @@ impl Cell {
             ForkResult::Child => {
                 // Child: build the cage, then exec. Any failure here must NOT
                 // result in running the command, so we exit non-zero instead.
-                let exit_code =
-                    match self.run_child(ns_flags, host_uid, host_gid, command, sync.as_ref()) {
-                        Ok(()) => unreachable!("run_child only returns on error; success execs"),
-                        Err(e) => {
-                            // The cage could not be built. Fail closed: do not
-                            // exec. Always say which wall failed and why — a
-                            // silent refusal is impossible to operate. Exit 126
-                            // = "command found but not executed", here meaning
-                            // "refused to run uncontained".
-                            eprintln!("ql-enforce: refusing to run agent uncontained: {e}");
-                            126
-                        }
-                    };
+                let exit_code = match self.run_child(
+                    ns_flags,
+                    host_uid,
+                    host_gid,
+                    command,
+                    sync.as_ref(),
+                    cgroup_leaf.as_deref(),
+                ) {
+                    Ok(()) => unreachable!("run_child only returns on error; success execs"),
+                    Err(e) => {
+                        // The cage could not be built. Fail closed: do not
+                        // exec. Always say which wall failed and why — a
+                        // silent refusal is impossible to operate. Exit 126
+                        // = "command found but not executed", here meaning
+                        // "refused to run uncontained".
+                        eprintln!("ql-enforce: refusing to run agent uncontained: {e}");
+                        126
+                    }
+                };
                 // We must not return into the parent's call stack from the child.
                 std::process::exit(exit_code);
             }
@@ -170,13 +199,17 @@ impl Cell {
         host_gid: u32,
         command: &[String],
         sync: Option<&SyncPipes>,
+        cgroup_leaf: Option<&str>,
     ) -> Result<()> {
         // Close the parent's ends of the sync pipes in this process up front.
         if let Some(sync) = sync {
             sync.child_close_parent_ends();
         }
 
-        let ctx = ChildContext::new(host_uid, host_gid);
+        let mut ctx = ChildContext::new(host_uid, host_gid);
+        if let Some(leaf) = cgroup_leaf {
+            ctx = ctx.with_cgroup_leaf(leaf.to_string());
+        }
 
         // --- Phase 2a: pre-userns, while still REAL ROOT ---
         // Operations on host-owned resources (cgroups) must happen here,
