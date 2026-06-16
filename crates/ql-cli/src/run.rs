@@ -26,6 +26,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
 
     let mut profile_path: Option<String> = None;
     let mut workspace: Option<String> = None;
+    let mut audit_path: Option<String> = None;
     let mut verbose = false;
     let mut brokered = false;
 
@@ -34,6 +35,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         match a.as_str() {
             "--profile" => profile_path = it.next().cloned(),
             "--workspace" => workspace = it.next().cloned(),
+            "--audit" => audit_path = it.next().cloned(),
             "--verbose" => verbose = true,
             "--broker" => brokered = true,
             other => {
@@ -80,6 +82,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
     };
     let _ = crate::registry::register(&handle);
     eprintln!("ql: cell `{id}` running (revoke from another shell: ql kill {id})");
+
+    // Tamper-evident policy record: commit to the policy that will govern this
+    // session, and the reason for each grant, before the agent runs.
+    if let Some(audit) = audit_path.as_deref() {
+        let project_root = std::env::current_dir().ok();
+        match crate::policy::record_enforced(audit, &profile, project_root.as_deref()) {
+            Ok(n) => eprintln!("ql: wrote {n} policy record(s) to {audit}"),
+            Err(e) => eprintln!("ql run: could not write policy log {audit}: {e}"),
+        }
+    }
 
     let code = if brokered {
         run_brokered(profile, command, verbose)

@@ -29,7 +29,7 @@ mod trace;
 
 pub use error::{LearnError, Result};
 pub use observation::Observation;
-pub use risk::build_risk_report;
+pub use risk::{build_risk_report, risk_report_for_profile};
 pub use synth::{synthesize, SynthResult};
 
 /// Trace `command` to completion and synthesize a least-privilege profile from

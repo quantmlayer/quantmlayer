@@ -509,6 +509,7 @@ dependencies = [
  "ql-enforce",
  "ql-learn",
  "ql-profile",
+ "ql-risk",
  "ql-token",
  "serde",
  "serde_json",

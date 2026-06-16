@@ -65,3 +65,10 @@ fn is_external(ip: &IpAddr) -> bool {
         IpAddr::V6(v6) => !v6.is_loopback(),
     }
 }
+
+/// Build a risk report from a profile alone — for enforce time, where there is
+/// no trace, only the policy being applied. Network egress (which needs an
+/// observation) is simply absent; the profile's network is default-deny anyway.
+pub fn risk_report_for_profile(profile: &Profile, project_root: Option<&Path>) -> RiskReport {
+    build_risk_report(profile, &Observation::default(), project_root)
+}
