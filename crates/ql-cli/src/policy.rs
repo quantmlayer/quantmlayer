@@ -74,6 +74,43 @@ pub fn record_enforced(
         written += 1;
     }
 
+    // Commit to the content-addressed exec allow-list the kernel wall actually
+    // enforces (the SHA-256 digests, not just the exec paths classified above).
+    // These are the exact digests `bpf_ima_file_hash` checks at every execve, so
+    // pinning them in the chain is the tamper-evident record of what content was
+    // permitted to run — defeating copy-rename, where the path changes but the
+    // content (hence the digest) does not.
+    if enforced.exec.enforce && !enforced.exec.allow_digests.is_empty() {
+        let header = AuditEvent {
+            ts_millis: AuditLog::now_millis(),
+            actor: "run".to_string(),
+            action: "exec.enforce".to_string(),
+            target: "content-addressed exec".to_string(),
+            decision: Decision::Info,
+            detail: format!(
+                "{} digest(s) approved; deny-by-default",
+                enforced.exec.allow_digests.len()
+            ),
+            system: system.cloned(),
+        };
+        log.append(header).map_err(to_io)?;
+        written += 1;
+
+        for d in &enforced.exec.allow_digests {
+            let event = AuditEvent {
+                ts_millis: AuditLog::now_millis(),
+                actor: "run".to_string(),
+                action: "exec.digest".to_string(),
+                target: d.to_string(),
+                decision: Decision::Allow,
+                detail: "enforced content digest".to_string(),
+                system: system.cloned(),
+            };
+            log.append(event).map_err(to_io)?;
+            written += 1;
+        }
+    }
+
     // Reviewer-changes trail: what the approved policy added or removed relative
     // to the originally proposed (learned) one.
     if let Some(prop) = proposed {
@@ -139,4 +176,44 @@ fn load_or_new(path: &str) -> std::io::Result<AuditLog> {
 
 fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ql_profile::{ExecDigest, HashAlgo};
+
+    #[test]
+    fn commits_enforced_exec_digests_attributed() {
+        let digest = ExecDigest::new(HashAlgo::Sha256, "bf".repeat(32)).unwrap();
+        let mut profile = Profile::default();
+        profile.exec.enforce = true;
+        profile.exec.allow_digests.push(digest);
+        let sys = SystemIdentity::ai_system("coding-agent-prod", None);
+
+        let name = format!("ql-policy-test-{}.jsonl", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let p = path.to_str().expect("temp path is utf-8");
+        let _ = std::fs::remove_file(p);
+
+        let n = record_enforced(p, &profile, None, None, Some(&sys)).unwrap();
+        assert!(n >= 2, "expected an exec.enforce header + a digest record");
+
+        let log = AuditLog::from_jsonl(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert!(log.verify().is_ok(), "chain must stay intact");
+
+        let recs = log.records();
+        let actions: Vec<&str> = recs.iter().map(|r| r.event.action.as_str()).collect();
+        assert!(actions.contains(&"exec.enforce"));
+        assert!(actions.contains(&"exec.digest"));
+
+        let digest_rec = recs
+            .iter()
+            .find(|r| r.event.action == "exec.digest")
+            .unwrap();
+        let attributed = digest_rec.event.system.as_ref().expect("attributed");
+        assert_eq!(attributed.system_id, "coding-agent-prod");
+
+        let _ = std::fs::remove_file(p);
+    }
 }

@@ -20,7 +20,7 @@
 //! kind of security-critical logic that should be auditable at a glance.
 
 use crate::nonce::{NonceCheck, NonceStore};
-use ql_audit::{AuditEvent, AuditLog, Decision as AuditDecision};
+use ql_audit::{AuditEvent, AuditLog, Decision as AuditDecision, SystemIdentity};
 use ql_profile::NetPolicy;
 use ql_token::{authorize, Action, AuthzRequest, PublicId};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -79,6 +79,9 @@ pub struct BrokerPolicy {
     trusted_roots: Vec<PublicId>,
     /// Optional tamper-evident audit sink for egress decisions.
     audit: Option<Arc<AuditSink>>,
+    /// The AI system egress decisions are attributed to in the audit log (EU AI
+    /// Act Article 12 actor identity). `None` leaves the records unattributed.
+    system: Option<SystemIdentity>,
     /// Per-leaf-token anti-replay state for token-gated egress, shared across
     /// connection threads. A signed action is admitted only if its nonce is
     /// fresh for its leaf token (see [`crate::nonce`]).
@@ -94,6 +97,7 @@ impl BrokerPolicy {
             block_private_ranges: np.block_private_ranges,
             trusted_roots: Vec::new(),
             audit: None,
+            system: None,
             nonce_store: Arc::new(NonceStore::new()),
         }
     }
@@ -109,6 +113,12 @@ impl BrokerPolicy {
     /// Record every egress decision to a tamper-evident audit log.
     pub fn with_audit(mut self, sink: Arc<AuditSink>) -> Self {
         self.audit = Some(sink);
+        self
+    }
+
+    /// Attribute audited egress decisions to an AI system (EU AI Act Art. 12).
+    pub fn with_system(mut self, system: SystemIdentity) -> Self {
+        self.system = Some(system);
         self
     }
 
@@ -163,7 +173,7 @@ impl BrokerPolicy {
                 target: format!("{host}:{port}"),
                 decision: dec,
                 detail,
-                system: None,
+                system: self.system.clone(),
             });
         }
         decision
@@ -333,6 +343,7 @@ mod tests {
             block_private_ranges: true,
             trusted_roots: vec![],
             audit: None,
+            system: None,
             nonce_store: Arc::new(NonceStore::new()),
         };
         assert!(p.host_allowed("pypi.org"));
@@ -349,6 +360,7 @@ mod tests {
             block_private_ranges: true,
             trusted_roots: vec![],
             audit: None,
+            system: None,
             nonce_store: Arc::new(NonceStore::new()),
         };
         // Allowed host, public IP → allow.
@@ -381,6 +393,7 @@ mod token_gating_tests {
             block_private_ranges: true,
             trusted_roots: roots,
             audit: None,
+            system: None,
             nonce_store: Arc::new(NonceStore::new()),
         }
     }
@@ -568,7 +581,9 @@ mod token_gating_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("egress.jsonl");
         let _ = std::fs::remove_file(&log);
-        let p = gated_policy(vec![root.public()]).with_audit(AuditSink::new(&log));
+        let p = gated_policy(vec![root.public()])
+            .with_audit(AuditSink::new(&log))
+            .with_system(SystemIdentity::ai_system("coding-agent-prod", None));
 
         let blob = authz(&root, &agent, "pypi.org", "pypi.org");
         let _ = p.authorize_connect("pypi.org", 443, Some(&blob), 0); // allow
@@ -577,7 +592,12 @@ mod token_gating_tests {
         let text = std::fs::read_to_string(&log).unwrap();
         let parsed = AuditLog::from_jsonl(&text).unwrap();
         assert_eq!(parsed.records().len(), 2);
-        assert!(parsed.verify().is_ok()); // tamper-evident chain intact
+        assert!(parsed.verify().is_ok());
+        // Each egress decision is attributed to the AI system (EU AI Act Art. 12).
+        for r in parsed.records() {
+            let sys = r.event.system.as_ref().expect("egress record attributed");
+            assert_eq!(sys.system_id, "coding-agent-prod");
+        }
         let _ = std::fs::remove_file(&log);
     }
 

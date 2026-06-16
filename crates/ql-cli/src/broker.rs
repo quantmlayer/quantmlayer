@@ -8,6 +8,7 @@
 //! capability permits the destination. `--audit <log>` records every decision
 //! to a tamper-evident log.
 
+use ql_audit::SystemIdentity;
 use ql_broker::{serve, AuditSink, BrokerPolicy};
 use ql_profile::Profile;
 use ql_token::PublicId;
@@ -21,6 +22,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut listen = "127.0.0.1:8080".to_string();
     let mut trust: Vec<String> = Vec::new();
     let mut audit: Option<String> = None;
+    let mut system_id: Option<String> = None;
+    let mut model_version: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -37,6 +40,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 }
             }
             "--audit" => audit = it.next().cloned(),
+            "--system-id" => system_id = it.next().cloned(),
+            "--model-version" => model_version = it.next().cloned(),
             other => {
                 eprintln!("ql broker: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -83,6 +88,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
     if let Some(ref a) = audit {
         policy = policy.with_audit(AuditSink::new(a));
+    }
+    if let Some(id) = system_id {
+        policy = policy.with_system(SystemIdentity::ai_system(id, model_version));
     }
     let policy = Arc::new(policy);
 

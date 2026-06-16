@@ -72,7 +72,7 @@ fn print_usage() {
          \x20 ql ps\n\
          \x20 ql kill     <id> [--audit <log.jsonl>]\n\
          \x20 ql token    demo | keygen\n\
-         \x20 ql broker   --profile <p.yaml> [--listen 127.0.0.1:8080]\n\
+         \x20 ql broker   --profile <p.yaml> [--listen 127.0.0.1:8080] [--trust <root-hex>] [--audit <log.jsonl>] [--system-id <id> [--model-version <v>]]\n\
          \x20 ql version\n\
          \n\
          Learn a least-privilege profile by observing an agent, then enforce it:\n\
