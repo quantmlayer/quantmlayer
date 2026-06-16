@@ -7,7 +7,8 @@
 //! and `ql` exits with the command's own exit code, so `ql run` is transparent
 //! to scripts and CI.
 
-use ql_broker::{serve, BrokerPolicy};
+use ql_audit::SystemIdentity;
+use ql_broker::{serve, AuditSink, BrokerPolicy};
 use ql_enforce::veth::VethPlan;
 use ql_enforce::{brokered_coding_cell, standard_coding_cell, veth};
 use ql_profile::Profile;
@@ -91,15 +92,18 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let _ = crate::registry::register(&handle);
     eprintln!("ql: cell `{id}` running (revoke from another shell: ql kill {id})");
 
+    // Identity that the audit records — policy commitments and, in brokered
+    // mode, egress decisions — are attributed to (EU AI Act Art. 12).
+    let system = system_id
+        .as_deref()
+        .map(|id| SystemIdentity::ai_system(id, model_version.clone()));
+
     // Tamper-evident policy record: commit to the policy that will govern this
     // session, and the reason for each grant, before the agent runs.
     if let Some(audit) = audit_path.as_deref() {
         let project_root = std::env::current_dir().ok();
         let proposed = proposed_path.as_deref().and_then(load_profile_lenient);
         // Attribute the records to the agent identity, if the operator named one.
-        let system = system_id
-            .as_deref()
-            .map(|id| ql_audit::SystemIdentity::ai_system(id, model_version.clone()));
         match crate::policy::record_enforced(
             audit,
             &profile,
@@ -129,9 +133,21 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
 
     let code = if brokered {
-        run_brokered(profile, command, verbose)
+        run_brokered(
+            profile,
+            command,
+            verbose,
+            audit_path.as_deref(),
+            system.as_ref(),
+        )
     } else {
-        run_default(profile, command, verbose)
+        run_default(
+            profile,
+            command,
+            verbose,
+            audit_path.as_deref(),
+            system.as_ref(),
+        )
     };
     crate::registry::deregister(&id);
     code
@@ -146,7 +162,13 @@ fn now_ms() -> u64 {
 }
 
 /// Standard run: full containment with default-deny network.
-fn run_default(profile: Profile, command: &[String], verbose: bool) -> ExitCode {
+fn run_default(
+    profile: Profile,
+    command: &[String],
+    verbose: bool,
+    audit_path: Option<&str>,
+    system: Option<&SystemIdentity>,
+) -> ExitCode {
     if verbose {
         eprintln!(
             "ql: containing `{}` (walls: cgroups, namespaces, mount, network[deny], seccomp)",
@@ -160,7 +182,9 @@ fn run_default(profile: Profile, command: &[String], verbose: bool) -> ExitCode 
             return ExitCode::from(1);
         }
     };
-    match cell.run(command) {
+    let result = cell.run(command);
+    write_exec_events(audit_path, system);
+    match result {
         Ok(code) => ExitCode::from(clamp_code(code)),
         Err(e) => {
             eprintln!("ql run: containment failure (command not executed): {e}");
@@ -172,7 +196,13 @@ fn run_default(profile: Profile, command: &[String], verbose: bool) -> ExitCode 
 /// Brokered run: containment plus allow-listed egress through the broker. The
 /// agent's only network route is a veth uplink to the broker, which enforces
 /// the profile's domain allow-list and refuses private/link-local addresses.
-fn run_brokered(profile: Profile, command: &[String], verbose: bool) -> ExitCode {
+fn run_brokered(
+    profile: Profile,
+    command: &[String],
+    verbose: bool,
+    audit_path: Option<&str>,
+    system: Option<&SystemIdentity>,
+) -> ExitCode {
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
     let plan = VethPlan::for_seed(seed);
@@ -193,7 +223,18 @@ fn run_brokered(profile: Profile, command: &[String], verbose: bool) -> ExitCode
             return ExitCode::from(1);
         }
     };
-    let policy = Arc::new(BrokerPolicy::from_net_policy(&profile.network));
+    let mut policy = BrokerPolicy::from_net_policy(&profile.network);
+    // Unify the ledger: send the in-process broker's egress decisions to the
+    // same audit log the policy records went to (the AuditSink continues the
+    // existing chain), attributed to the same AI system.
+    if let Some(path) = audit_path {
+        policy = policy.with_audit(AuditSink::new(path));
+        if let Some(sys) = system {
+            policy = policy.with_system(sys.clone());
+        }
+        eprintln!("ql: auditing brokered egress to {path}");
+    }
+    let policy = Arc::new(policy);
     std::thread::spawn(move || {
         let _ = serve(listener, policy);
     });
@@ -215,6 +256,7 @@ fn run_brokered(profile: Profile, command: &[String], verbose: bool) -> ExitCode
     };
 
     let result = cell.run(command);
+    write_exec_events(audit_path, system);
     // Always tear the veth down, success or failure.
     veth::teardown(&plan);
 
@@ -226,6 +268,72 @@ fn run_brokered(profile: Profile, command: &[String], verbose: bool) -> ExitCode
         }
     }
 }
+
+/// Drain the kernel's per-execve audit stream (content-addressed exec wall) for
+/// the run that just finished and append one attributed record per decision —
+/// `exec.run` (allowed) / `exec.deny` (denied) — to the unified ledger, chaining
+/// onto the policy and egress records. No-op without the `lsm` feature, when no
+/// wall was active, or when no audit log is set.
+#[cfg(feature = "lsm")]
+fn write_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) {
+    use ql_audit::{AuditEvent, AuditLog, Decision};
+
+    let events = ql_enforce::drain_exec_events();
+    if events.is_empty() {
+        return;
+    }
+    let Some(path) = audit_path else {
+        return;
+    };
+
+    let mut log = match std::fs::read_to_string(path) {
+        Ok(s) => match AuditLog::from_jsonl(&s) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ql: exec audit: cannot parse {path}: {e}");
+                return;
+            }
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => AuditLog::new(),
+        Err(e) => {
+            eprintln!("ql: exec audit: cannot read {path}: {e}");
+            return;
+        }
+    };
+
+    for ev in events {
+        let (action, decision) = if ev.allowed {
+            ("exec.run", Decision::Allow)
+        } else {
+            ("exec.deny", Decision::Deny)
+        };
+        let event = AuditEvent {
+            ts_millis: ev.ts_millis,
+            actor: "exec".to_string(),
+            action: action.to_string(),
+            target: ev.digest_hex.unwrap_or_else(|| "<unhashed>".to_string()),
+            decision,
+            detail: format!("pid {} ({})", ev.pid, ev.comm),
+            system: system.cloned(),
+        };
+        if log.append(event).is_err() {
+            eprintln!("ql: exec audit: append failed");
+            return;
+        }
+    }
+
+    match log.to_jsonl() {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(path, text) {
+                eprintln!("ql: exec audit: write {path} failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("ql: exec audit: serialize failed: {e}"),
+    }
+}
+
+#[cfg(not(feature = "lsm"))]
+fn write_exec_events(_audit_path: Option<&str>, _system: Option<&SystemIdentity>) {}
 
 /// Nanosecond counter for unique-ish veth subnet seeds.
 fn nanos() -> u128 {

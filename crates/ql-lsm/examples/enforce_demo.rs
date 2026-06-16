@@ -98,6 +98,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("copy of /bin/true (same bytes)", &exec_in_cgroup(COPY), true);
     report("/bin/ls (NOT approved)", &exec_in_cgroup("/bin/ls"), false);
 
+    // Show the kernel's exec audit stream: ground truth of what executed and
+    // what content-addressing denied. Expect three records — true, the copy
+    // (same digest), and ls (denied).
+    println!("\nKernel exec audit stream:");
+    match enforcer.drain_events() {
+        Ok(events) => {
+            println!("  captured {} event(s)", events.len());
+            for e in &events {
+                let verdict = if e.allowed { "ALLOWED" } else { "DENIED" };
+                let dg = e.digest_hex.as_deref().unwrap_or("<unhashed>");
+                println!(
+                    "  [{verdict}] ts={} comm={} pid={} digest={dg}",
+                    e.ts_millis, e.comm, e.pid
+                );
+            }
+        }
+        Err(e) => eprintln!("  draining exec events failed: {e}"),
+    }
+
     // Cleanup: detach before removing the cgroup.
     drop(enforcer);
     let _ = fs::remove_file(COPY);

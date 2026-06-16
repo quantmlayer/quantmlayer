@@ -24,8 +24,10 @@
 //! because it needs the eBPF build toolchain; build it with
 //! `cd crates/ql-lsm && cargo build`.
 
+use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
+use std::rc::Rc;
 
 use ql_profile::Profile;
 
@@ -37,7 +39,7 @@ mod skel {
 use skel::*;
 
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{Link, MapCore as _, MapFlags};
+use libbpf_rs::{Link, MapCore as _, MapFlags, RingBufferBuilder};
 
 /// `BPF_F_SLEEPABLE` from the BPF UAPI. `bpf_ima_file_hash` may sleep, so the
 /// program must be loaded sleepable.
@@ -53,6 +55,89 @@ pub enum LsmError {
     /// would deny every exec. Refuse rather than silently brick the cell.
     #[error("exec.enforce is set but allow_digests is empty")]
     NoDigests,
+}
+
+/// One exec decision observed at the kernel enforcement boundary, drained from
+/// the BPF ring buffer. This is the userspace view of an `exec_event` the
+/// `bprm_check_security` program emitted — ground truth of what actually tried
+/// to run inside the cell and whether content-addressing let it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecRecord {
+    /// Wall-clock time of the exec, in milliseconds since the Unix epoch,
+    /// derived from the kernel monotonic timestamp at drain time.
+    pub ts_millis: u64,
+    /// The binary's SHA-256 content digest (lowercase hex), or `None` if the
+    /// kernel could not hash it (which is itself the deny reason).
+    pub digest_hex: Option<String>,
+    /// The thread-group id (pid) that performed the exec.
+    pub pid: u32,
+    /// The task comm (up to 15 bytes, NUL-trimmed).
+    pub comm: String,
+    /// Whether the exec was allowed (digest on the approved list).
+    pub allowed: bool,
+}
+
+/// Wire size of `struct exec_event` in enforce.bpf.c: u64 ktime + digest[32] +
+/// comm[16] + u32 pid + 2 flag bytes, tail-padded to an 8-byte boundary.
+const EVENT_SIZE: usize = 64;
+
+/// Lowercase-hex encode without pulling in a formatting dependency.
+fn hex(bytes: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(H[(b >> 4) as usize] as char);
+        s.push(H[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// The kernel monotonic clock (`CLOCK_MONOTONIC`), matching what
+/// `bpf_ktime_get_ns` stamps into each event. In nanoseconds.
+fn mono_now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid, writable timespec; clock_gettime only writes it.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let secs = ts.tv_sec as u64;
+    let nsec = ts.tv_nsec as u64;
+    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+/// Wall-clock now, milliseconds since the Unix epoch.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Parse one `exec_event` from its raw ring-buffer bytes. Field offsets mirror
+/// the C struct exactly; we read by offset rather than transmuting to avoid any
+/// alignment assumptions. Native byte order — producer and consumer are the
+/// same machine. The event's monotonic `ktime` is mapped to wall-clock using
+/// the `mono_now_ns`/`wall_now_ms` reference captured at drain time.
+fn parse_event(data: &[u8], mono_now_ns: u64, wall_now_ms: u64) -> Option<ExecRecord> {
+    if data.len() < EVENT_SIZE {
+        return None;
+    }
+    let ktime_ns = u64::from_ne_bytes(data[0..8].try_into().ok()?);
+    let hashed = data[61] != 0;
+    let digest_hex = hashed.then(|| hex(&data[8..40]));
+    let comm_raw = &data[40..56];
+    let end = comm_raw.iter().position(|&b| b == 0).unwrap_or(comm_raw.len());
+    let comm = String::from_utf8_lossy(&comm_raw[..end]).into_owned();
+    let pid = u32::from_ne_bytes(data[56..60].try_into().ok()?);
+    let allowed = data[60] != 0;
+    // The event happened `mono_now_ns - ktime_ns` ago; subtract that from now.
+    let ago_ms = mono_now_ns.saturating_sub(ktime_ns) / 1_000_000;
+    let ts_millis = wall_now_ms.saturating_sub(ago_ms);
+    Some(ExecRecord {
+        ts_millis,
+        digest_hex,
+        pid,
+        comm,
+        allowed,
+    })
 }
 
 /// A live content-addressed exec enforcer attached to one cgroup.
@@ -107,5 +192,41 @@ impl ExecEnforcer {
             _link: link,
             _skel: skel,
         })
+    }
+
+    /// Drain every exec decision the kernel has emitted so far, returning them
+    /// oldest-first. The BPF program streams one event per exec of a task in the
+    /// attached cgroup; call this after the workload has run (or periodically)
+    /// to collect the ground-truth record of what executed and what was denied.
+    ///
+    /// Best-effort by construction: if the kernel ring filled (a very busy
+    /// cell), the producer dropped the overflow rather than blocking execs, so
+    /// this returns what the ring retained.
+    pub fn drain_events(&self) -> Result<Vec<ExecRecord>, LsmError> {
+        // Reference points captured once: every event's monotonic ktime is
+        // mapped to wall-clock against these.
+        let mono_now = mono_now_ns();
+        let wall_now = wall_now_ms();
+
+        let collected: Rc<RefCell<Vec<ExecRecord>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&collected);
+
+        let mut builder = RingBufferBuilder::new();
+        // API(libbpf-rs 0.24): add(map, callback) registers a per-record
+        // callback; the callback returns 0 to continue.
+        builder.add(&self._skel.maps.events, move |data: &[u8]| {
+            if let Some(rec) = parse_event(data, mono_now, wall_now) {
+                sink.borrow_mut().push(rec);
+            }
+            0
+        })?;
+        let ring = builder.build()?;
+        // consume() invokes the callback for all currently-available records.
+        ring.consume()?;
+        drop(ring); // release the borrow of the events map before unwrapping
+
+        Ok(Rc::try_unwrap(collected)
+            .expect("ring buffer dropped, so this is the sole Rc")
+            .into_inner())
     }
 }

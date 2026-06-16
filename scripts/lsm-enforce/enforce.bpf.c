@@ -30,6 +30,7 @@
 char LICENSE[] SEC("license") = "GPL";
 
 #define SHA256_LEN 32
+#define COMM_LEN 16
 
 // The allow-list: key = 32-byte SHA-256 digest, value = 1 (presence = approved).
 // Using key_size/value_size (rather than __type) keeps the byte-array key clean.
@@ -40,19 +41,58 @@ struct {
     __uint(value_size, 1);
 } allowlist SEC(".maps");
 
+// Per-exec audit event streamed to userspace for the tamper-evident log. Field
+// order is largest-first so the Rust `#[repr(C)]` mirror has the same layout
+// without padding surprises: ktime 0..8, digest 8..40, comm 40..56, pid 56..60,
+// allowed 60, hashed 61; the tail pads to an 8-byte boundary (size = 64).
+struct exec_event {
+    __u64 ktime; // ns since boot (bpf_ktime_get_ns); userspace maps it to wall time
+    __u8 digest[SHA256_LEN];
+    char comm[COMM_LEN];
+    __u32 pid;
+    __u8 allowed; // 1 = allowed, 0 = denied
+    __u8 hashed;  // 1 = content hashed, 0 = hash unavailable (the deny reason)
+};
+
+// Single stream of exec decisions for userspace to record. 64 KiB; if userspace
+// falls behind and it fills, bpf_ringbuf_reserve returns NULL and we skip the
+// record — logging never changes or blocks the enforcement decision.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 16);
+} events SEC(".maps");
+
 // Sleepable (set via BPF_F_SLEEPABLE by the loader) because bpf_ima_file_hash
 // may sleep. lsm_cgroup return convention: 1 = allow, 0 = reject.
 SEC("lsm_cgroup/bprm_check_security")
 int BPF_PROG(enforce_exec, struct linux_binprm *bprm, int ret)
 {
     __u8 digest[SHA256_LEN] = {};
+    int hashed = 0;
+    int allow = 0;
 
     long rc = bpf_ima_file_hash(bprm->file, digest, sizeof(digest));
-    if (rc < 0)
-        return 0; // could not hash -> fail closed (deny)
+    if (rc >= 0) {
+        hashed = 1;
+        if (bpf_map_lookup_elem(&allowlist, digest))
+            allow = 1; // approved content -> allow
+    }
+    // rc < 0: could not hash -> allow stays 0 -> deny-by-default (fail closed)
 
-    if (bpf_map_lookup_elem(&allowlist, digest))
-        return 1; // approved content -> allow
+    // Best-effort audit record of this exec decision. The logging path must
+    // never change or gate the decision: if the ring is full, skip the record.
+    struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (e) {
+        __builtin_memset(e, 0, sizeof(*e));
+        e->ktime = bpf_ktime_get_ns();
+        if (hashed)
+            __builtin_memcpy(e->digest, digest, SHA256_LEN);
+        e->pid = bpf_get_current_pid_tgid() >> 32;
+        e->allowed = allow;
+        e->hashed = hashed;
+        bpf_get_current_comm(e->comm, sizeof(e->comm));
+        bpf_ringbuf_submit(e, 0);
+    }
 
-    return 0; // unknown content -> deny-by-default
+    return allow; // 1 = allow, 0 = deny-by-default
 }

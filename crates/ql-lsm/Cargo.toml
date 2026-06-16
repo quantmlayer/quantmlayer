@@ -19,6 +19,7 @@ description = "QuantmLayer kernel-side content-addressed exec enforcement (Linux
 [dependencies]
 ql-profile = { path = "../ql-profile" }
 libbpf-rs = "0.24"
+libc = "0.2" # CLOCK_MONOTONIC, to map kernel ktime to wall time
 thiserror = "1"
 
 [build-dependencies]
@@ -26,4 +27,3 @@ libbpf-cargo = "0.24"
 
 [dev-dependencies]
 sha2 = "0.10" # the runtime demo hashes /bin/true to build an allow-list
-libc = "0.2"  # EPERM, to recognize a denied exec

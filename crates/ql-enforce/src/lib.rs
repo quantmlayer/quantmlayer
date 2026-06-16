@@ -203,12 +203,39 @@ fn attach_exec_wall(pid: nix::unistd::Pid, profile: &Profile) -> Result<()> {
     let enforcer = ql_lsm::ExecEnforcer::attach(profile, cgroup.as_raw_fd())
         .map_err(|e| EnforceError::enforcer("exec", format!("attaching exec wall: {e}")))?;
 
-    // Hold the link WITHOUT pinning to bpffs: an unpinned link auto-detaches
-    // when this process exits, which is exactly right for the one-shot `ql run`
-    // model. TODO: a long-lived process running many cells should own this
-    // handle and drop it per-cell instead of leaking it here.
-    std::mem::forget(enforcer);
+    // Stash the live enforcer in this (parent) thread so `drain_exec_events`
+    // can read the kernel's exec audit stream after the run, while the BPF link
+    // stays alive for the cell's lifetime. The unpinned link auto-detaches when
+    // the enforcer is dropped (at drain time, or at process exit). The parent
+    // hook runs in the same thread as the caller of `Cell::run`, so a
+    // thread-local needs no `Send` handling.
+    EXEC_ENFORCER.with(|slot| {
+        *slot.borrow_mut() = Some(enforcer);
+    });
     Ok(())
+}
+
+#[cfg(feature = "lsm")]
+thread_local! {
+    /// The live exec enforcer for the current run (one cell per `ql run`
+    /// process). Set by [`attach_exec_wall`]; the wall stays attached while this
+    /// is `Some`. Drained and dropped by [`drain_exec_events`] after the run.
+    static EXEC_ENFORCER: std::cell::RefCell<Option<ql_lsm::ExecEnforcer>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Drain the kernel's per-execve audit stream for the run that just finished,
+/// returning one record per exec decision (oldest first). Takes and drops the
+/// enforcer, detaching the wall — the run is over. Empty if no wall was active.
+#[cfg(feature = "lsm")]
+pub fn drain_exec_events() -> Vec<ql_lsm::ExecRecord> {
+    EXEC_ENFORCER.with(|slot| {
+        let enforcer = slot.borrow_mut().take();
+        match enforcer {
+            Some(e) => e.drain_events().unwrap_or_default(),
+            None => Vec::new(),
+        }
+    })
 }
 
 /// Resolve the cell's cgroup-v2 directory from a pid via the unified (`0::`)
