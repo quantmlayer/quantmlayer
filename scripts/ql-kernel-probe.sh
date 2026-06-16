@@ -30,11 +30,15 @@ set -u
 c_ok=$'\033[32m'; c_no=$'\033[31m'; c_wa=$'\033[33m'; c_in=$'\033[36m'; c_z=$'\033[0m'
 [ -t 1 ] || { c_ok=; c_no=; c_wa=; c_in=; c_z=; }   # no colour when piped
 
-ok()   { printf '  %s[ OK ]%s %s\n'  "$c_ok" "$c_z" "$*"; }
-no()   { printf '  %s[ NO ]%s %s\n'  "$c_no" "$c_z" "$*"; }
-warn() { printf '  %s[ !! ]%s %s\n'  "$c_wa" "$c_z" "$*"; }
-info() { printf '  %s[ .. ]%s %s\n'  "$c_in" "$c_z" "$*"; }
-hdr()  { printf '\n%s== %s ==%s\n' "$c_in" "$*" "$c_z"; }
+# --json emits ONLY a machine-readable capability object on stdout (for the
+# portability-matrix runner); default mode prints the human report.
+JSON_MODE=no; [ "${1:-}" = "--json" ] && JSON_MODE=yes
+
+ok()   { [ "$JSON_MODE" = yes ] && return 0; printf '  %s[ OK ]%s %s\n'  "$c_ok" "$c_z" "$*"; }
+no()   { [ "$JSON_MODE" = yes ] && return 0; printf '  %s[ NO ]%s %s\n'  "$c_no" "$c_z" "$*"; }
+warn() { [ "$JSON_MODE" = yes ] && return 0; printf '  %s[ !! ]%s %s\n'  "$c_wa" "$c_z" "$*"; }
+info() { [ "$JSON_MODE" = yes ] && return 0; printf '  %s[ .. ]%s %s\n'  "$c_in" "$c_z" "$*"; }
+hdr()  { [ "$JSON_MODE" = yes ] && return 0; printf '\n%s== %s ==%s\n' "$c_in" "$*" "$c_z"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Verdict flags, filled in as we go, summarised at the end.
@@ -47,12 +51,22 @@ V_CGROUP_BPF=unknown        # CONFIG_CGROUP_BPF (LSM_CGROUP prereq)
 V_HELPER_IMA=unknown        # bpf_ima_file_hash advertised
 V_HELPER_VERITY=unknown     # bpf_get_fsverity_digest advertised
 V_BUILD=unknown             # clang + bpftool + libbpf headers present
+V_CGROUP_V2=unknown         # unified cgroup v2 hierarchy
+V_PIDS=unknown              # pids controller (fork-bomb wall)
+V_USERNS=unknown            # user namespaces usable (clone3 + CLONE_NEWUSER)
+V_VETH=unknown              # veth + NET_NS + ip (brokered egress uplink)
+V_SECCOMP=unknown           # seccomp filtering
+V_SECCOMP_NOTIFY=unknown    # seccomp user-notification (>= 5.0)
+V_LANDLOCK=unknown          # Landlock (optional fs hardening, >= 5.13)
+OS_PRETTY=unknown           # distro pretty name
 
 am_root=no; [ "$(id -u)" = 0 ] && am_root=yes
 
-printf '%s' "QuantmLayer kernel-floor probe"
-printf '   (root=%s)\n' "$am_root"
-date 2>/dev/null
+if [ "$JSON_MODE" != yes ]; then
+  printf '%s' "QuantmLayer kernel-floor probe"
+  printf '   (root=%s)\n' "$am_root"
+  date 2>/dev/null
+fi
 
 # ---------------------------------------------------------------------------
 hdr "A. Kernel & platform"
@@ -70,7 +84,8 @@ else no "kernel < 5.7 → no BPF-LSM at all (would need a newer kernel)"; fi
 if [ -r /etc/os-release ]; then
   # shellcheck disable=SC1091
   . /etc/os-release 2>/dev/null
-  info "distro : ${PRETTY_NAME:-unknown}"
+  OS_PRETTY="${PRETTY_NAME:-unknown}"
+  info "distro : $OS_PRETTY"
 fi
 
 # ---------------------------------------------------------------------------
@@ -109,7 +124,9 @@ else
   info "config source: $CFG"
   for opt in CONFIG_BPF_SYSCALL CONFIG_BPF_LSM CONFIG_DEBUG_INFO_BTF \
              CONFIG_CGROUP_BPF CONFIG_IMA CONFIG_IMA_DEFAULT_HASH_SHA256 \
-             CONFIG_INTEGRITY CONFIG_FS_VERITY CONFIG_FS_VERITY_BUILTIN_SIGNATURES; do
+             CONFIG_INTEGRITY CONFIG_FS_VERITY CONFIG_FS_VERITY_BUILTIN_SIGNATURES \
+             CONFIG_USER_NS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_VETH \
+             CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_SECURITY_LANDLOCK; do
     line="$(cfg_get "$opt")"
     if [ -n "$line" ]; then ok "$line"; else no "$opt is not set (=n / absent)"; fi
   done
@@ -217,14 +234,132 @@ have cargo && info "cargo present ($(cargo --version 2>/dev/null)) → aya (pure
 if [ "$tool_clang" = yes ] && [ "$libbpf" = yes ]; then V_BUILD=yes; else V_BUILD=partial; fi
 
 # ---------------------------------------------------------------------------
-hdr "I. cgroup v2  (the cell's existing structure the LSM program would scope to)"
+hdr "I. cgroup v2  (resource walls: pids anti-forkbomb, memory, cpu)"
 if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
-  ok "unified cgroup v2 at /sys/fs/cgroup (controllers: $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null))"
+  ctrls="$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)"
+  ok "unified cgroup v2 at /sys/fs/cgroup (controllers: $ctrls)"
+  V_CGROUP_V2=yes
+  case " $ctrls " in
+    *" pids "*) ok "pids controller present → fork-bomb wall available"; V_PIDS=yes ;;
+    *)          no "pids controller absent → fork-bomb wall degraded"; V_PIDS=no ;;
+  esac
 else
-  warn "cgroup v2 unified hierarchy not detected at /sys/fs/cgroup (hybrid/v1?) — confirm the cell's cgroup is v2"
+  warn "cgroup v2 unified hierarchy not detected at /sys/fs/cgroup (hybrid/v1?) — resource walls degraded"
+  V_CGROUP_V2=no; V_PIDS=no
 fi
 
 # ---------------------------------------------------------------------------
+hdr "J. User namespaces  (the cell builds with clone3 + CLONE_NEWUSER)"
+userns_cfg="$(cfg_get CONFIG_USER_NS)"
+[ -n "$userns_cfg" ] && ok "$userns_cfg" || info "CONFIG_USER_NS unknown (no readable config)"
+maxuserns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo unknown)"
+info "user.max_user_namespaces = $maxuserns"
+unpriv="$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo unset)"
+[ "$unpriv" != unset ] && info "kernel.unprivileged_userns_clone = $unpriv"
+if [ "$maxuserns" = 0 ]; then
+  no "user namespaces disabled (max_user_namespaces=0) — cell cannot create a userns"
+  V_USERNS=no
+elif [ "$unpriv" = 0 ] && [ "$am_root" != yes ]; then
+  warn "unprivileged userns disabled; cell needs root or unprivileged_userns_clone=1"
+  V_USERNS=restricted
+elif [ -z "$userns_cfg" ] && [ "$maxuserns" = unknown ]; then
+  warn "user namespace support undetermined (need readable config or sudo)"
+  V_USERNS=unknown
+else
+  ok "user namespaces available"
+  V_USERNS=yes
+fi
+
+# ---------------------------------------------------------------------------
+hdr "K. seccomp  (syscall-filter wall; notify = userspace supervision)"
+actions=/proc/sys/kernel/seccomp/actions_avail
+if [ -r "$actions" ]; then
+  ok "seccomp filtering available (actions: $(cat "$actions" 2>/dev/null))"
+  V_SECCOMP=yes
+else
+  sc_cfg="$(cfg_get CONFIG_SECCOMP_FILTER)"
+  if [ -n "$sc_cfg" ]; then ok "$sc_cfg (actions_avail not readable)"; V_SECCOMP=yes
+  else warn "seccomp filter support undetermined"; V_SECCOMP=unknown; fi
+fi
+if [ "$kver" -ge 5000 ]; then
+  ok "kernel >= 5.0 → seccomp user-notification (notify) available"; V_SECCOMP_NOTIFY=yes
+else
+  no "kernel < 5.0 → no seccomp user-notification"; V_SECCOMP_NOTIFY=no
+fi
+
+# ---------------------------------------------------------------------------
+hdr "L. Network namespace + veth  (the brokered-egress uplink)"
+netns_cfg="$(cfg_get CONFIG_NET_NS)"; veth_cfg="$(cfg_get CONFIG_VETH)"
+[ -n "$netns_cfg" ] && ok "$netns_cfg" || info "CONFIG_NET_NS unknown"
+veth_ok=no
+if [ -n "$veth_cfg" ]; then
+  case "$veth_cfg" in
+    *=y | *=m) ok "$veth_cfg → veth available"; veth_ok=yes ;;
+    *)         no "$veth_cfg" ;;
+  esac
+elif [ -d /sys/module/veth ]; then
+  ok "veth module loaded"; veth_ok=yes
+else
+  info "veth support undetermined (no config; try: sudo modprobe veth)"
+fi
+if have ip; then ok "iproute2 'ip' present (veth setup)"; else warn "'ip' (iproute2) absent — brokered veth setup needs it"; fi
+if [ "$veth_ok" = yes ] && have ip; then V_VETH=yes
+elif have ip; then V_VETH=maybe
+else V_VETH=no; fi
+
+# ---------------------------------------------------------------------------
+hdr "M. Landlock  (optional fs hardening; the current cell uses mount ns, not Landlock)"
+ll_cfg="$(cfg_get CONFIG_SECURITY_LANDLOCK)"
+if [ "$kver" -lt 5013 ]; then
+  no "kernel < 5.13 → Landlock unavailable"; V_LANDLOCK=no
+elif [ -r "$LSM_FILE" ] && grep -q 'landlock' "$LSM_FILE" 2>/dev/null; then
+  ok "landlock in the active LSM stack → available"; V_LANDLOCK=yes
+elif [ -n "$ll_cfg" ]; then
+  case "$ll_cfg" in
+    *=y) info "CONFIG_SECURITY_LANDLOCK=y but not in active lsm stack (add to lsm=)"; V_LANDLOCK=restricted ;;
+    *)   no "$ll_cfg"; V_LANDLOCK=no ;;
+  esac
+else
+  info "Landlock status undetermined (need readable config or sudo)"; V_LANDLOCK=unknown
+fi
+info "NOTE: the current cell enforces fs boundaries via mount namespaces, not Landlock; this row is for future hardening."
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Machine-readable capability object (one row of the portability matrix).
+emit_json() {
+  js() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+  local rootbool; [ "$am_root" = yes ] && rootbool=true || rootbool=false
+  printf '{\n'
+  printf '  "schema": "ql-probe/1",\n'
+  printf '  "host": {"kernel": "%s", "arch": "%s", "distro": "%s", "root": %s},\n' \
+    "$(js "${KREL:-unknown}")" "$(js "${KARCH:-unknown}")" "$(js "$OS_PRETTY")" "$rootbool"
+  printf '  "walls": {\n'
+  printf '    "cgroup_v2": "%s",\n'        "$V_CGROUP_V2"
+  printf '    "pids_controller": "%s",\n'  "$V_PIDS"
+  printf '    "user_namespaces": "%s",\n'  "$V_USERNS"
+  printf '    "network_veth": "%s",\n'     "$V_VETH"
+  printf '    "seccomp": "%s",\n'          "$V_SECCOMP"
+  printf '    "seccomp_notify": "%s",\n'   "$V_SECCOMP_NOTIFY"
+  printf '    "landlock": "%s",\n'         "$V_LANDLOCK"
+  printf '    "exec_bpf_lsm": "%s"\n'      "$V_LSM_ACTIVE"
+  printf '  },\n'
+  printf '  "exec_wall_detail": {\n'
+  printf '    "config_bpf_lsm": "%s",\n'   "$V_BPF_LSM_CFG"
+  printf '    "btf": "%s",\n'              "$V_BTF"
+  printf '    "cgroup_bpf": "%s",\n'       "$V_CGROUP_BPF"
+  printf '    "ima": "%s",\n'              "$V_IMA"
+  printf '    "ima_helper": "%s",\n'       "$V_HELPER_IMA"
+  printf '    "verity": "%s",\n'           "$V_VERITY"
+  printf '    "verity_helper": "%s"\n'     "$V_HELPER_VERITY"
+  printf '  },\n'
+  printf '  "build_tooling": "%s"\n'       "$V_BUILD"
+  printf '}\n'
+}
+
+# In machine-readable mode, emit the capability object and stop here.
+if [ "$JSON_MODE" = yes ]; then emit_json; exit 0; fi
+
 hdr "VERDICT"
 say() { printf '  %-26s %s\n' "$1" "$2"; }
 say "BPF-LSM active (no reboot):" "$V_LSM_ACTIVE"
