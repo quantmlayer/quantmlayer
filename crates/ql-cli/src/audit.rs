@@ -21,6 +21,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Some("export") => export(&args[1..]),
         Some("rotate") => rotate(&args[1..]),
         Some("retention") => retention(&args[1..]),
+        Some("keygen") => keygen(&args[1..]),
         Some("-h") | Some("--help") | None => {
             print_help();
             ExitCode::SUCCESS
@@ -166,12 +167,14 @@ fn export(args: &[String]) -> ExitCode {
     let mut out_dir: Option<&str> = None;
     let mut since: Option<u64> = None;
     let mut until: Option<u64> = None;
+    let mut sign_key: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out_dir = it.next().map(String::as_str),
             "--since" => since = it.next().and_then(|s| s.parse().ok()),
             "--until" => until = it.next().and_then(|s| s.parse().ok()),
+            "--sign-key" => sign_key = it.next().map(String::as_str),
             s if !s.starts_with('-') && log_path.is_none() => log_path = Some(s),
             other => {
                 eprintln!("ql audit export: unexpected argument `{other}`");
@@ -246,7 +249,7 @@ fn export(args: &[String]) -> ExitCode {
         }
     }
 
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema": "ql-audit-export/1",
         "source": path,
         "exported_at_ms": AuditLog::now_millis(),
@@ -261,6 +264,27 @@ fn export(args: &[String]) -> ExitCode {
         "full_log_count": all.len(),
         "canonicalization": "sha256( be64(seq) || prev_hash_ascii || 0x00 || compact_json(event) )"
     });
+
+    // Optional deployer signature over the head hash: integrity comes from the
+    // chain, authenticity (who attests to this segment) comes from the signature.
+    if let Some(key_path) = sign_key {
+        let head_hash = window.last().map(|r| r.hash.clone()).unwrap_or_default();
+        match sign_head(key_path, &head_hash) {
+            Ok((signature, public_key)) => {
+                if let Some(obj) = manifest.as_object_mut() {
+                    obj.insert("signature_alg".into(), serde_json::json!("ed25519"));
+                    obj.insert("signed_field".into(), serde_json::json!("head_hash"));
+                    obj.insert("public_key".into(), serde_json::json!(public_key));
+                    obj.insert("signature".into(), serde_json::json!(signature));
+                }
+            }
+            Err(e) => {
+                eprintln!("ql audit export: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let manifest = match serde_json::to_string_pretty(&manifest) {
         Ok(s) => s,
         Err(e) => {
@@ -498,6 +522,61 @@ fn parse_archive_stamp(name: &str) -> Option<u64> {
     rest.split('-').next()?.parse().ok()
 }
 
+/// Load an Ed25519 private seed (hex) from `key_path` and sign `head_hash`'s
+/// ASCII bytes. Returns `(signature_hex, public_key_hex)`.
+fn sign_head(key_path: &str, head_hash: &str) -> Result<(String, String), String> {
+    let seed = std::fs::read_to_string(key_path)
+        .map_err(|e| format!("cannot read sign key {key_path}: {e}"))?;
+    let id = ql_token::Identity::from_seed_hex(seed.trim())
+        .map_err(|e| format!("invalid sign key {key_path}: {e}"))?;
+    Ok((id.sign(head_hash.as_bytes()), id.public().to_hex()))
+}
+
+/// `ql audit keygen [--out <path>]` — generate an Ed25519 deployer signing key.
+/// Writes the private seed (chmod 600) and prints the public key to publish, so
+/// auditors can verify signed export bundles.
+fn keygen(args: &[String]) -> ExitCode {
+    let mut out: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().map(String::as_str),
+            other => {
+                eprintln!("ql audit keygen: unexpected argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let id = match ql_token::Identity::generate() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("ql audit keygen: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let public_key = id.public().to_hex();
+    match out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, format!("{}\n", id.seed_hex())) {
+                eprintln!("ql audit keygen: cannot write {path}: {e}");
+                return ExitCode::from(2);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            println!("private signing key written to {path} (keep secret)");
+            println!("public key (publish so auditors can verify): {public_key}");
+        }
+        None => {
+            println!("private seed (store securely): {}", id.seed_hex());
+            println!("public key (publish):          {public_key}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Standalone, dependency-free (Python stdlib only) chain verifier shipped in
 /// every export bundle. Replicates `chain_hash` exactly.
 const VERIFY_PY: &str = r#"#!/usr/bin/env python3
@@ -533,15 +612,34 @@ for r in recs:
         print("TAMPERED: record seq %d does not link to the previous record" % r["seq"]); sys.exit(1)
     prev = r["hash"]
 
+man = None
 try:
     with open(os.path.join(here, "manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
-    if man.get("head_hash") != recs[-1]["hash"]:
-        print("WARNING: manifest head_hash does not match the last record"); sys.exit(1)
 except FileNotFoundError:
     pass
 
+if man is not None and man.get("head_hash") != recs[-1]["hash"]:
+    print("WARNING: manifest head_hash does not match the last record"); sys.exit(1)
+
 print("INTACT: %d record(s), chain verified; head %s..." % (len(recs), recs[-1]["hash"][:16]))
+
+# Optional authenticity: the chain proves integrity; a deployer signature over
+# the head proves who produced it. Checked opportunistically (stdlib has no
+# ed25519, so the chain check above never depends on this).
+if man is not None and man.get("signature") and man.get("public_key"):
+    sig = man["signature"]; pub = man["public_key"]
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        print("SIGNATURE: present, not checked (pip install cryptography); deployer key %s..." % pub[:16])
+    else:
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub)).verify(bytes.fromhex(sig), recs[-1]["hash"].encode())
+            print("SIGNATURE: valid; deployer key %s..." % pub[:16])
+        except Exception:
+            print("SIGNATURE: INVALID"); sys.exit(1)
+
 sys.exit(0)
 "#;
 
@@ -575,6 +673,15 @@ in the segment was altered, added, or removed.
   count so you can confirm what portion you received.
 - Each record names the AI system it is attributed to (event.system) and carries
   a millisecond wall-clock timestamp (event.ts_millis).
+
+## Authenticity (signed bundles)
+If manifest.json carries "signature" and "public_key", the deployer signed the
+head hash with an Ed25519 key. The chain already proves integrity; this proves
+who attests to the segment. verify.py checks it automatically when the Python
+"cryptography" package is installed. To check by hand, obtain the deployer's
+public key through a trusted channel, confirm it matches "public_key", then:
+
+    python3 -c 'import json,sys; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as K; m=json.load(open("manifest.json")); K.from_public_bytes(bytes.fromhex(m["public_key"])).verify(bytes.fromhex(m["signature"]), m["head_hash"].encode()); print("signature OK")'
 "#;
 
 fn print_help() {
@@ -585,7 +692,8 @@ fn print_help() {
          \x20 ql audit verify <log.jsonl>\n\
          \x20 ql audit append <log.jsonl> --actor <a> --action <x> --target <t> \\\n\
          \x20                  --decision allow|deny|info [--detail <text>]\n\
-         \x20 ql audit export <log.jsonl> --out <dir> [--since <ms>] [--until <ms>]\n\
+         \x20 ql audit export <log.jsonl> --out <dir> [--since <ms>] [--until <ms>] [--sign-key <key>]\n\
+         \x20 ql audit keygen [--out <key>]\n\
          \x20 ql audit rotate <log.jsonl> --archive-dir <dir> [--reason <text>]\n\
          \x20 ql audit retention <archive-dir> [--min-keep-days <n>]\n\
          \n\
@@ -641,6 +749,58 @@ mod tests {
         assert!(man.contains(log.head()));
         assert!(out.join("verify.py").exists());
         assert!(out.join("VERIFY.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_signs_head_when_key_given() {
+        let mut log = AuditLog::new();
+        for i in 0..2u64 {
+            log.append(AuditEvent {
+                ts_millis: 1000 + i,
+                actor: "run".to_string(),
+                action: "policy.grant".to_string(),
+                target: format!("cap{i}"),
+                decision: Decision::Allow,
+                detail: String::new(),
+                system: None,
+            })
+            .unwrap();
+        }
+
+        let dir = std::env::temp_dir().join(format!("ql-sign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("log.jsonl");
+        std::fs::write(&log_path, log.to_jsonl().unwrap()).unwrap();
+
+        let id = ql_token::Identity::generate().unwrap();
+        let keyfile = dir.join("key.hex");
+        std::fs::write(&keyfile, id.seed_hex()).unwrap();
+
+        let out = dir.join("bundle");
+        let args = vec![
+            log_path.to_str().unwrap().to_string(),
+            "--out".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--sign-key".to_string(),
+            keyfile.to_str().unwrap().to_string(),
+        ];
+        let _ = export(&args);
+
+        let man: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        let sig = man["signature"].as_str().unwrap();
+        let pubkey = man["public_key"].as_str().unwrap();
+        let head = man["head_hash"].as_str().unwrap();
+
+        // The signature verifies over the head, against the bundled public key,
+        // and the head matches the real log head.
+        let pid = ql_token::PublicId::from_hex(pubkey).unwrap();
+        assert!(pid.verify(head.as_bytes(), sig).is_ok());
+        assert_eq!(head, log.head());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
