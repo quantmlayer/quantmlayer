@@ -167,6 +167,7 @@ fn record_revocation(h: &Handle, audit_path: Option<&str>) {
         target: format!("cell:{}", h.id),
         decision: Decision::Deny,
         detail: format!("revoked `{}` (pid {})", h.command, h.pid),
+        system: None,
     };
     if log.append(event).is_ok() {
         if let Ok(text) = log.to_jsonl() {

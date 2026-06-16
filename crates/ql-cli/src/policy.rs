@@ -10,7 +10,7 @@
 //! exists" — that anyone can re-verify with `ql audit verify`, without trusting
 //! the producer.
 
-use ql_audit::{AuditEvent, AuditLog, Decision};
+use ql_audit::{AuditEvent, AuditLog, Decision, SystemIdentity};
 use ql_learn::risk_report_for_profile;
 use ql_profile::{diff, Profile};
 use ql_risk::RiskLevel;
@@ -19,13 +19,15 @@ use std::path::Path;
 /// Append a policy record for `enforced` to the audit log at `log_path`,
 /// classifying each grant from `project_root`'s perspective. If `proposed` is
 /// given (the originally learned profile), the grant lines the approval added
-/// or removed are appended too — the reviewer-changes trail. Returns the number
-/// of records written.
+/// or removed are appended too — the reviewer-changes trail. When `system` is
+/// given, every record is attributed to that AI system (EU AI Act Art. 12).
+/// Returns the number of records written.
 pub fn record_enforced(
     log_path: &str,
     enforced: &Profile,
     proposed: Option<&Profile>,
     project_root: Option<&Path>,
+    system: Option<&SystemIdentity>,
 ) -> std::io::Result<usize> {
     let report = risk_report_for_profile(enforced, project_root);
     let mut log = load_or_new(log_path)?;
@@ -47,6 +49,7 @@ pub fn record_enforced(
             s.deny_by_default,
             report.basis
         ),
+        system: system.cloned(),
     };
     log.append(header).map_err(to_io)?;
     written += 1;
@@ -65,6 +68,7 @@ pub fn record_enforced(
             target: g.resource.clone(),
             decision,
             detail: format!("{:?}/{:?}: {}", g.level, g.confidence, g.reason),
+            system: system.cloned(),
         };
         log.append(event).map_err(to_io)?;
         written += 1;
@@ -80,6 +84,7 @@ pub fn record_enforced(
                 g.category,
                 &g.value,
                 "in enforced, not proposed",
+                system,
             );
             log.append(event).map_err(to_io)?;
             written += 1;
@@ -90,6 +95,7 @@ pub fn record_enforced(
                 g.category,
                 &g.value,
                 "in proposed, not enforced",
+                system,
             );
             log.append(event).map_err(to_io)?;
             written += 1;
@@ -102,7 +108,13 @@ pub fn record_enforced(
 }
 
 /// Build a `policy.add` / `policy.remove` change record.
-fn change_event(action: &str, category: &str, value: &str, detail: &str) -> AuditEvent {
+fn change_event(
+    action: &str,
+    category: &str,
+    value: &str,
+    detail: &str,
+    system: Option<&SystemIdentity>,
+) -> AuditEvent {
     AuditEvent {
         ts_millis: AuditLog::now_millis(),
         actor: "run".to_string(),
@@ -110,6 +122,7 @@ fn change_event(action: &str, category: &str, value: &str, detail: &str) -> Audi
         target: format!("{category} {value}"),
         decision: Decision::Info,
         detail: detail.to_string(),
+        system: system.cloned(),
     }
 }
 

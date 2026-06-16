@@ -43,6 +43,11 @@ pub struct AuditEvent {
     /// Free-form context (kept stable; it is part of the hash).
     #[serde(default)]
     pub detail: String,
+    /// The AI system this action is attributed to (EU AI Act Article 12 actor
+    /// identity), when known. Omitted from the record — and therefore from its
+    /// hash — when absent, so logs written without it verify exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemIdentity>,
 }
 
 /// The outcome recorded for an event.
@@ -52,6 +57,33 @@ pub enum Decision {
     Allow,
     Deny,
     Info,
+}
+
+/// The AI system an action is attributed to — the EU AI Act Article 12 "actor"
+/// identity. Distinct from [`AuditEvent::actor`], which names the QuantmLayer
+/// component that *recorded* the event (e.g. "broker", "run"); this names the
+/// deployed agent on whose behalf the action happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemIdentity {
+    /// The actor kind. Conventionally "ai_system".
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// A stable identifier for the deployed system (e.g. "coding-agent-prod").
+    pub system_id: String,
+    /// The model or version behind the system (e.g. a model snapshot id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+}
+
+impl SystemIdentity {
+    /// An `ai_system` identity with the given id and optional model version.
+    pub fn ai_system(system_id: impl Into<String>, model_version: Option<String>) -> Self {
+        Self {
+            kind: "ai_system".to_string(),
+            system_id: system_id.into(),
+            model_version,
+        }
+    }
 }
 
 /// A chained record: an event plus its position and hashes.
@@ -202,6 +234,7 @@ mod tests {
             target: target.into(),
             decision,
             detail: String::new(),
+            system: None,
         }
     }
 
@@ -260,5 +293,45 @@ mod tests {
         assert_eq!(recs[0].prev_hash, GENESIS);
         assert_eq!(recs[1].prev_hash, recs[0].hash);
         assert_eq!(log.head(), recs[3].hash);
+    }
+
+    #[test]
+    fn absent_system_is_not_serialized() {
+        // An event with no attributed system must serialize without a "system"
+        // key, so its bytes — and therefore its hash — match a pre-identity log.
+        let json = serde_json::to_string(&ev("session.start", "x", Decision::Info)).unwrap();
+        assert!(!json.contains("system"), "unexpected system field: {json}");
+    }
+
+    #[test]
+    fn attributed_system_chains_and_roundtrips() {
+        let mut log = AuditLog::new();
+        let mut event = ev("policy.enforce", "agent:demo", Decision::Info);
+        event.system = Some(SystemIdentity::ai_system(
+            "coding-agent-prod",
+            Some("model-2026-06".to_string()),
+        ));
+        log.append(event).unwrap();
+
+        let json = log.to_jsonl().unwrap();
+        assert!(json.contains("\"type\":\"ai_system\""));
+        assert!(json.contains("coding-agent-prod"));
+
+        let parsed = AuditLog::from_jsonl(&json).unwrap();
+        assert!(parsed.verify().is_ok());
+        assert_eq!(parsed.records(), log.records());
+    }
+
+    #[test]
+    fn editing_the_attributed_system_is_detected() {
+        let mut log = AuditLog::new();
+        let mut event = ev("policy.enforce", "agent:demo", Decision::Info);
+        event.system = Some(SystemIdentity::ai_system("real-agent", None));
+        log.append(event).unwrap();
+
+        let mut parsed = AuditLog::from_jsonl(&log.to_jsonl().unwrap()).unwrap();
+        // Re-attribute the action to a different system without rehashing.
+        parsed.records[0].event.system = Some(SystemIdentity::ai_system("spoofed-agent", None));
+        assert!(parsed.verify().is_err());
     }
 }

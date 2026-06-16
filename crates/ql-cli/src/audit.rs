@@ -125,6 +125,7 @@ fn append(args: &[String]) -> ExitCode {
         target,
         decision,
         detail,
+        system: None,
     };
     let (seq, hash) = match log.append(event) {
         Ok(rec) => (rec.seq, rec.hash.clone()),

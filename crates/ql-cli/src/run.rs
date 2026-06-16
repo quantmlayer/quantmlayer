@@ -29,6 +29,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut audit_path: Option<String> = None;
     let mut proposed_path: Option<String> = None;
     let mut issue_token_path: Option<String> = None;
+    let mut system_id: Option<String> = None;
+    let mut model_version: Option<String> = None;
     let mut verbose = false;
     let mut brokered = false;
 
@@ -40,6 +42,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--audit" => audit_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
             "--issue-token" => issue_token_path = it.next().cloned(),
+            "--system-id" => system_id = it.next().cloned(),
+            "--model-version" => model_version = it.next().cloned(),
             "--verbose" => verbose = true,
             "--broker" => brokered = true,
             other => {
@@ -92,11 +96,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
     if let Some(audit) = audit_path.as_deref() {
         let project_root = std::env::current_dir().ok();
         let proposed = proposed_path.as_deref().and_then(load_profile_lenient);
+        // Attribute the records to the agent identity, if the operator named one.
+        let system = system_id
+            .as_deref()
+            .map(|id| ql_audit::SystemIdentity::ai_system(id, model_version.clone()));
         match crate::policy::record_enforced(
             audit,
             &profile,
             proposed.as_ref(),
             project_root.as_deref(),
+            system.as_ref(),
         ) {
             Ok(n) => eprintln!("ql: wrote {n} policy record(s) to {audit}"),
             Err(e) => eprintln!("ql run: could not write policy log {audit}: {e}"),

@@ -64,7 +64,7 @@ fn print_usage() {
         "ql {VERSION} — security runtime for coding agents\n\
          \n\
          USAGE:\n\
-         \x20 ql run      --profile <p.yaml> [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--verbose] [--broker] -- <cmd...>\n\
+         \x20 ql run      --profile <p.yaml> [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--verbose] [--broker] -- <cmd...>\n\
          \x20 ql learn    [--out <p.yaml>] [--verbose] -- <cmd...>\n\
          \x20 ql validate --profile <p.yaml>\n\
          \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
