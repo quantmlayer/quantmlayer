@@ -1,0 +1,13 @@
+[package]
+name = "ql-risk"
+description = "Risk classification for synthesized least-privilege grants: turns a profile into a reviewable, per-grant risk report."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# INVARIANT: pure and OS-independent, like ql-profile. No platform crates — this
+# is analysis over already-captured evidence, not enforcement.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

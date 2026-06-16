@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 ql-profile = { workspace = true }
+ql-risk = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 sha2 = "0.10"

@@ -23,11 +23,13 @@
 mod digest;
 mod error;
 mod observation;
+mod risk;
 mod synth;
 mod trace;
 
 pub use error::{LearnError, Result};
 pub use observation::Observation;
+pub use risk::build_risk_report;
 pub use synth::{synthesize, SynthResult};
 
 /// Trace `command` to completion and synthesize a least-privilege profile from

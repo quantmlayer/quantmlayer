@@ -9,6 +9,7 @@ members = [
     "crates/ql-learn",
     "crates/ql-audit",
     "crates/ql-token",
+    "crates/ql-risk",
 ]
 # ql-lsm needs the BPF build toolchain (clang + libelf/zlib via libbpf-sys), so
 # it is kept out of the default workspace build and built standalone. This keeps
@@ -36,3 +37,4 @@ ql-broker = { path = "crates/ql-broker" }
 ql-learn = { path = "crates/ql-learn" }
 ql-audit = { path = "crates/ql-audit" }
 ql-token = { path = "crates/ql-token" }
+ql-risk = { path = "crates/ql-risk" }

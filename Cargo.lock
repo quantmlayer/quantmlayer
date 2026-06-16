@@ -533,6 +533,7 @@ dependencies = [
  "libc",
  "nix 0.27.1",
  "ql-profile",
+ "ql-risk",
  "sha2",
 ]
 
@@ -554,6 +555,14 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror",
+]
+
+[[package]]
+name = "ql-risk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
