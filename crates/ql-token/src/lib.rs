@@ -20,8 +20,8 @@ pub use capability::{Action, Capability};
 pub use error::{Result, TokenError};
 pub use identity::{Identity, PublicId};
 pub use token::{
-    authorize, delegate, issue_root, sign_action, verify_action, verify_chain, ActionBody,
-    AuthzRequest, SignedAction, Token, TokenBody,
+    authorize, default_expiry, delegate, issue_root, sign_action, verify_action, verify_chain,
+    ActionBody, AuthzRequest, SignedAction, Token, TokenBody, DEFAULT_TTL_MS,
 };
 
 /// A self-contained narrated walkthrough of the whole flow, for `ql token demo`.
@@ -136,6 +136,24 @@ mod tests {
             net_domains: vec!["pypi.org".into()],
             allow_exec: vec!["/usr/bin/python3".into()],
         }
+    }
+
+    #[test]
+    fn default_ttl_bounds_expiry_and_token_expires() {
+        let now = 1_000_000;
+        assert_eq!(default_expiry(now), now + DEFAULT_TTL_MS);
+
+        let root = Identity::generate().unwrap();
+        let a = Identity::generate().unwrap();
+        let rt = issue_root(&root, &a.public(), broad_cap(), default_expiry(now)).unwrap();
+
+        // Valid before expiry; rejected once the bounded lifetime has passed.
+        assert!(verify_chain(std::slice::from_ref(&rt), &[root.public()], now).is_ok());
+        let after = default_expiry(now) + 1;
+        assert!(matches!(
+            verify_chain(&[rt], &[root.public()], after),
+            Err(TokenError::Expired)
+        ));
     }
 
     #[test]

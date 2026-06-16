@@ -28,6 +28,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut workspace: Option<String> = None;
     let mut audit_path: Option<String> = None;
     let mut proposed_path: Option<String> = None;
+    let mut issue_token_path: Option<String> = None;
     let mut verbose = false;
     let mut brokered = false;
 
@@ -38,6 +39,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
+            "--issue-token" => issue_token_path = it.next().cloned(),
             "--verbose" => verbose = true,
             "--broker" => brokered = true,
             other => {
@@ -98,6 +100,22 @@ pub fn cmd(args: &[String]) -> ExitCode {
         ) {
             Ok(n) => eprintln!("ql: wrote {n} policy record(s) to {audit}"),
             Err(e) => eprintln!("ql run: could not write policy log {audit}: {e}"),
+        }
+    }
+
+    // Per-subtask credential: mint a fresh, capability-attenuated, expiring
+    // identity for this cell, scoped to exactly what the profile permits.
+    if let Some(out) = issue_token_path.as_deref() {
+        match crate::token_issue::issue_subtask(&profile, now_ms()) {
+            Ok(bundle) => match crate::token_issue::write_bundle(out, &bundle) {
+                Ok(()) => eprintln!(
+                    "ql: issued subtask token to {out} (trust root {}, expires {})",
+                    &bundle.trust_root[..16.min(bundle.trust_root.len())],
+                    bundle.not_after_ms
+                ),
+                Err(e) => eprintln!("ql run: could not write token bundle {out}: {e}"),
+            },
+            Err(e) => eprintln!("ql run: could not issue subtask token: {e}"),
         }
     }
 

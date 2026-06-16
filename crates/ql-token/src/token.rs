@@ -64,6 +64,18 @@ impl Token {
     }
 }
 
+/// A sane bounded default lifetime for issued tokens: one hour. Issuance sites
+/// should prefer this over `0` (no expiry) so a leaked or forgotten token stops
+/// working on its own.
+pub const DEFAULT_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The expiry timestamp for a token issued at `now_ms` with the default
+/// lifetime. Saturating, so a clock near `u64::MAX` cannot wrap to a tiny
+/// expiry that would be instantly stale.
+pub fn default_expiry(now_ms: u64) -> u64 {
+    now_ms.saturating_add(DEFAULT_TTL_MS)
+}
+
 /// Issue a root token: a trusted authority grants `capability` to `subject`.
 pub fn issue_root(
     authority: &Identity,
