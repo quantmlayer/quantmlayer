@@ -24,10 +24,12 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)] // this crate is pure data; it must never need unsafe
 
+mod diff;
 mod error;
 mod export;
 mod policy;
 
+pub use diff::{diff, GrantRef, PolicyDiff};
 pub use error::{ProfileError, Result};
 pub use export::{
     to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,

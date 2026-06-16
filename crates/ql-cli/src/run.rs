@@ -27,6 +27,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut profile_path: Option<String> = None;
     let mut workspace: Option<String> = None;
     let mut audit_path: Option<String> = None;
+    let mut proposed_path: Option<String> = None;
     let mut verbose = false;
     let mut brokered = false;
 
@@ -36,6 +37,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--profile" => profile_path = it.next().cloned(),
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
+            "--proposed" => proposed_path = it.next().cloned(),
             "--verbose" => verbose = true,
             "--broker" => brokered = true,
             other => {
@@ -87,7 +89,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
     // session, and the reason for each grant, before the agent runs.
     if let Some(audit) = audit_path.as_deref() {
         let project_root = std::env::current_dir().ok();
-        match crate::policy::record_enforced(audit, &profile, project_root.as_deref()) {
+        let proposed = proposed_path.as_deref().and_then(load_profile_lenient);
+        match crate::policy::record_enforced(
+            audit,
+            &profile,
+            proposed.as_ref(),
+            project_root.as_deref(),
+        ) {
             Ok(n) => eprintln!("ql: wrote {n} policy record(s) to {audit}"),
             Err(e) => eprintln!("ql run: could not write policy log {audit}: {e}"),
         }
@@ -201,6 +209,25 @@ fn nanos() -> u128 {
 }
 
 /// Read and validate a profile, mapping failures to an exit code.
+/// Load a profile for diffing without aborting the run on failure: a missing or
+/// invalid proposed baseline just means no diff is recorded, never a refused
+/// run. Returns `None` (with a warning) rather than an exit code.
+fn load_profile_lenient(path: &str) -> Option<Profile> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => match Profile::from_yaml(&s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("ql run: proposed profile {path} is invalid ({e}); skipping diff");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("ql run: cannot read proposed profile {path} ({e}); skipping diff");
+            None
+        }
+    }
+}
+
 fn load_profile(path: &str) -> Result<Profile, ExitCode> {
     let yaml = std::fs::read_to_string(path).map_err(|e| {
         eprintln!("ql run: cannot read {path}: {e}");

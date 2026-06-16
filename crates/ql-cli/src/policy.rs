@@ -12,20 +12,24 @@
 
 use ql_audit::{AuditEvent, AuditLog, Decision};
 use ql_learn::risk_report_for_profile;
-use ql_profile::Profile;
+use ql_profile::{diff, Profile};
 use ql_risk::RiskLevel;
 use std::path::Path;
 
-/// Append a policy record for `profile` to the audit log at `log_path`,
-/// classifying each grant from `project_root`'s perspective. Returns the number
-/// of records written (header + one per grant).
+/// Append a policy record for `enforced` to the audit log at `log_path`,
+/// classifying each grant from `project_root`'s perspective. If `proposed` is
+/// given (the originally learned profile), the grant lines the approval added
+/// or removed are appended too — the reviewer-changes trail. Returns the number
+/// of records written.
 pub fn record_enforced(
     log_path: &str,
-    profile: &Profile,
+    enforced: &Profile,
+    proposed: Option<&Profile>,
     project_root: Option<&Path>,
 ) -> std::io::Result<usize> {
-    let report = risk_report_for_profile(profile, project_root);
+    let report = risk_report_for_profile(enforced, project_root);
     let mut log = load_or_new(log_path)?;
+    let mut written = 0usize;
 
     // Header: commit to the policy as a whole and its risk summary.
     let s = &report.summary;
@@ -45,6 +49,7 @@ pub fn record_enforced(
         ),
     };
     log.append(header).map_err(to_io)?;
+    written += 1;
 
     // One record per grant — the "why each permission exists" trail.
     for g in &report.grants {
@@ -62,11 +67,50 @@ pub fn record_enforced(
             detail: format!("{:?}/{:?}: {}", g.level, g.confidence, g.reason),
         };
         log.append(event).map_err(to_io)?;
+        written += 1;
+    }
+
+    // Reviewer-changes trail: what the approved policy added or removed relative
+    // to the originally proposed (learned) one.
+    if let Some(prop) = proposed {
+        let changes = diff(prop, enforced);
+        for g in &changes.added {
+            let event = change_event(
+                "policy.add",
+                g.category,
+                &g.value,
+                "in enforced, not proposed",
+            );
+            log.append(event).map_err(to_io)?;
+            written += 1;
+        }
+        for g in &changes.removed {
+            let event = change_event(
+                "policy.remove",
+                g.category,
+                &g.value,
+                "in proposed, not enforced",
+            );
+            log.append(event).map_err(to_io)?;
+            written += 1;
+        }
     }
 
     let text = log.to_jsonl().map_err(to_io)?;
     std::fs::write(log_path, text)?;
-    Ok(report.grants.len() + 1)
+    Ok(written)
+}
+
+/// Build a `policy.add` / `policy.remove` change record.
+fn change_event(action: &str, category: &str, value: &str, detail: &str) -> AuditEvent {
+    AuditEvent {
+        ts_millis: AuditLog::now_millis(),
+        actor: "run".to_string(),
+        action: action.to_string(),
+        target: format!("{category} {value}"),
+        decision: Decision::Info,
+        detail: detail.to_string(),
+    }
 }
 
 /// Load an existing chain to append to, or start a fresh one if the file does

@@ -1,5 +1,8 @@
 # Rust build output
 /target
+# ql-lsm is an excluded workspace member built standalone; its nested target/
+# is not matched by the root-anchored /target above, so ignore it explicitly.
+crates/ql-lsm/target/
 
 # asciinema recordings — the final GIF is committed, raw casts are not
 *.cast
@@ -22,4 +25,3 @@ __pycache__/
 # OS / editor cruft
 .DS_Store
 *.swp
-crates/ql-lsm/target/
