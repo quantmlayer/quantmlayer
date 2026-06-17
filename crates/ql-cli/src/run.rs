@@ -34,6 +34,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut model_version: Option<String> = None;
     let mut verbose = false;
     let mut brokered = false;
+    let mut require_signed = false;
+    let mut trust_signers: Vec<String> = Vec::new();
 
     let mut it = opts.iter();
     while let Some(a) = it.next() {
@@ -47,6 +49,12 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--model-version" => model_version = it.next().cloned(),
             "--verbose" => verbose = true,
             "--broker" => brokered = true,
+            "--require-signed" => require_signed = true,
+            "--trust-signer" => {
+                if let Some(v) = it.next() {
+                    trust_signers.push(v.clone());
+                }
+            }
             other => {
                 eprintln!("ql run: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -68,6 +76,19 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(code) => return code,
     };
+
+    // Signed-profile gate. A profile carrying a signature must verify; with
+    // --require-signed or --trust-signer, a valid authorized signature is
+    // mandatory. Runs BEFORE any runtime profile mutation (e.g. --workspace) so
+    // the signature covers exactly what was authored and signed.
+    match check_signature(&profile, require_signed, &trust_signers) {
+        Ok(Some(signer)) => {
+            let short = &signer[..16.min(signer.len())];
+            eprintln!("ql: profile signature OK (signer {short}…)");
+        }
+        Ok(None) => {}
+        Err(code) => return code,
+    }
 
     // If a workspace is given, grant read-write to it.
     if let Some(ws) = workspace {
@@ -159,6 +180,56 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Enforce the operator's signed-profile policy before arming.
+///
+/// Returns the verified signer's public key when a valid signature is present,
+/// `Ok(None)` when no signature is required and none is attached, or an error
+/// exit code when the policy is violated — a missing signature (under
+/// `--require-signed`/`--trust-signer`), an invalid signature (tampered
+/// profile), or a signature from an untrusted signer.
+fn check_signature(
+    profile: &Profile,
+    require_signed: bool,
+    trust_signers: &[String],
+) -> Result<Option<String>, ExitCode> {
+    let required = require_signed || !trust_signers.is_empty();
+    let Some(sig) = profile.signature.clone() else {
+        if required {
+            eprintln!("ql run: profile is unsigned but a signature is required");
+            return Err(ExitCode::from(1));
+        }
+        return Ok(None);
+    };
+    let bytes = match profile.signing_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("ql run: cannot canonicalize profile: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    let pid = match ql_token::PublicId::from_hex(&sig.public_key) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ql run: bad public key in profile signature: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    if pid.verify(&bytes, &sig.value).is_err() {
+        eprintln!("ql run: profile signature INVALID — refusing to arm");
+        return Err(ExitCode::from(1));
+    }
+    if !trust_signers.is_empty() {
+        let pk = &sig.public_key;
+        let trusted = trust_signers.iter().any(|t| t.eq_ignore_ascii_case(pk));
+        if !trusted {
+            let short = &pk[..16.min(pk.len())];
+            eprintln!("ql run: signer {short}… not trusted — refusing to arm");
+            return Err(ExitCode::from(1));
+        }
+    }
+    Ok(Some(sig.public_key))
 }
 
 /// Standard run: full containment with default-deny network.
@@ -383,4 +454,50 @@ fn load_profile(path: &str) -> Result<Profile, ExitCode> {
 /// Out-of-range or negative codes collapse to 1 (generic failure).
 fn clamp_code(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_default() -> (Profile, String) {
+        let id = ql_token::Identity::generate().unwrap();
+        let mut p = Profile::default();
+        let bytes = p.signing_bytes().unwrap();
+        p.signature = Some(ql_profile::ProfileSignature {
+            algorithm: "ed25519".to_string(),
+            public_key: id.public().to_hex(),
+            value: id.sign(&bytes),
+        });
+        (p, id.public().to_hex())
+    }
+
+    #[test]
+    fn gate_accepts_valid_trusted_signature() {
+        let (p, signer) = signed_default();
+        let got = check_signature(&p, true, std::slice::from_ref(&signer)).unwrap();
+        assert_eq!(got, Some(signer));
+    }
+
+    #[test]
+    fn gate_rejects_tampered_signature() {
+        let (mut p, _) = signed_default();
+        // Change the policy after signing — the signature must no longer verify.
+        p.network.default_deny = !p.network.default_deny;
+        assert!(check_signature(&p, false, &[]).is_err());
+    }
+
+    #[test]
+    fn gate_requires_signature_only_when_asked() {
+        let unsigned = Profile::default();
+        assert!(check_signature(&unsigned, true, &[]).is_err());
+        assert!(check_signature(&unsigned, false, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn gate_rejects_untrusted_signer() {
+        let (p, _) = signed_default();
+        let other = ql_token::Identity::generate().unwrap().public().to_hex();
+        assert!(check_signature(&p, false, std::slice::from_ref(&other)).is_err());
+    }
 }

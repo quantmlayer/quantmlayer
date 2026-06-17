@@ -54,6 +54,23 @@ pub fn record_enforced(
     log.append(header).map_err(to_io)?;
     written += 1;
 
+    // If the profile carries an authorizing signature, record who signed it and
+    // the signature that committed this policy — so the trail names the
+    // change-control authority for the session, not just the policy itself.
+    if let Some(sig) = &enforced.signature {
+        let event = AuditEvent {
+            ts_millis: AuditLog::now_millis(),
+            actor: "run".to_string(),
+            action: "policy.signed".to_string(),
+            target: sig.public_key.clone(),
+            decision: Decision::Info,
+            detail: format!("{}; sig {}", sig.algorithm, sig.value),
+            system: system.cloned(),
+        };
+        log.append(event).map_err(to_io)?;
+        written += 1;
+    }
+
     // One record per grant — the "why each permission exists" trail.
     for g in &report.grants {
         let decision = match g.level {
