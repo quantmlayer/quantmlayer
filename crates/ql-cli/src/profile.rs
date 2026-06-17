@@ -14,7 +14,7 @@
 //!
 //! Mint a signing key with `ql audit keygen --out <file>`.
 
-use ql_profile::{Profile, ProfileSignature};
+use ql_profile::{ApprovedFor, Profile, ProfileSignature};
 use std::process::ExitCode;
 
 pub fn cmd(args: &[String]) -> ExitCode {
@@ -37,11 +37,15 @@ fn sign(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut key: Option<&str> = None;
     let mut out: Option<&str> = None;
+    let mut approve_commit: Option<String> = None;
+    let mut approve_image: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--key" => key = it.next().map(String::as_str),
             "--out" => out = it.next().map(String::as_str),
+            "--approve-commit" => approve_commit = it.next().cloned(),
+            "--approve-image" => approve_image = it.next().cloned(),
             s if !s.starts_with('-') && path.is_none() => path = Some(s),
             other => {
                 eprintln!("ql profile sign: unexpected argument `{other}`");
@@ -72,6 +76,15 @@ fn sign(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // If the signer attests an approval context, set it before computing the
+    // bytes to sign, so the signature covers it. Flags are authoritative over
+    // any approved_for already in the file.
+    if approve_commit.is_some() || approve_image.is_some() {
+        profile.approved_for = Some(ApprovedFor {
+            commit: approve_commit,
+            image_digest: approve_image,
+        });
+    }
     // Sign the canonical bytes (profile minus any existing signature), so
     // re-signing replaces a prior signature rather than nesting under it.
     let bytes = match profile.signing_bytes() {
@@ -200,6 +213,7 @@ fn print_help() {
          \n\
          USAGE:\n\
          \x20 ql profile sign <profile.yaml> --key <seed-hex-file> [--out <path>]\n\
+         \x20                  [--approve-commit <hash>] [--approve-image <digest>]\n\
          \x20 ql profile verify <profile.yaml> [--signer <pubkey-hex>]\n\
          \n\
          The signature covers the profile minus the signature field, so a signed\n\
@@ -225,6 +239,25 @@ mod tests {
             value: "cd".to_string(),
         });
         assert_eq!(bare, signed.signing_bytes().unwrap());
+    }
+
+    #[test]
+    fn approved_for_is_covered_by_the_signature() {
+        // approved_for is part of signing_bytes, so changing it changes the bytes
+        // a signature commits to — binding the policy to its approved context.
+        let a = Profile {
+            approved_for: Some(ApprovedFor {
+                commit: Some("aaa".to_string()),
+                image_digest: None,
+            }),
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.approved_for = Some(ApprovedFor {
+            commit: Some("bbb".to_string()),
+            image_digest: None,
+        });
+        assert_ne!(a.signing_bytes().unwrap(), b.signing_bytes().unwrap());
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut brokered = false;
     let mut require_signed = false;
     let mut trust_signers: Vec<String> = Vec::new();
+    let mut expect_commit: Option<String> = None;
+    let mut expect_image: Option<String> = None;
 
     let mut it = opts.iter();
     while let Some(a) = it.next() {
@@ -55,6 +57,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
                     trust_signers.push(v.clone());
                 }
             }
+            "--expect-commit" => expect_commit = it.next().cloned(),
+            "--expect-image" => expect_image = it.next().cloned(),
             other => {
                 eprintln!("ql run: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -85,6 +89,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Ok(Some(signer)) => {
             let short = &signer[..16.min(signer.len())];
             eprintln!("ql: profile signature OK (signer {short}…)");
+            // The signed approval context is only trustworthy once the signature
+            // checks out, so enforce it here, inside the valid-signature branch.
+            let want_commit = expect_commit.as_deref();
+            let want_image = expect_image.as_deref();
+            if let Err(code) = check_approved_for(&profile, want_commit, want_image) {
+                return code;
+            }
         }
         Ok(None) => {}
         Err(code) => return code,
@@ -230,6 +241,36 @@ fn check_signature(
         }
     }
     Ok(Some(sig.public_key))
+}
+
+/// Enforce the signed `approved_for` binding against the operator's asserted run
+/// context (`--expect-commit` / `--expect-image`). A mismatch means the profile
+/// was approved for a different commit or image than the one actually running —
+/// refuse to arm. Only meaningful for a validly-signed profile; the caller gates
+/// on that.
+fn check_approved_for(
+    profile: &Profile,
+    expect_commit: Option<&str>,
+    expect_image: Option<&str>,
+) -> Result<(), ExitCode> {
+    let Some(approved) = &profile.approved_for else {
+        return Ok(());
+    };
+    if let (Some(want), Some(actual)) = (&approved.commit, expect_commit) {
+        if !want.eq_ignore_ascii_case(actual) {
+            let a = &want[..12.min(want.len())];
+            let b = &actual[..12.min(actual.len())];
+            eprintln!("ql run: approved for commit {a}…, running {b}… — refusing");
+            return Err(ExitCode::from(1));
+        }
+    }
+    if let (Some(want), Some(actual)) = (&approved.image_digest, expect_image) {
+        if !want.eq_ignore_ascii_case(actual) {
+            eprintln!("ql run: profile approved for a different image — refusing");
+            return Err(ExitCode::from(1));
+        }
+    }
+    Ok(())
 }
 
 /// Standard run: full containment with default-deny network.
@@ -499,5 +540,34 @@ mod tests {
         let (p, _) = signed_default();
         let other = ql_token::Identity::generate().unwrap().public().to_hex();
         assert!(check_signature(&p, false, std::slice::from_ref(&other)).is_err());
+    }
+
+    fn approved(commit: Option<&str>, image: Option<&str>) -> Profile {
+        Profile {
+            approved_for: Some(ql_profile::ApprovedFor {
+                commit: commit.map(str::to_string),
+                image_digest: image.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn approved_for_commit_matches_and_mismatches() {
+        let p = approved(Some("abc123"), None);
+        assert!(check_approved_for(&p, Some("abc123"), None).is_ok());
+        assert!(check_approved_for(&p, Some("def456"), None).is_err());
+        // Operator asserts no context -> nothing to check.
+        assert!(check_approved_for(&p, None, None).is_ok());
+        // Unpinned profile -> ok regardless of context.
+        let q = Profile::default();
+        assert!(check_approved_for(&q, Some("anything"), None).is_ok());
+    }
+
+    #[test]
+    fn approved_for_image_mismatch_refuses() {
+        let p = approved(None, Some("sha256:aaaa"));
+        assert!(check_approved_for(&p, None, Some("sha256:aaaa")).is_ok());
+        assert!(check_approved_for(&p, None, Some("sha256:bbbb")).is_err());
     }
 }

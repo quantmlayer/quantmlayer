@@ -184,6 +184,7 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
             enforce: exec_fully_covered,
             allow_digests,
         },
+        approved_for: None,
         signature: None,
     };
 

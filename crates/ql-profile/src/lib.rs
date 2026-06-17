@@ -87,12 +87,33 @@ pub struct Profile {
     #[serde(default)]
     pub exec: ExecPolicy,
 
+    /// The deployment context this profile was approved for (git commit and/or
+    /// container image digest), if pinned. Part of [`Profile::signing_bytes`],
+    /// so a signature binds the policy to the context it was approved against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_for: Option<ApprovedFor>,
+
     /// Detached signature from an authorizing party (e.g. a security admin),
     /// if present. Covers [`Profile::signing_bytes`] — i.e. everything in this
     /// profile *except* this field — so a signed profile cannot be widened
     /// without invalidating it. Absent on unsigned profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<ProfileSignature>,
+}
+
+/// The deployment context a [`Profile`] was approved for: the git commit and/or
+/// container image digest the signing party attested this policy against.
+/// Because it is part of [`Profile::signing_bytes`], the signature binds the
+/// policy to its approved context — a profile approved for one commit/image
+/// cannot be silently reused for another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApprovedFor {
+    /// The git commit this policy was approved for, if pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The container image digest this policy was approved for, if pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
 }
 
 /// A detached signature attached to a [`Profile`] by an authorizing party.
@@ -223,6 +244,7 @@ impl Default for Profile {
             resources: ResourceLimits::default(),
             processes: ProcPolicy::default(),
             exec: ExecPolicy::default(),
+            approved_for: None,
             signature: None,
         }
     }

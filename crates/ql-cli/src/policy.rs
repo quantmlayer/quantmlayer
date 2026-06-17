@@ -58,13 +58,22 @@ pub fn record_enforced(
     // the signature that committed this policy — so the trail names the
     // change-control authority for the session, not just the policy itself.
     if let Some(sig) = &enforced.signature {
+        let mut detail = format!("{}; sig {}", sig.algorithm, sig.value);
+        if let Some(ap) = &enforced.approved_for {
+            if let Some(c) = &ap.commit {
+                detail = format!("{detail}; commit {c}");
+            }
+            if let Some(i) = &ap.image_digest {
+                detail = format!("{detail}; image {i}");
+            }
+        }
         let event = AuditEvent {
             ts_millis: AuditLog::now_millis(),
             actor: "run".to_string(),
             action: "policy.signed".to_string(),
             target: sig.public_key.clone(),
             decision: Decision::Info,
-            detail: format!("{}; sig {}", sig.algorithm, sig.value),
+            detail,
             system: system.cloned(),
         };
         log.append(event).map_err(to_io)?;
