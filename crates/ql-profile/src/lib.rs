@@ -86,6 +86,28 @@ pub struct Profile {
     /// Additive over `processes`; off unless `exec.enforce` is set.
     #[serde(default)]
     pub exec: ExecPolicy,
+
+    /// Detached signature from an authorizing party (e.g. a security admin),
+    /// if present. Covers [`Profile::signing_bytes`] — i.e. everything in this
+    /// profile *except* this field — so a signed profile cannot be widened
+    /// without invalidating it. Absent on unsigned profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ProfileSignature>,
+}
+
+/// A detached signature attached to a [`Profile`] by an authorizing party.
+/// It binds the profile's contents to a signer's key, enabling separation of
+/// duties: the kernel enforces only what an authorized signer approved, and a
+/// developer cannot quietly widen a profile they were handed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSignature {
+    /// Signature algorithm. Currently always `"ed25519"`.
+    pub algorithm: String,
+    /// The signer's public key, hex-encoded — what a verifier checks against
+    /// its set of trusted/authorized signers.
+    pub public_key: String,
+    /// The detached signature, hex-encoded, over the profile's signing bytes.
+    pub value: String,
 }
 
 impl Profile {
@@ -111,6 +133,17 @@ impl Profile {
     /// Serialize this profile to JSON (for export / API transport).
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// The canonical bytes a signature covers: this profile as compact JSON with
+    /// the [`signature`](Profile::signature) field stripped. Canonicalizing
+    /// through the typed model (not the raw YAML) means reformatting, reordering,
+    /// or re-commenting the source document cannot invalidate a valid signature —
+    /// only a change to the *policy* can.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        let mut bare = self.clone();
+        bare.signature = None;
+        Ok(serde_json::to_vec(&bare)?)
     }
 
     /// Check semantic validity. Parsing succeeds for many documents that are
@@ -190,6 +223,7 @@ impl Default for Profile {
             resources: ResourceLimits::default(),
             processes: ProcPolicy::default(),
             exec: ExecPolicy::default(),
+            signature: None,
         }
     }
 }
