@@ -129,12 +129,12 @@ fn render_markdown(results: &[(attack::Attack, Vec<Outcome>)]) -> String {
          point is that it derives and applies the equivalent restrictions \
          automatically from the agent's observed behavior, on the real host \
          filesystem, with no separate image to build or maintain.\n\n\
-         **E2B** and **Daytona** are a different category — *remote-execution* \
-         sandboxes that run the agent on a separate machine. Scoring them on \
-         these host-threat attacks would be apples-to-oranges (their isolation \
-         comes from the agent not being on your machine at all), so they are not \
-         shown as a column here. See \"How this differs from cloud sandboxes\" \
-         in the README for an honest comparison of the two models.\n",
+         *Remote-execution* sandboxes that run the agent on a separate machine - \
+         scoring them on these host-threat attacks would be apples-to-oranges \
+         (their isolation comes from the agent not being on your machine at \
+         all), so they are not shown as a column here. See \"How this differs \
+         from cloud sandboxes\" in the README for an honest comparison of the \
+         two models.\n",
     );
     s
 }
