@@ -25,6 +25,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::RawFd;
 
+use ql_profile::{ExecPolicy, HashAlgo, Profile};
+
 // ---- raw constants not exposed by libc -------------------------------------
 
 const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
@@ -159,6 +161,29 @@ impl ExecSupervisor {
     /// Build a supervisor from a set of approved lowercase-hex sha256 digests.
     pub fn new(allow: HashSet<String>) -> Self {
         ExecSupervisor { allow }
+    }
+
+    /// Build the allowlist from a profile's [`ExecPolicy`].
+    ///
+    /// Only **sha256** digests are honored: this wall hashes binaries with
+    /// sha256, so a digest in another algorithm cannot be matched here and its
+    /// binary is denied (fail-closed). In practice profiles use sha256 (the
+    /// default and recommended algorithm). When the profile is signed and
+    /// verified before arming, this allowlist is therefore *attested* — it cannot
+    /// be widened without breaking the signature.
+    pub fn from_exec_policy(policy: &ExecPolicy) -> Self {
+        let allow = policy
+            .allow_digests
+            .iter()
+            .filter(|d| d.algo() == HashAlgo::Sha256)
+            .map(|d| d.hex().to_string())
+            .collect();
+        ExecSupervisor::new(allow)
+    }
+
+    /// Convenience: build from a whole [`Profile`] (uses `profile.exec`).
+    pub fn from_profile(profile: &Profile) -> Self {
+        Self::from_exec_policy(&profile.exec)
     }
 
     /// The pure allow/deny decision. `None` (could not hash) is fail-closed.
@@ -394,5 +419,32 @@ mod tests {
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
+
+    #[test]
+    fn from_exec_policy_honors_sha256_digests() {
+        use ql_profile::ExecDigest;
+        let d = ExecDigest::new(HashAlgo::Sha256, "a".repeat(64)).unwrap();
+        let policy = ExecPolicy {
+            enforce: true,
+            allow_digests: vec![d.clone()],
+        };
+        let s = ExecSupervisor::from_exec_policy(&policy);
+        assert_eq!(s.decide(Some(d.hex())), Decision::Allow);
+        assert_eq!(s.decide(Some("b".repeat(64).as_str())), Decision::Deny);
+        assert_eq!(s.decide(None), Decision::Deny);
+    }
+
+    #[test]
+    fn from_exec_policy_skips_non_sha256() {
+        use ql_profile::ExecDigest;
+        // A sha512 digest cannot be matched by this sha256 wall -> fail-closed.
+        let d = ExecDigest::new(HashAlgo::Sha512, "a".repeat(128)).unwrap();
+        let policy = ExecPolicy {
+            enforce: true,
+            allow_digests: vec![d.clone()],
+        };
+        let s = ExecSupervisor::from_exec_policy(&policy);
+        assert_eq!(s.decide(Some(d.hex())), Decision::Deny);
     }
 }
