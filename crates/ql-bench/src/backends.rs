@@ -850,6 +850,7 @@ fn exec_attack_profile(workspace: &Path) -> Profile {
     p.exec = ExecPolicy {
         enforce: true,
         allow_digests: vec![sh],
+        ..Default::default()
     };
     p
 }

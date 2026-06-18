@@ -21,7 +21,10 @@
 //! in the exec ledger but never feeds the verdict, because a multi-threaded
 //! tracee could rewrite it between our read and the kernel's copy (the
 //! seccomp-notify TOCTOU caveat). The decision rides on the stable content
-//! digest; see [`read_argv`].
+//! digest; see [`read_argv`]. After allowing an exec it can optionally read the
+//! *committed* argv (post-CONTINUE, from `/proc/<pid>/cmdline`) — the sound copy
+//! the new process actually sees — to support detect-and-act; see
+//! [`read_committed_argv`] and [`ExecSupervisor::with_committed_argv`].
 //!
 //! This module is the reusable core. Cell wiring, profile-sourced allowlists, and
 //! audit records are layered on top in later slices; here the allowlist is a flat
@@ -33,6 +36,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::RawFd;
+use std::time::Duration;
 
 use ql_profile::{ExecPolicy, HashAlgo, Profile};
 
@@ -123,6 +127,14 @@ pub struct ExecEvent<'a> {
     /// this read and the kernel's; see [`read_argv`]). The verdict is on the
     /// content digest, which is stable.
     pub argv: &'a [String],
+    /// The **committed** argv — what the kernel installed in the new mm, read
+    /// from `/proc/<pid>/cmdline` *after* this exec was allowed to proceed (see
+    /// [`read_committed_argv`]). Unlike [`argv`](Self::argv) this is the immutable
+    /// copy the new process actually sees, so it is *sound* input for a decision
+    /// — but it is post-commit, so it supports detect-and-act (e.g. a later kill),
+    /// not a pre-commit gate. Empty unless committed capture is enabled and the
+    /// exec was allowed and confirmed within the poll budget.
+    pub committed_argv: &'a [String],
     /// sha256 hex of the resolved binary, or `None` if it could not be hashed.
     pub digest: Option<&'a str>,
     /// The verdict.
@@ -182,12 +194,25 @@ impl Drop for Listener {
 /// sha256 digests (lowercase hex). See the [module docs](self).
 pub struct ExecSupervisor {
     allow: HashSet<String>,
+    capture_committed: bool,
 }
 
 impl ExecSupervisor {
     /// Build a supervisor from a set of approved lowercase-hex sha256 digests.
     pub fn new(allow: HashSet<String>) -> Self {
-        ExecSupervisor { allow }
+        ExecSupervisor {
+            allow,
+            capture_committed: false,
+        }
+    }
+
+    /// Enable reading the **committed** argv (sound, post-CONTINUE) on allowed
+    /// execs, for audit/diagnostics. Off by default because it costs a bounded
+    /// `/proc/<pid>/cmdline` poll per allowed exec (see [`read_committed_argv`]).
+    /// Builder-style: consumes and returns `self`.
+    pub fn with_committed_argv(mut self, on: bool) -> Self {
+        self.capture_committed = on;
+        self
     }
 
     /// Build the allowlist from a profile's [`ExecPolicy`].
@@ -265,9 +290,13 @@ impl ExecSupervisor {
         Ok(Listener { fd })
     }
 
-    /// Service exactly one notification: hash the target, decide, report via
-    /// `on_event`, and respond. The caller should `poll_ready` first so this does
-    /// not block. Returns `Ok(())` when handled (including a benign "expired
+    /// Service exactly one notification: hash the target, decide, respond, then
+    /// report via `on_event`. The caller should `poll_ready` first so this does
+    /// not block. When committed-argv capture is enabled (see
+    /// [`with_committed_argv`](Self::with_committed_argv)) an allowed exec also
+    /// reads the committed argv after responding, so the reported event carries
+    /// both the pre-commit and committed views; this adds a bounded poll on the
+    /// allow path. Returns `Ok(())` when handled (including a benign "expired
     /// before response" race); returns `Err` on a RECV/SEND ioctl failure.
     pub fn serve_one<F: FnMut(&ExecEvent)>(
         &self,
@@ -302,13 +331,15 @@ impl ExecSupervisor {
             return Ok(());
         }
 
-        on_event(&ExecEvent {
-            pid: req.pid,
-            path: &path,
-            argv: &argv,
-            digest: digest.as_deref(),
-            decision,
-        });
+        // The child is frozen in execve until we SEND, so /proc/<pid>/cmdline
+        // still shows its pre-exec cmdline; snapshot it now (only when we will
+        // read the committed argv) to detect the post-exec change below.
+        let want_committed = self.capture_committed && matches!(decision, Decision::Allow);
+        let pre_cmdline = if want_committed {
+            read_cmdline(req.pid)
+        } else {
+            Vec::new()
+        };
 
         // SAFETY: zeroed response, then filled per the decision.
         let mut resp: SeccompNotifResp = unsafe { std::mem::zeroed() };
@@ -323,6 +354,26 @@ impl ExecSupervisor {
         if s != 0 {
             return Err(io::Error::last_os_error());
         }
+
+        // Post-CONTINUE: the exec was let through, so the kernel switches the mm
+        // and populates the committed argv. Read it (sound, unlike `argv`) for
+        // audit; gated because it costs a bounded poll. Reported via on_event
+        // below so a record carries both the pre-commit and committed views.
+        let committed = if want_committed {
+            read_committed_argv(req.pid, &pre_cmdline)
+        } else {
+            Vec::new()
+        };
+
+        on_event(&ExecEvent {
+            pid: req.pid,
+            path: &path,
+            argv: &argv,
+            committed_argv: &committed,
+            digest: digest.as_deref(),
+            decision,
+        });
+
         Ok(())
     }
 }
@@ -448,6 +499,56 @@ fn read_argv(pid: u32, argv_addr: u64) -> Vec<String> {
         out.push(String::from_utf8_lossy(&strbuf[..end]).into_owned());
     }
     out
+}
+
+/// Poll attempts for the committed argv to appear after CONTINUE.
+const COMMITTED_POLL_TRIES: u32 = 64;
+/// Sleep between committed-argv polls (64 * 250us ~= 16ms total budget).
+const COMMITTED_POLL_INTERVAL: Duration = Duration::from_micros(250);
+
+/// Read a process's current cmdline (NUL-separated argv) from
+/// `/proc/<pid>/cmdline`. Empty vec if unavailable (e.g. the process is gone).
+/// Interior empty args are preserved; only the trailing terminator NUL is
+/// dropped.
+fn read_cmdline(pid: u32) -> Vec<String> {
+    let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut parts: Vec<String> = raw
+        .split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    if parts.last().is_some_and(|s| s.is_empty()) {
+        parts.pop();
+    }
+    parts
+}
+
+/// Read the **committed** argv after the supervisor has CONTINUEd the exec.
+///
+/// Unlike [`read_argv`] (which reads the pre-`execve` userspace copy and is thus
+/// racy), this reads `/proc/<pid>/cmdline` — the argv the kernel installed in the
+/// new mm, the immutable copy the new process will see. It is therefore *sound*
+/// input for a decision, but only *after* the exec has been allowed to proceed,
+/// so it supports detect-and-act (e.g. a later kill), never a pre-commit gate.
+///
+/// Handles the populate race: while the child is frozen in `execve`,
+/// `/proc/<pid>/cmdline` still shows the *old* cmdline (`pre`). After CONTINUE the
+/// kernel switches the mm; we poll until cmdline changes to a non-empty value
+/// (the committed argv) or the budget expires. Returns an empty vec if it could
+/// not be confirmed in budget — the process exited too fast, or it was a re-exec
+/// with byte-identical argv (in which case the committed argv equals `pre`, so no
+/// information is lost for a later policy check).
+fn read_committed_argv(pid: u32, pre: &[String]) -> Vec<String> {
+    for _ in 0..COMMITTED_POLL_TRIES {
+        let cur = read_cmdline(pid);
+        if !cur.is_empty() && cur.as_slice() != pre {
+            return cur;
+        }
+        std::thread::sleep(COMMITTED_POLL_INTERVAL);
+    }
+    Vec::new()
 }
 
 /// Hash the file the child will exec, through the child's own mount root so a
@@ -590,6 +691,7 @@ mod tests {
         let policy = ExecPolicy {
             enforce: true,
             allow_digests: vec![d.clone()],
+            ..Default::default()
         };
         let s = ExecSupervisor::from_exec_policy(&policy);
         assert_eq!(s.decide(Some(d.hex())), Decision::Allow);
@@ -605,6 +707,7 @@ mod tests {
         let policy = ExecPolicy {
             enforce: true,
             allow_digests: vec![d.clone()],
+            ..Default::default()
         };
         let s = ExecSupervisor::from_exec_policy(&policy);
         assert_eq!(s.decide(Some(d.hex())), Decision::Deny);

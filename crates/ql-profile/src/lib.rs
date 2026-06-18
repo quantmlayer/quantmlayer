@@ -35,8 +35,9 @@ pub use export::{
     to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,
 };
 pub use policy::{
-    AgentType, CapPolicy, ExecDigest, ExecDigestError, ExecPolicy, FsPolicy, HashAlgo, NetPolicy,
-    ProcPolicy, ResourceLimits, SeccompDefault, SyscallPolicy,
+    evaluate_argv, AgentType, ArgvDeny, ArgvRule, ArgvVerdict, CapPolicy, ExecDigest,
+    ExecDigestError, ExecPolicy, FsPolicy, HashAlgo, NetPolicy, ProcPolicy, ResourceLimits,
+    SeccompDefault, SyscallPolicy,
 };
 
 use serde::{Deserialize, Serialize};
@@ -296,6 +297,20 @@ mod tests {
         assert!(p.capabilities.retain.is_empty());
         assert!(p.processes.allow_exec.is_empty());
         assert!(p.filesystem.readwrite.is_empty());
+    }
+
+    /// Adding the `argv_deny` field must not change the signing bytes of a
+    /// profile that does not use it — otherwise every existing signature breaks.
+    #[test]
+    fn empty_argv_deny_is_absent_from_signing_bytes() {
+        let p = Profile::default();
+        assert!(p.exec.argv_deny.is_empty());
+        let bytes = p.signing_bytes().expect("signing bytes");
+        let s = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !s.contains("argv_deny"),
+            "empty argv_deny must be skipped from canonical bytes (got: {s})"
+        );
     }
 
     /// Wrong schema version must be rejected, not silently accepted.

@@ -183,6 +183,7 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
         exec: ExecPolicy {
             enforce: exec_fully_covered,
             allow_digests,
+            ..Default::default()
         },
         approved_for: None,
         signature: None,

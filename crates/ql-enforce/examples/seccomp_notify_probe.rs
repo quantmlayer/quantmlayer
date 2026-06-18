@@ -105,7 +105,7 @@ fn build_allowlist(args: &Args) -> HashSet<String> {
 
 fn main() {
     let args = parse_args();
-    let sup = ExecSupervisor::new(build_allowlist(&args));
+    let sup = ExecSupervisor::new(build_allowlist(&args)).with_committed_argv(true);
 
     println!("== QuantmLayer Tier-2 proof: ExecSupervisor deny-by-digest ==");
     println!("[*] target command: {}", args.cmd.join(" "));
@@ -158,6 +158,15 @@ fn main() {
         match e.digest {
             Some(d) => println!("    sha256={d}"),
             None => println!("    sha256=<unhashable> (denied fail-closed)"),
+        }
+        // The whole point of this probe: pre-commit argv is read from the frozen
+        // tracee's memory (racy); committed argv is read from /proc/<pid>/cmdline
+        // after CONTINUE (sound). On an allowed, non-racing exec they match.
+        println!("    argv(pre-commit)={:?}", e.argv);
+        if e.committed_argv.is_empty() {
+            println!("    argv(committed) =<none> (denied, too fast, or unconfirmed)");
+        } else {
+            println!("    argv(committed) ={:?}", e.committed_argv);
         }
     };
 

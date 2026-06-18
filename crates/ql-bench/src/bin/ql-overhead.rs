@@ -134,6 +134,7 @@ fn exec_variant_profile(base: &Profile) -> Result<Profile, String> {
     p.exec = ExecPolicy {
         enforce: true,
         allow_digests: vec![digest],
+        ..Default::default()
     };
     Ok(p)
 }
