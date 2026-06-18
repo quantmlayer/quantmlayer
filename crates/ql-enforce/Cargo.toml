@@ -31,6 +31,11 @@ ql-lsm = { path = "../ql-lsm", optional = true }
 # with the eBPF toolchain: `cargo build -p ql-enforce --features lsm`.
 lsm = ["dep:ql-lsm"]
 
+[dev-dependencies]
+# Used only by examples/tests (e.g. the seccomp-notify probe hashes the resolved
+# execve target). Kept out of the production dependency set.
+sha2 = "0.10"
+
 # Linux-only crate. Guard the build so a mistaken macOS/Windows build fails
 # loudly rather than compiling a non-functional stub.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
