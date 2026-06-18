@@ -9,9 +9,11 @@
 //! proven in `examples/seccomp_notify_probe.rs`.
 //!
 //! Unlike an [`crate::Enforcer`] (apply-once in the child), this is a long-lived
-//! **supervisor**: the parent installs the notify filter and keeps the listener
-//! fd; the contained child inherits the filter; every `execve` the child makes is
-//! delivered to the parent, which hashes the resolved binary and allows
+//! **supervisor**. To keep the cell's (unfiltered) parent free to run its veth
+//! hook — which execs `ip` and would deadlock under a notify filter — the
+//! **child** installs the filter and hands the listener fd up to the parent via
+//! `SCM_RIGHTS` ([`send_fd`]/[`recv_fd`]). The parent, never filtered, screens
+//! every `execve` the child makes: it hashes the resolved binary and allows
 //! (`CONTINUE`) or denies (`EACCES`) by digest.
 //!
 //! This module is the reusable core. Cell wiring, profile-sourced allowlists, and
@@ -141,6 +143,18 @@ impl std::os::unix::io::AsRawFd for Listener {
     /// The raw listener fd (for the caller to `poll`/select on).
     fn as_raw_fd(&self) -> RawFd {
         self.fd
+    }
+}
+
+impl std::os::unix::io::FromRawFd for Listener {
+    /// Wrap an externally-obtained notification fd — e.g. one a parent received
+    /// from its child via `pidfd_getfd` or `SCM_RIGHTS` in the child-installs
+    /// model. The `Listener` takes ownership and closes it on drop.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, owned seccomp notification fd.
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Listener { fd }
     }
 }
 
@@ -387,6 +401,87 @@ fn notif_id_valid(fd: RawFd, id: u64) -> bool {
     r == 0
 }
 
+const FD_SIZE: u32 = std::mem::size_of::<RawFd>() as u32;
+
+/// Send one fd over a connected Unix socket via `SCM_RIGHTS` (with one carrier
+/// data byte). This is how the **child** — which installs the notify filter so
+/// the parent is never filtered — hands the listener fd up to the supervising
+/// parent. `SCM_RIGHTS` needs no `CAP_SYS_PTRACE` and works in unprivileged
+/// containers (unlike `pidfd_getfd`, which the default Docker seccomp blocks).
+/// Proven on host and in unprivileged Docker in `examples/fd_transfer_probe.rs`.
+pub fn send_fd(sock: RawFd, fd: RawFd) -> io::Result<()> {
+    let mut byte: u8 = b'F';
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut cbuf = [0u64; 4]; // 32 bytes, 8-aligned, >= CMSG_SPACE(4)
+                              // SAFETY: zeroed msghdr; we set the fields we use below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(FD_SIZE) } as _;
+    // SAFETY: fill the single SCM_RIGHTS control message, then send.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(std::ptr::addr_of!(msg));
+        if cmsg.is_null() {
+            return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(FD_SIZE) as _;
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(fd).cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            FD_SIZE as usize,
+        );
+        if libc::sendmsg(sock, std::ptr::addr_of!(msg), 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Receive one fd sent over a connected Unix socket via `SCM_RIGHTS`. The
+/// supervising parent calls this to obtain the child's listener fd, then wraps
+/// it with `Listener::from_raw_fd`.
+pub fn recv_fd(sock: RawFd) -> io::Result<RawFd> {
+    let mut byte: u8 = 0;
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut cbuf = [0u64; 4];
+    // SAFETY: zeroed msghdr; we set the fields we use below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+    // SAFETY: receive one message, then read the single fd from its cmsg.
+    unsafe {
+        if libc::recvmsg(sock, std::ptr::addr_of_mut!(msg), 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(std::ptr::addr_of!(msg));
+        if cmsg.is_null()
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::other("no SCM_RIGHTS control message received"));
+        }
+        let mut fd: RawFd = -1;
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cmsg).cast_const(),
+            std::ptr::addr_of_mut!(fd).cast::<u8>(),
+            FD_SIZE as usize,
+        );
+        Ok(fd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +541,44 @@ mod tests {
         };
         let s = ExecSupervisor::from_exec_policy(&policy);
         assert_eq!(s.decide(Some(d.hex())), Decision::Deny);
+    }
+
+    #[test]
+    fn scm_rights_round_trips_an_fd() {
+        // Fork-free: send a pipe's read end across a socketpair and prove the
+        // received fd is a working dup by reading bytes written to the original
+        // write end. Exercises the exact send_fd/recv_fd the cell will use.
+        let mut sv: [RawFd; 2] = [0; 2];
+        // SAFETY: socketpair into a length-2 array we own.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair");
+        let mut p: [RawFd; 2] = [0; 2];
+        // SAFETY: pipe into a length-2 array we own.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0, "pipe");
+        let (pr, pw) = (p[0], p[1]);
+
+        send_fd(sv[1], pr).expect("send_fd");
+        let got = recv_fd(sv[0]).expect("recv_fd");
+        assert!(got >= 0);
+        assert_ne!(got, pr, "received fd should be a fresh descriptor");
+
+        let out = [0xABu8; 1];
+        // SAFETY: write one byte to the pipe's write end.
+        let wn = unsafe { libc::write(pw, out.as_ptr().cast::<libc::c_void>(), 1) };
+        assert_eq!(wn, 1);
+        let mut inb = [0u8; 1];
+        // SAFETY: read one byte through the *received* fd.
+        let rn = unsafe { libc::read(got, inb.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        assert_eq!(rn, 1);
+        assert_eq!(inb[0], 0xAB, "received fd is a working dup of the pipe");
+
+        // SAFETY: close every fd we own.
+        unsafe {
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+            libc::close(pr);
+            libc::close(pw);
+            libc::close(got);
+        }
     }
 }
