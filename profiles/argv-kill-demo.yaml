@@ -1,0 +1,87 @@
+# QuantmLayer demo profile: post-commit argv detect-and-kill (Tier-2).
+#
+# Approves /bin/sleep by content digest, and adds an argv-deny rule keyed by the
+# SAME digest that denies the token "11". The point is to show the two-layer
+# story:
+#
+#   * `ql run ... -- /bin/sleep 0.2`  -> digest approved, argv clean -> runs.
+#   * `ql run ... -- /bin/sleep 11`   -> digest approved (the exec is ALLOWED to
+#                                        start), then the supervisor reads the
+#                                        *committed* argv, matches all_of ["11"],
+#                                        and SIGKILLs the process. The ledger
+#                                        shows exec.run (allowed by digest) AND
+#                                        exec.kill (killed by argv policy).
+#
+# "11" stands in for a dangerous subcommand (e.g. `git push`): the binary is on
+# the allow-list, but a specific invocation of it is not. This is post-commit
+# detect-and-kill, not a pre-commit gate — the process runs for a brief window
+# before the kill lands (a sound-read-then-kill model; argv matching is evadable,
+# so it is defense-in-depth over the digest and network walls, not a boundary).
+#
+# Build WITHOUT the `lsm` feature so tier selection routes to the Tier-2
+# seccomp-notify wall (the path that performs the userspace kill):
+#   cargo build -p ql-cli
+#
+# Both digests below are placeholders (64 zeros). Fill them with /bin/sleep's
+# digest on this VM in one shot (the `g` flag replaces both occurrences):
+#   sed "s|sha256:[0-9a-f]\{64\}|sha256:$(sha256sum /bin/sleep | cut -d' ' -f1)|g" \
+#       profiles/argv-kill-demo.yaml > /tmp/argv-kill-demo.yaml
+
+schema_version: 1
+agent_type: coding
+
+exec:
+  enforce: true
+  allow_digests:
+    - "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  argv_deny:
+    - digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      deny:
+        - all_of: ["11"]
+
+filesystem:
+  readwrite:
+    - "/tmp/agent/**"
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+  denied:
+    - "/home/**"
+    - "/root/**"
+    - "/sys/**"
+
+network:
+  default_deny: true
+  block_private_ranges: true
+  allow_domains: []
+
+capabilities:
+  retain: []
+
+syscalls:
+  default_action: allow
+  deny:
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+  notify: []
+
+resources:
+  memory_max_bytes: 1073741824   # 1 GiB
+  cpu_max_percent: 100           # 1 core
+  pids_max: 128
+  wall_clock_secs: 30
+
+processes:
+  allow_exec:
+    - "/bin/sleep"

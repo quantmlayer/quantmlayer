@@ -30,7 +30,7 @@ use crate::exec_supervisor::{recv_fd, send_fd, Decision, ExecEvent, ExecSupervis
 use nix::sched::CloneFlags;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Gid, Pid, Uid};
-use ql_profile::Profile;
+use ql_profile::{evaluate_argv, ArgvVerdict, Profile};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -178,7 +178,11 @@ impl Cell {
                     // SAFETY: `lfd` is the child's seccomp notify listener,
                     // transferred to us via SCM_RIGHTS; we now own it.
                     let listener = unsafe { Listener::from_raw_fd(lfd) };
-                    let supervisor = ExecSupervisor::from_profile(&self.profile);
+                    // Enable committed-argv capture only when there is an argv
+                    // policy to act on — otherwise the default path stays free of
+                    // the per-exec /proc/<pid>/cmdline poll.
+                    let supervisor = ExecSupervisor::from_profile(&self.profile)
+                        .with_committed_argv(!self.profile.exec.argv_deny.is_empty());
                     chan.parent_signal_go();
                     chan.parent_close();
                     return self.supervise(child, &listener, &supervisor);
@@ -378,11 +382,34 @@ impl Cell {
             let ready = listener.poll_ready(200).unwrap_or(false);
             if ready {
                 // A serve error after the child is gone is benign (the listener
-                // drains); audit records are layered on in a later slice.
+                // drains), so the result is intentionally ignored.
                 let _ = supervisor.serve_one(listener, &mut |e: &ExecEvent| {
-                    record_tier2_exec(e);
+                    // Post-commit argv policy: only when the exec was allowed (by
+                    // digest) and we captured the committed argv. Sound input, but
+                    // post-commit — so it drives detect-and-kill, not a gate.
+                    let killed_reason = if e.committed_argv.is_empty() {
+                        None
+                    } else {
+                        e.digest.and_then(|dh| {
+                            match evaluate_argv(&self.profile.exec, dh, e.committed_argv) {
+                                ArgvVerdict::Deny(reason) => Some(reason),
+                                ArgvVerdict::Allow => None,
+                            }
+                        })
+                    };
+                    record_tier2_exec(e, killed_reason.clone());
                     if matches!(e.decision, Decision::Deny) {
                         eprintln!("ql-enforce[exec]: denied exec of {}", e.path);
+                    }
+                    if let Some(reason) = killed_reason {
+                        // SAFETY: post-commit detect-and-kill of the offending
+                        // process by pid; SIGKILL is always a valid signal and a
+                        // stale pid simply yields ESRCH, which we ignore.
+                        unsafe { libc::kill(e.pid as libc::pid_t, libc::SIGKILL) };
+                        eprintln!(
+                            "ql-enforce[exec]: post-commit KILL of {} ({reason})",
+                            e.path
+                        );
                     }
                 });
             } else if let Some(code) = exit {
@@ -650,6 +677,13 @@ pub struct Tier2ExecRecord {
     /// The argv the child passed to `execve` (bounded, observation only — never
     /// used for the verdict; see [`crate::exec_supervisor::ExecEvent::argv`]).
     pub argv: Vec<String>,
+    /// The committed argv (sound, post-CONTINUE) when committed capture was on
+    /// for this run; empty otherwise. The evidence a post-commit argv kill acts
+    /// on (see [`crate::exec_supervisor::ExecEvent::committed_argv`]).
+    pub committed_argv: Vec<String>,
+    /// `Some(reason)` if a post-commit argv-deny rule matched and the offending
+    /// process was `SIGKILL`ed (detect-and-kill); `None` otherwise.
+    pub killed_reason: Option<String>,
 }
 
 thread_local! {
@@ -666,8 +700,10 @@ fn now_millis() -> u64 {
 }
 
 /// Record one supervised exec decision into the thread-local buffer. Converts
-/// the borrowed [`ExecEvent`] into an owned [`Tier2ExecRecord`].
-fn record_tier2_exec(e: &ExecEvent) {
+/// the borrowed [`ExecEvent`] into an owned [`Tier2ExecRecord`]. `killed_reason`
+/// is `Some` when a post-commit argv-deny rule matched and the process was
+/// killed.
+fn record_tier2_exec(e: &ExecEvent, killed_reason: Option<String>) {
     let rec = Tier2ExecRecord {
         ts_millis: now_millis(),
         allowed: matches!(e.decision, Decision::Allow),
@@ -675,6 +711,8 @@ fn record_tier2_exec(e: &ExecEvent) {
         pid: e.pid,
         path: e.path.to_string(),
         argv: e.argv.to_vec(),
+        committed_argv: e.committed_argv.to_vec(),
+        killed_reason,
     };
     TIER2_EXEC_EVENTS.with(|b| b.borrow_mut().push(rec));
 }

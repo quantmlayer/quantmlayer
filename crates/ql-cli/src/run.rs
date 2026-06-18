@@ -518,6 +518,33 @@ fn tier2_exec_audit_event(
     }
 }
 
+/// Convert a killed Tier-2 record into an `exec.kill` audit event: the
+/// post-commit detect-and-kill a matched argv-deny rule triggered. Emitted in
+/// addition to the `exec.run` record — the exec was allowed by digest, then
+/// killed by argv policy, and the two events together tell the true sequence.
+fn tier2_kill_audit_event(
+    rec: &ql_enforce::Tier2ExecRecord,
+    system: Option<&SystemIdentity>,
+) -> ql_audit::AuditEvent {
+    use ql_audit::Decision;
+    let reason = rec.killed_reason.as_deref().unwrap_or("");
+    ql_audit::AuditEvent {
+        ts_millis: rec.ts_millis,
+        actor: "exec".to_string(),
+        action: "exec.kill".to_string(),
+        target: rec
+            .digest_hex
+            .clone()
+            .unwrap_or_else(|| "<unhashed>".to_string()),
+        decision: Decision::Deny,
+        detail: format!(
+            "tier=2 post-commit kill pid {} path {} committed {:?} reason: {reason}",
+            rec.pid, rec.path, rec.committed_argv
+        ),
+        system: system.cloned(),
+    }
+}
+
 /// Drain the Tier-2 exec wall's decisions for the run that just finished and
 /// append one attributed `exec.run`/`exec.deny` record per decision to the
 /// ledger. Unlike the Tier-1 path this needs no `lsm` feature. No-op when no
@@ -551,6 +578,10 @@ fn write_tier2_exec_events(audit_path: Option<&str>, system: Option<&SystemIdent
 
     for rec in &events {
         if log.append(tier2_exec_audit_event(rec, system)).is_err() {
+            eprintln!("ql: exec audit: append failed");
+            return;
+        }
+        if rec.killed_reason.is_some() && log.append(tier2_kill_audit_event(rec, system)).is_err() {
             eprintln!("ql: exec audit: append failed");
             return;
         }
@@ -686,6 +717,8 @@ mod tests {
             pid: 7,
             path: "/bin/echo".to_string(),
             argv: vec!["/bin/echo".to_string(), "hi".to_string()],
+            committed_argv: vec![],
+            killed_reason: None,
         };
         let ev = tier2_exec_audit_event(&allow, None);
         assert_eq!(ev.action, "exec.run");
@@ -703,11 +736,33 @@ mod tests {
             pid: 8,
             path: "/bin/ls".to_string(),
             argv: vec!["/bin/ls".to_string()],
+            committed_argv: vec![],
+            killed_reason: None,
         };
         let ev = tier2_exec_audit_event(&deny, None);
         assert_eq!(ev.action, "exec.deny");
         assert!(matches!(ev.decision, ql_audit::Decision::Deny));
         assert_eq!(ev.target, "<unhashed>");
+    }
+
+    #[test]
+    fn tier2_kill_event_carries_committed_argv_and_reason() {
+        let killed = ql_enforce::Tier2ExecRecord {
+            ts_millis: 200,
+            allowed: true,
+            digest_hex: Some("cd".repeat(32)),
+            pid: 42,
+            path: "/usr/bin/git".to_string(),
+            argv: vec!["git".to_string(), "push".to_string()],
+            committed_argv: vec!["git".to_string(), "push".to_string()],
+            killed_reason: Some("sha256:cd… argv all_of [\"push\"]".to_string()),
+        };
+        let ev = tier2_kill_audit_event(&killed, None);
+        assert_eq!(ev.action, "exec.kill");
+        assert!(matches!(ev.decision, ql_audit::Decision::Deny));
+        assert!(ev.detail.contains("post-commit kill"));
+        assert!(ev.detail.contains("\"push\""));
+        assert!(ev.detail.contains("reason:"));
     }
 
     fn signed_default() -> (Profile, String) {
