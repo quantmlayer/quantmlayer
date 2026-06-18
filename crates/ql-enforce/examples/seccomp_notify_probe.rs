@@ -1,36 +1,46 @@
 // crates/ql-enforce/examples/seccomp_notify_probe.rs
 //
-//! Tier-2 exec-wall PROOF HARNESS — seccomp user-notification.
+//! Tier-2 exec-wall PROOF HARNESS — seccomp user-notification, deny-by-digest.
 //!
-//! This is a *de-risking probe*, not the production wall. Its only job is to
-//! answer one question on a given substrate: can an unprivileged process install
-//! a `SECCOMP_RET_USER_NOTIF` listener, intercept a child's `execve`, hash the
-//! exact binary the kernel is about to run, and let it continue? If this prints a
-//! correct sha256 from inside an unprivileged container, the Tier-2 mechanism is
-//! proven and the real enforcement module (deny-by-digest, profile wiring, audit)
-//! is incremental. If `seccomp(NEW_LISTENER)` fails here, we learn it on day one.
+//! A *de-risking probe*, not the production wall. It answers two questions on a
+//! given substrate: (1) can an unprivileged process install a
+//! `SECCOMP_RET_USER_NOTIF` listener and intercept a child's `execve`, and
+//! (2) can it ENFORCE a content-addressed allow/deny decision — letting an
+//! approved binary run (CONTINUE) and failing an unapproved one (EACCES) — purely
+//! in userspace. If a binary outside the allowlist is blocked from inside an
+//! unprivileged container, the Tier-2 enforcement mechanism is proven and the real
+//! `ql-enforce` module (profile wiring, audit, tier selection) is incremental.
 //!
-//! Contract: intercept-hash-LOG-and-ALLOW. It carries NO policy and enforces
-//! nothing — every exec is permitted. Do not grow policy logic in here; copy the
-//! proven core into `ql-enforce` instead.
+//! It still carries no policy *model* — the allowlist is a flat set of approved
+//! sha256 digests. Do not grow profile logic in here; copy the proven core into
+//! `ql-enforce` instead.
 //!
 //! Design: the PARENT sets no_new_privs, installs the filter with NEW_LISTENER
 //! (so the listener fd lives in the parent), then forks. The child inherits the
-//! filter; its execve is delivered to the parent's listener fd. No SCM_RIGHTS
-//! fd-passing is required.
+//! filter; its execve is delivered to the parent's listener fd. No SCM_RIGHTS.
 //!
-//! Run (default execs `/bin/echo`):
+//! Allowlist: `--allow-path P` hashes binary P and approves that digest;
+//! `--allow-digest HEX` approves a literal digest. With NO allow flags, the
+//! target binary is auto-approved (so the happy path runs out of the box).
+//! Fail-closed: anything not approved — including a binary we cannot hash — is
+//! denied.
+//!
+//! Run:
 //! ```text
+//! # happy path (auto-approves the target):
 //! cargo run -p ql-enforce --example seccomp_notify_probe
-//! cargo run -p ql-enforce --example seccomp_notify_probe -- /bin/ls -l /
+//! # enforcement: approve echo, then try to run ls -> DENIED by digest
+//! cargo run -p ql-enforce --example seccomp_notify_probe -- \
+//!   --allow-path /bin/echo -- /bin/ls /
 //! ```
-//! Inside a container:
+//! Inside a container (the real test):
 //! ```text
 //! docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
-//!   /work/target/debug/examples/seccomp_notify_probe /bin/echo hi
+//!   /work/target/debug/examples/seccomp_notify_probe --allow-path /bin/echo -- /bin/ls /
 //! ```
 
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
@@ -144,8 +154,8 @@ fn last_err() -> std::io::Error {
 
 /// Install the notify filter on the current process and return the listener fd.
 fn install_listener() -> std::io::Result<libc::c_int> {
-    // SAFETY: standard prctl; turning on no_new_privs lets an unprivileged
-    // process load a seccomp filter without CAP_SYS_ADMIN.
+    // SAFETY: standard prctl; no_new_privs lets an unprivileged process load a
+    // seccomp filter without CAP_SYS_ADMIN.
     let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if nnp != 0 {
         return Err(last_err());
@@ -178,6 +188,34 @@ fn notif_id_valid(fd: libc::c_int, id: u64) -> bool {
     r == 0
 }
 
+// ---- hashing ---------------------------------------------------------------
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn hash_reader(mut r: impl Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Hash a binary by path, in the caller's own view (used to seed the allowlist).
+fn hash_path(path: &str) -> std::io::Result<String> {
+    hash_reader(File::open(path)?)
+}
+
 /// Read the NUL-terminated path argument out of the stopped child's memory.
 fn read_path(pid: u32, addr: u64) -> std::io::Result<String> {
     let mem = File::open(format!("/proc/{pid}/mem"))?;
@@ -194,34 +232,19 @@ fn hash_target(pid: u32, path: &str) -> std::io::Result<String> {
     let candidate = if path.starts_with('/') {
         format!("/proc/{pid}/root{path}")
     } else {
-        // relative exec: resolve against the child's cwd
         format!("/proc/{pid}/cwd/{path}")
     };
-    let mut file = File::open(&candidate).or_else(|_| File::open(path))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex(&hasher.finalize()))
+    let file = File::open(&candidate).or_else(|_| File::open(path))?;
+    hash_reader(file)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+// ---- notification handling -------------------------------------------------
 
-/// Service one notification: hash the target, log it, allow (CONTINUE).
-fn service(fd: libc::c_int) -> std::io::Result<()> {
-    // SAFETY: zeroed is a valid initial state for these all-integer structs; the
-    // kernel requires the request struct be zeroed before NOTIF_RECV.
+/// Service one notification: hash the target, decide by digest, respond.
+/// Approved -> CONTINUE (the real execve runs); otherwise EACCES (denied).
+fn service(fd: libc::c_int, allow: &HashSet<String>) -> std::io::Result<()> {
+    // SAFETY: zeroed is the required initial state for these all-integer structs
+    // before NOTIF_RECV.
     let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
     // SAFETY: req is a live, correctly-sized buffer for the RECV ioctl.
     let r = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, std::ptr::addr_of_mut!(req)) };
@@ -236,12 +259,12 @@ fn service(fd: libc::c_int) -> std::io::Result<()> {
     } else {
         req.data.args[0]
     };
-
     let path = read_path(req.pid, path_addr).unwrap_or_else(|e| format!("<unreadable: {e}>"));
 
-    let digest = match hash_target(req.pid, &path) {
-        Ok(d) => d,
-        Err(e) => format!("<hash failed: {e}>"),
+    // Fail-closed: a binary we cannot hash is never approved.
+    let (approved, shown) = match hash_target(req.pid, &path) {
+        Ok(d) => (allow.contains(&d), d),
+        Err(e) => (false, format!("<hash failed: {e}>")),
     };
 
     if !notif_id_valid(fd, req.id) {
@@ -252,20 +275,27 @@ fn service(fd: libc::c_int) -> std::io::Result<()> {
         return Ok(());
     }
 
-    println!("[+] exec intercepted  pid={:<7} path={path}", req.pid);
-    println!("    sha256={digest}");
-    println!("    verdict=ALLOW (proof harness enforces nothing)");
+    if approved {
+        println!("[+] ALLOW pid={:<7} path={path}", req.pid);
+    } else {
+        println!(
+            "[-] DENY  pid={:<7} path={path}  (execve -> EACCES)",
+            req.pid
+        );
+    }
+    println!("    sha256={shown}");
 
-    // SAFETY: zeroed response, then filled; CONTINUE lets the real execve run.
+    // SAFETY: zeroed response, then filled per the allow/deny decision.
     let mut resp: SeccompNotifResp = unsafe { std::mem::zeroed() };
     resp.id = req.id;
-    resp.val = 0;
-    resp.error = 0;
-    resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    if approved {
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE; // val/error stay 0
+    } else {
+        resp.error = -libc::EACCES; // deny; flags stay 0 (do not continue)
+    }
     // SAFETY: resp is a live, correctly-sized buffer for the SEND ioctl.
     let s = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, std::ptr::addr_of_mut!(resp)) };
     if s != 0 {
-        // A response can race the child dying; treat as non-fatal.
         eprintln!(
             "[!] NOTIF_SEND failed (likely child exited): {}",
             last_err()
@@ -274,23 +304,93 @@ fn service(fd: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd: Vec<String> = if argv.is_empty() {
-        vec![
+// ---- argument parsing ------------------------------------------------------
+
+struct Args {
+    allow_paths: Vec<String>,
+    allow_digests: Vec<String>,
+    cmd: Vec<String>,
+}
+
+fn parse_args() -> Args {
+    let mut allow_paths = Vec::new();
+    let mut allow_digests = Vec::new();
+    let mut cmd = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--allow-path" => allow_paths.push(it.next().expect("--allow-path needs a value")),
+            "--allow-digest" => {
+                allow_digests.push(it.next().expect("--allow-digest needs a value"))
+            }
+            "--" => {
+                cmd.extend(it.by_ref());
+                break;
+            }
+            _ => {
+                cmd.push(a);
+                cmd.extend(it.by_ref());
+                break;
+            }
+        }
+    }
+    if cmd.is_empty() {
+        cmd = vec![
             "/bin/echo".to_string(),
             "seccomp-notify exec wall: hello from inside the cell".to_string(),
-        ]
-    } else {
-        argv
-    };
+        ];
+    }
+    Args {
+        allow_paths,
+        allow_digests,
+        cmd,
+    }
+}
 
-    println!("== QuantmLayer Tier-2 proof: seccomp-notify exec interception ==");
-    println!("[*] target command: {}", cmd.join(" "));
+fn build_allowlist(args: &Args) -> HashSet<String> {
+    let mut allow: HashSet<String> = HashSet::new();
+    for d in &args.allow_digests {
+        allow.insert(d.to_lowercase());
+    }
+    for p in &args.allow_paths {
+        match hash_path(p) {
+            Ok(d) => {
+                println!("[*] approved --allow-path {p}");
+                println!("    sha256={d}");
+                allow.insert(d);
+            }
+            Err(e) => eprintln!("[!] cannot hash --allow-path {p}: {e}"),
+        }
+    }
+    let explicit = !args.allow_paths.is_empty() || !args.allow_digests.is_empty();
+    if !explicit {
+        match hash_path(&args.cmd[0]) {
+            Ok(d) => {
+                println!(
+                    "[*] no allowlist given; auto-approving target {}",
+                    args.cmd[0]
+                );
+                println!("    sha256={d}");
+                allow.insert(d);
+            }
+            Err(e) => eprintln!("[!] cannot hash target {}: {e}", args.cmd[0]),
+        }
+    }
+    allow
+}
+
+fn main() {
+    let args = parse_args();
+    let allow = build_allowlist(&args);
+
+    println!("== QuantmLayer Tier-2 proof: seccomp-notify deny-by-digest ==");
+    println!("[*] target command: {}", args.cmd.join(" "));
+    println!("[*] allowlist holds {} approved digest(s)", allow.len());
 
     // Build the child's argv BEFORE fork (no allocation in the child).
-    let path_c = CString::new(cmd[0].as_str()).expect("nul in path");
-    let argv_c: Vec<CString> = cmd
+    let path_c = CString::new(args.cmd[0].as_str()).expect("nul in path");
+    let argv_c: Vec<CString> = args
+        .cmd
         .iter()
         .map(|s| CString::new(s.as_str()).expect("nul in arg"))
         .collect();
@@ -302,7 +402,6 @@ fn main() {
         Err(e) => {
             eprintln!("[!] seccomp(NEW_LISTENER) failed: {e}");
             eprintln!("    This substrate cannot host the Tier-2 wall unprivileged.");
-            eprintln!("    (Try: is no_new_privs blocked? does the runtime drop seccomp?)");
             std::process::exit(1);
         }
     };
@@ -315,15 +414,16 @@ fn main() {
         std::process::exit(1);
     }
     if pid == 0 {
-        // Child: exec the target. This execve is what the parent will intercept.
+        // Child: exec the target. This execve is what the parent intercepts.
         // SAFETY: pointers come from CStrings kept alive in the parent frame.
         unsafe { libc::execvp(path_c.as_ptr(), argv_p.as_ptr()) };
-        // Only reached if exec failed.
+        // Only reached if the kernel let the exec proceed and it still failed,
+        // or the exec was denied (EACCES) — either way the child is done.
         unsafe { libc::_exit(127) };
     }
 
-    // Parent: supervise. Drain notifications without blocking forever once the
-    // child is gone.
+    // Parent: supervise. Drain notifications without blocking once the child is
+    // gone.
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -337,7 +437,7 @@ fn main() {
         // SAFETY: poll over one live pollfd, 200 ms timeout.
         let p = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, 200) };
         if p > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            if let Err(e) = service(fd) {
+            if let Err(e) = service(fd, &allow) {
                 eprintln!("[!] service error: {e}");
                 if child_done {
                     break;
@@ -348,5 +448,5 @@ fn main() {
         }
     }
 
-    println!("[+] child finished; Tier-2 mechanism exercised end-to-end.");
+    println!("[+] child finished; Tier-2 deny-by-digest exercised end-to-end.");
 }
