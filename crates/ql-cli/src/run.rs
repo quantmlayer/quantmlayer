@@ -296,6 +296,7 @@ fn run_default(
     };
     let result = cell.run(command);
     write_exec_events(audit_path, system);
+    write_tier2_exec_events(audit_path, system);
     match result {
         Ok(code) => ExitCode::from(clamp_code(code)),
         Err(e) => {
@@ -369,6 +370,7 @@ fn run_brokered(
 
     let result = cell.run(command);
     write_exec_events(audit_path, system);
+    write_tier2_exec_events(audit_path, system);
     // Always tear the veth down, success or failure.
     veth::teardown(&plan);
 
@@ -447,6 +449,81 @@ fn write_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) 
 #[cfg(not(feature = "lsm"))]
 fn write_exec_events(_audit_path: Option<&str>, _system: Option<&SystemIdentity>) {}
 
+/// Convert one Tier-2 (seccomp-notify) exec record into an attributed audit
+/// event. The tier is carried in `detail` — the audit schema has no dedicated
+/// tier field — so the chain hash and existing logs verify exactly as before.
+fn tier2_exec_audit_event(
+    rec: &ql_enforce::Tier2ExecRecord,
+    system: Option<&SystemIdentity>,
+) -> ql_audit::AuditEvent {
+    use ql_audit::Decision;
+    let (action, decision) = if rec.allowed {
+        ("exec.run", Decision::Allow)
+    } else {
+        ("exec.deny", Decision::Deny)
+    };
+    ql_audit::AuditEvent {
+        ts_millis: rec.ts_millis,
+        actor: "exec".to_string(),
+        action: action.to_string(),
+        target: rec
+            .digest_hex
+            .clone()
+            .unwrap_or_else(|| "<unhashed>".to_string()),
+        decision,
+        detail: format!("tier=2 pid {} path {}", rec.pid, rec.path),
+        system: system.cloned(),
+    }
+}
+
+/// Drain the Tier-2 exec wall's decisions for the run that just finished and
+/// append one attributed `exec.run`/`exec.deny` record per decision to the
+/// ledger. Unlike the Tier-1 path this needs no `lsm` feature. No-op when no
+/// Tier-2 wall was active (the common case until tier selection routes to it)
+/// or when no audit log is set.
+fn write_tier2_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) {
+    use ql_audit::AuditLog;
+
+    let events = ql_enforce::drain_tier2_exec_events();
+    if events.is_empty() {
+        return;
+    }
+    let Some(path) = audit_path else {
+        return;
+    };
+
+    let mut log = match std::fs::read_to_string(path) {
+        Ok(s) => match AuditLog::from_jsonl(&s) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ql: exec audit: cannot parse {path}: {e}");
+                return;
+            }
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => AuditLog::new(),
+        Err(e) => {
+            eprintln!("ql: exec audit: cannot read {path}: {e}");
+            return;
+        }
+    };
+
+    for rec in &events {
+        if log.append(tier2_exec_audit_event(rec, system)).is_err() {
+            eprintln!("ql: exec audit: append failed");
+            return;
+        }
+    }
+
+    match log.to_jsonl() {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(path, text) {
+                eprintln!("ql: exec audit: write {path} failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("ql: exec audit: serialize failed: {e}"),
+    }
+}
+
 /// Nanosecond counter for unique-ish veth subnet seeds.
 fn nanos() -> u128 {
     std::time::SystemTime::now()
@@ -500,6 +577,36 @@ fn clamp_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier2_audit_event_maps_allow_and_deny() {
+        let allow = ql_enforce::Tier2ExecRecord {
+            ts_millis: 123,
+            allowed: true,
+            digest_hex: Some("ab".repeat(32)),
+            pid: 7,
+            path: "/bin/echo".to_string(),
+        };
+        let ev = tier2_exec_audit_event(&allow, None);
+        assert_eq!(ev.action, "exec.run");
+        assert!(matches!(ev.decision, ql_audit::Decision::Allow));
+        assert_eq!(ev.actor, "exec");
+        assert_eq!(ev.target, "ab".repeat(32));
+        assert!(ev.detail.contains("tier=2"));
+        assert!(ev.detail.contains("/bin/echo"));
+
+        let deny = ql_enforce::Tier2ExecRecord {
+            ts_millis: 124,
+            allowed: false,
+            digest_hex: None,
+            pid: 8,
+            path: "/bin/ls".to_string(),
+        };
+        let ev = tier2_exec_audit_event(&deny, None);
+        assert_eq!(ev.action, "exec.deny");
+        assert!(matches!(ev.decision, ql_audit::Decision::Deny));
+        assert_eq!(ev.target, "<unhashed>");
+    }
 
     fn signed_default() -> (Profile, String) {
         let id = ql_token::Identity::generate().unwrap();

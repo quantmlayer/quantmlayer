@@ -31,6 +31,7 @@ use nix::sched::CloneFlags;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Gid, Pid, Uid};
 use ql_profile::Profile;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -379,6 +380,7 @@ impl Cell {
                 // A serve error after the child is gone is benign (the listener
                 // drains); audit records are layered on in a later slice.
                 let _ = supervisor.serve_one(listener, &mut |e: &ExecEvent| {
+                    record_tier2_exec(e);
                     if matches!(e.decision, Decision::Deny) {
                         eprintln!("ql-enforce[exec]: denied exec of {}", e.path);
                     }
@@ -618,4 +620,65 @@ impl SyncPipes {
             ))
         }
     }
+}
+
+// --- Tier-2 exec-wall audit capture ------------------------------------------
+//
+// The supervise loop records one owned decision per screened `execve` into a
+// thread-local buffer; the caller (`ql run`) drains it after the run and
+// converts each into an attributed audit record (`exec.run`/`exec.deny`),
+// tagging the tier. This mirrors the Tier-1 BPF path (`drain_exec_events`),
+// keeping ql-enforce decoupled from ql-audit. Single cell per `ql run` process,
+// and the supervise loop runs in the caller's thread, so a thread-local needs
+// no `Send`/locking.
+
+/// An owned record of one exec decision made by the Tier-2 (seccomp user-
+/// notification) exec wall, captured for the audit layer. Mirrors the Tier-1
+/// kernel `ExecRecord` shape closely enough for a parallel audit conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier2ExecRecord {
+    /// Milliseconds since the Unix epoch (UTC) when the decision was made.
+    pub ts_millis: u64,
+    /// Whether the exec was allowed (`true`) or denied (`false`).
+    pub allowed: bool,
+    /// sha256 hex of the resolved binary, or `None` if it could not be hashed.
+    pub digest_hex: Option<String>,
+    /// Pid of the execing process, in the supervisor's pid namespace.
+    pub pid: u32,
+    /// The path the child passed to `execve`.
+    pub path: String,
+}
+
+thread_local! {
+    /// Decisions recorded by the Tier-2 exec wall for the current run, oldest
+    /// first. Filled by the supervise loop; emptied by [`drain_tier2_exec_events`].
+    static TIER2_EXEC_EVENTS: RefCell<Vec<Tier2ExecRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Record one supervised exec decision into the thread-local buffer. Converts
+/// the borrowed [`ExecEvent`] into an owned [`Tier2ExecRecord`].
+fn record_tier2_exec(e: &ExecEvent) {
+    let rec = Tier2ExecRecord {
+        ts_millis: now_millis(),
+        allowed: matches!(e.decision, Decision::Allow),
+        digest_hex: e.digest.map(|d| d.to_string()),
+        pid: e.pid,
+        path: e.path.to_string(),
+    };
+    TIER2_EXEC_EVENTS.with(|b| b.borrow_mut().push(rec));
+}
+
+/// Drain the Tier-2 exec wall's recorded decisions for the run that just
+/// finished (oldest first), emptying the buffer. One record per `execve` the
+/// wall screened. The caller converts these to audit records, tagging tier=2.
+/// Empty when no Tier-2 wall was active.
+pub fn drain_tier2_exec_events() -> Vec<Tier2ExecRecord> {
+    TIER2_EXEC_EVENTS.with(|b| std::mem::take(&mut *b.borrow_mut()))
 }

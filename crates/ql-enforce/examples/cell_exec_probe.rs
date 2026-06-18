@@ -39,7 +39,25 @@ fn run_one(label: &str, allow_hex: &str, cmd: &[&str]) {
         .expect("cell builds");
 
     let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-    match cell.run(&argv) {
+    let result = cell.run(&argv);
+
+    // Drain the Tier-2 audit records the wall captured for this run and print
+    // them in the exec.run/exec.deny framing the audit layer uses (tier=2).
+    for rec in ql_enforce::drain_tier2_exec_events() {
+        let action = if rec.allowed {
+            "exec.run "
+        } else {
+            "exec.deny"
+        };
+        let dg = rec.digest_hex.as_deref().unwrap_or("<unhashed>");
+        let dg = &dg[..dg.len().min(16)];
+        println!(
+            "      audit: {action} tier=2 pid={} path={} sha256={dg}",
+            rec.pid, rec.path
+        );
+    }
+
+    match result {
         Ok(0) => println!("[{label}] exit 0    ALLOWED + ran: {}", cmd.join(" ")),
         Ok(code) => println!("[{label}] exit {code}  DENIED / refused: {}", cmd.join(" ")),
         Err(e) => println!("[{label}] error: {e}"),

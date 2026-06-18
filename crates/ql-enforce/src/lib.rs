@@ -50,7 +50,7 @@ mod error;
 pub mod exec_supervisor;
 pub mod veth;
 
-pub use cell::{Cell, CellBuilder};
+pub use cell::{drain_tier2_exec_events, Cell, CellBuilder, Tier2ExecRecord};
 pub use context::ChildContext;
 pub use enforcer::Enforcer;
 pub use error::{EnforceError, Result};
