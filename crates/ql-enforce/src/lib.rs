@@ -47,12 +47,14 @@ mod context;
 mod enforcer;
 pub mod enforcers;
 mod error;
+pub mod exec_supervisor;
 pub mod veth;
 
 pub use cell::{Cell, CellBuilder};
 pub use context::ChildContext;
 pub use enforcer::Enforcer;
 pub use error::{EnforceError, Result};
+pub use exec_supervisor::{Decision, ExecEvent, ExecSupervisor, Listener};
 
 use enforcers::{
     CgroupEnforcer, MountEnforcer, NamespaceEnforcer, NetworkEnforcer, SeccompEnforcer,
