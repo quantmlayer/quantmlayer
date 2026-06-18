@@ -55,6 +55,7 @@ fn run_one(label: &str, allow_hex: &str, cmd: &[&str]) {
             "      audit: {action} tier=2 pid={} path={} sha256={dg}",
             rec.pid, rec.path
         );
+        println!("             argv={:?}", rec.argv);
     }
 
     match result {

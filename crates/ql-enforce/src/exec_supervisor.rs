@@ -16,6 +16,13 @@
 //! every `execve` the child makes: it hashes the resolved binary and allows
 //! (`CONTINUE`) or denies (`EACCES`) by digest.
 //!
+//! For audit it also captures the child's `argv` from the frozen process's
+//! memory (bounded, best-effort). This is **observation only**: argv is recorded
+//! in the exec ledger but never feeds the verdict, because a multi-threaded
+//! tracee could rewrite it between our read and the kernel's copy (the
+//! seccomp-notify TOCTOU caveat). The decision rides on the stable content
+//! digest; see [`read_argv`].
+//!
 //! This module is the reusable core. Cell wiring, profile-sourced allowlists, and
 //! audit records are layered on top in later slices; here the allowlist is a flat
 //! set of lowercase-hex sha256 digests and the caller drives the serve loop.
@@ -110,6 +117,12 @@ pub struct ExecEvent<'a> {
     pub pid: u32,
     /// The path the child passed to `execve` (as read from its memory).
     pub path: &'a str,
+    /// The argv the child passed to `execve`, captured (bounded) from its
+    /// memory. **Observation only** — best-effort and never used for the
+    /// allow/deny decision (a multi-threaded tracee could rewrite it between
+    /// this read and the kernel's; see [`read_argv`]). The verdict is on the
+    /// content digest, which is stable.
+    pub argv: &'a [String],
     /// sha256 hex of the resolved binary, or `None` if it could not be hashed.
     pub digest: Option<&'a str>,
     /// The verdict.
@@ -270,14 +283,17 @@ impl ExecSupervisor {
             return Err(io::Error::last_os_error());
         }
 
-        // execve(path,...) -> path is args[0]; execveat(dirfd,path,...) -> args[1]
+        // execve(path, argv, ...) -> path=args[0], argv=args[1];
+        // execveat(dirfd, path, argv, ...) -> path=args[1], argv=args[2].
         let is_execveat = i64::from(req.data.nr) == libc::SYS_execveat;
-        let addr = if is_execveat {
-            req.data.args[1]
+        let (path_addr, argv_addr) = if is_execveat {
+            (req.data.args[1], req.data.args[2])
         } else {
-            req.data.args[0]
+            (req.data.args[0], req.data.args[1])
         };
-        let path = read_path(req.pid, addr).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        let path = read_path(req.pid, path_addr).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        // Observation only: never feeds the decision (see read_argv).
+        let argv = read_argv(req.pid, argv_addr);
         let digest = hash_target(req.pid, &path).ok();
         let decision = self.decide(digest.as_deref());
 
@@ -289,6 +305,7 @@ impl ExecSupervisor {
         on_event(&ExecEvent {
             pid: req.pid,
             path: &path,
+            argv: &argv,
             digest: digest.as_deref(),
             decision,
         });
@@ -381,6 +398,56 @@ fn read_path(pid: u32, addr: u64) -> io::Result<String> {
     let n = mem.read_at(&mut buf, addr)?;
     let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
     Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+/// Max argv entries captured for audit. Real coding-agent commands sit well
+/// under this; anything longer is truncated in the record (observation only).
+const MAX_ARGV: usize = 16;
+/// Max bytes captured per argv entry.
+const ARG_MAX_LEN: usize = 4096;
+/// Size of a userspace pointer in the (same-arch, 64-bit) tracee's argv array.
+const PTR_SIZE: usize = std::mem::size_of::<u64>();
+
+/// Read up to [`MAX_ARGV`] NUL-terminated argv strings out of the stopped
+/// child's memory. `argv_addr` points to a NUL-terminated array of string
+/// pointers (the second arg to `execve`).
+///
+/// **Observation/audit only, by design.** This is best-effort: a multi-threaded
+/// tracee can rewrite these strings between this read and the kernel's own copy
+/// during the real `execve` (the documented seccomp-notify TOCTOU caveat —
+/// blocking the calling thread does not freeze its siblings). So the captured
+/// argv is recorded for the audit ledger but is *never* used for the allow/deny
+/// decision, which rides on the content digest of the resolved binary (stable,
+/// because the file is hashed through the frozen child's own mount root). Bounds
+/// and read errors degrade gracefully to a shorter (possibly empty) vector.
+fn read_argv(pid: u32, argv_addr: u64) -> Vec<String> {
+    if argv_addr == 0 {
+        return Vec::new();
+    }
+    let mem = match File::open(format!("/proc/{pid}/mem")) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut strbuf = [0u8; ARG_MAX_LEN];
+    for i in 0..MAX_ARGV {
+        let slot = argv_addr.wrapping_add(i as u64 * PTR_SIZE as u64);
+        let mut ptr_bytes = [0u8; PTR_SIZE];
+        if !matches!(mem.read_at(&mut ptr_bytes, slot), Ok(n) if n == PTR_SIZE) {
+            break;
+        }
+        let ptr = u64::from_ne_bytes(ptr_bytes);
+        if ptr == 0 {
+            break; // NULL terminator: end of argv.
+        }
+        let n = match mem.read_at(&mut strbuf, ptr) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let end = strbuf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+        out.push(String::from_utf8_lossy(&strbuf[..end]).into_owned());
+    }
+    out
 }
 
 /// Hash the file the child will exec, through the child's own mount root so a

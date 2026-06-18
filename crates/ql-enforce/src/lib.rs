@@ -121,6 +121,42 @@ pub fn brokered_coding_cell(
         .build()
 }
 
+/// Build a coding-agent cell with the **Tier-2** seccomp user-notification exec
+/// wall instead of the Tier-1 BPF-LSM wall. Same containment walls as
+/// [`standard_coding_cell`], but exec enforcement runs in userspace in the
+/// supervising parent — no `lsm` build feature and no kernel BPF-LSM/IMA
+/// required. `ql run` selects this when Tier 1 is unavailable.
+pub fn coding_cell_with_exec_supervision(profile: Profile) -> Result<Cell> {
+    Cell::builder(profile)
+        .with_enforcer(Box::new(CgroupEnforcer::new()))
+        .with_enforcer(Box::new(NamespaceEnforcer::new()))
+        .with_enforcer(Box::new(MountEnforcer::new()))
+        .with_enforcer(Box::new(NetworkEnforcer::new()))
+        .with_enforcer(Box::new(SeccompEnforcer::new()))
+        .with_exec_supervision()
+        .build()
+}
+
+/// Brokered counterpart of [`coding_cell_with_exec_supervision`]: containment
+/// plus allow-listed egress through the broker, with the Tier-2 exec wall. The
+/// parent hook only wires the veth — the exec wall is the userspace supervisor
+/// in the (unfiltered) parent, so the hook's own `ip` execs are unaffected.
+pub fn brokered_coding_cell_with_exec_supervision(
+    profile: Profile,
+    plan: veth::VethPlan,
+    proxy_url: String,
+) -> Result<Cell> {
+    Cell::builder(profile)
+        .with_enforcer(Box::new(CgroupEnforcer::new()))
+        .with_enforcer(Box::new(NamespaceEnforcer::new()))
+        .with_enforcer(Box::new(MountEnforcer::new()))
+        .with_enforcer(Box::new(NetworkEnforcer::with_proxy(proxy_url)))
+        .with_enforcer(Box::new(SeccompEnforcer::new()))
+        .with_parent_hook(Box::new(move |pid| veth::wire(pid, &plan)))
+        .with_exec_supervision()
+        .build()
+}
+
 // --- exec-enforcement integration (feature `lsm`) -------------------------
 //
 // The content-addressed exec wall is attached host-side, in the parent hook,

@@ -7,10 +7,14 @@
 //! and `ql` exits with the command's own exit code, so `ql run` is transparent
 //! to scripts and CI.
 
+use crate::exec_tier::{select_exec_tier, ExecTier, TierChoice};
 use ql_audit::SystemIdentity;
 use ql_broker::{serve, AuditSink, BrokerPolicy};
 use ql_enforce::veth::VethPlan;
-use ql_enforce::{brokered_coding_cell, standard_coding_cell, veth};
+use ql_enforce::{
+    brokered_coding_cell, brokered_coding_cell_with_exec_supervision,
+    coding_cell_with_exec_supervision, standard_coding_cell, veth,
+};
 use ql_profile::Profile;
 use std::net::TcpListener;
 use std::process::ExitCode;
@@ -164,6 +168,27 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     }
 
+    // Select the exec-enforcement tier for this run from the profile's demand
+    // and the host substrate (compile-time `lsm` gates Tier 1). Fail closed if
+    // enforcement is demanded but no content-verified tier is available.
+    let (sub_t1, sub_t2, _sub_t3) = crate::doctor::exec_substrate();
+    let t1_usable = lsm_feature_built() && sub_t1;
+    let tier = match select_exec_tier(profile.exec.enforce, t1_usable, sub_t2) {
+        TierChoice::Use(t) => t,
+        TierChoice::Refuse(reason) => {
+            eprintln!("ql run: {reason}");
+            crate::registry::deregister(&id);
+            return ExitCode::from(1);
+        }
+    };
+    if profile.exec.enforce {
+        eprintln!("ql: exec enforcement tier: {}", tier.label());
+    }
+    // Tamper-evident record of which exec tier actually governs this session.
+    if let Some(audit) = audit_path.as_deref() {
+        write_exec_tier_record(audit, tier, system.as_ref());
+    }
+
     let code = if brokered {
         run_brokered(
             profile,
@@ -171,6 +196,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             verbose,
             audit_path.as_deref(),
             system.as_ref(),
+            tier,
         )
     } else {
         run_default(
@@ -179,6 +205,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             verbose,
             audit_path.as_deref(),
             system.as_ref(),
+            tier,
         )
     };
     crate::registry::deregister(&id);
@@ -280,6 +307,7 @@ fn run_default(
     verbose: bool,
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
+    tier: ExecTier,
 ) -> ExitCode {
     if verbose {
         eprintln!(
@@ -287,7 +315,11 @@ fn run_default(
             command.join(" ")
         );
     }
-    let cell = match standard_coding_cell(profile) {
+    let built = match tier {
+        ExecTier::SeccompNotify => coding_cell_with_exec_supervision(profile),
+        ExecTier::BpfLsm | ExecTier::None => standard_coding_cell(profile),
+    };
+    let cell = match built {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ql run: could not build containment cell: {e}");
@@ -315,6 +347,7 @@ fn run_brokered(
     verbose: bool,
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
+    tier: ExecTier,
 ) -> ExitCode {
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
@@ -360,7 +393,13 @@ fn run_brokered(
         );
     }
 
-    let cell = match brokered_coding_cell(profile, plan.clone(), proxy_url) {
+    let built = match tier {
+        ExecTier::SeccompNotify => {
+            brokered_coding_cell_with_exec_supervision(profile, plan.clone(), proxy_url)
+        }
+        ExecTier::BpfLsm | ExecTier::None => brokered_coding_cell(profile, plan.clone(), proxy_url),
+    };
+    let cell = match built {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ql run: could not build brokered cell: {e}");
@@ -471,7 +510,10 @@ fn tier2_exec_audit_event(
             .clone()
             .unwrap_or_else(|| "<unhashed>".to_string()),
         decision,
-        detail: format!("tier=2 pid {} path {}", rec.pid, rec.path),
+        detail: format!(
+            "tier=2 pid {} path {} argv {:?}",
+            rec.pid, rec.path, rec.argv
+        ),
         system: system.cloned(),
     }
 }
@@ -522,6 +564,63 @@ fn write_tier2_exec_events(audit_path: Option<&str>, system: Option<&SystemIdent
         }
         Err(e) => eprintln!("ql: exec audit: serialize failed: {e}"),
     }
+}
+
+/// Append a tamper-evident record of which exec-enforcement tier governs this
+/// session (`policy.exec_tier`), chaining onto the policy/egress records. The
+/// decision is `Info` — a commitment, not an allow/deny — and the tier label is
+/// the target. No-op when no audit log is set (the caller checks).
+fn write_exec_tier_record(audit_path: &str, tier: ExecTier, system: Option<&SystemIdentity>) {
+    use ql_audit::{AuditEvent, AuditLog, Decision};
+
+    let mut log = match std::fs::read_to_string(audit_path) {
+        Ok(s) => match AuditLog::from_jsonl(&s) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ql: exec tier: cannot parse {audit_path}: {e}");
+                return;
+            }
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => AuditLog::new(),
+        Err(e) => {
+            eprintln!("ql: exec tier: cannot read {audit_path}: {e}");
+            return;
+        }
+    };
+
+    let detail = match tier {
+        ExecTier::None => "exec enforcement off",
+        ExecTier::BpfLsm => "content-verified exec wall (kernel BPF-LSM)",
+        ExecTier::SeccompNotify => "content-verified exec wall (seccomp user-notify)",
+    };
+    let event = AuditEvent {
+        ts_millis: AuditLog::now_millis(),
+        actor: "run".to_string(),
+        action: "policy.exec_tier".to_string(),
+        target: tier.label().to_string(),
+        decision: Decision::Info,
+        detail: detail.to_string(),
+        system: system.cloned(),
+    };
+    if log.append(event).is_err() {
+        eprintln!("ql: exec tier: append failed");
+        return;
+    }
+    match log.to_jsonl() {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(audit_path, text) {
+                eprintln!("ql: exec tier: write {audit_path} failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("ql: exec tier: serialize failed: {e}"),
+    }
+}
+
+/// Whether the `lsm` (Tier-1 BPF-LSM) feature was built into this binary. Kept
+/// behind a fn so the tier check reads as runtime logic, not a const-folded
+/// `false && x` that lint passes flag.
+fn lsm_feature_built() -> bool {
+    cfg!(feature = "lsm")
 }
 
 /// Nanosecond counter for unique-ish veth subnet seeds.
@@ -586,6 +685,7 @@ mod tests {
             digest_hex: Some("ab".repeat(32)),
             pid: 7,
             path: "/bin/echo".to_string(),
+            argv: vec!["/bin/echo".to_string(), "hi".to_string()],
         };
         let ev = tier2_exec_audit_event(&allow, None);
         assert_eq!(ev.action, "exec.run");
@@ -594,6 +694,7 @@ mod tests {
         assert_eq!(ev.target, "ab".repeat(32));
         assert!(ev.detail.contains("tier=2"));
         assert!(ev.detail.contains("/bin/echo"));
+        assert!(ev.detail.contains("\"hi\""));
 
         let deny = ql_enforce::Tier2ExecRecord {
             ts_millis: 124,
@@ -601,6 +702,7 @@ mod tests {
             digest_hex: None,
             pid: 8,
             path: "/bin/ls".to_string(),
+            argv: vec!["/bin/ls".to_string()],
         };
         let ev = tier2_exec_audit_event(&deny, None);
         assert_eq!(ev.action, "exec.deny");

@@ -16,6 +16,7 @@
 mod audit;
 mod broker;
 mod doctor;
+mod exec_tier;
 mod export;
 mod kill;
 mod learn;

@@ -647,6 +647,9 @@ pub struct Tier2ExecRecord {
     pub pid: u32,
     /// The path the child passed to `execve`.
     pub path: String,
+    /// The argv the child passed to `execve` (bounded, observation only — never
+    /// used for the verdict; see [`crate::exec_supervisor::ExecEvent::argv`]).
+    pub argv: Vec<String>,
 }
 
 thread_local! {
@@ -671,6 +674,7 @@ fn record_tier2_exec(e: &ExecEvent) {
         digest_hex: e.digest.map(|d| d.to_string()),
         pid: e.pid,
         path: e.path.to_string(),
+        argv: e.argv.to_vec(),
     };
     TIER2_EXEC_EVENTS.with(|b| b.borrow_mut().push(rec));
 }

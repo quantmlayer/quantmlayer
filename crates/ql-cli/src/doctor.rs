@@ -256,6 +256,22 @@ fn active_tier(t1: bool, t2: bool, t3: bool) -> &'static str {
     }
 }
 
+/// Probe which exec-enforcement substrates the host *kernel* supports, as three
+/// booleans: (tier1 BPF-LSM+BTF+IMA, tier2 seccomp user-notify, tier3 Landlock).
+/// Used by `ql run` to select a tier. Compile-time `lsm` gating is the caller's
+/// concern; this reports only the kernel substrate.
+pub(crate) fn exec_substrate() -> (bool, bool, bool) {
+    let t1 = read("/sys/kernel/security/lsm")
+        .as_deref()
+        .is_some_and(lsm_has_bpf)
+        && exists("/sys/kernel/btf/vmlinux")
+        && (exists("/sys/kernel/security/ima") || exists("/sys/kernel/security/integrity/ima"));
+    let t2 =
+        read("/proc/sys/kernel/seccomp/actions_avail").is_some_and(|s| s.contains("user_notif"));
+    let t3 = landlock_abi().is_some();
+    (t1, t2, t3)
+}
+
 fn assess_exec() -> ExecAssessment {
     // Tier 1 — BPF-LSM + BTF + IMA (kernel, content-verified, best).
     let bpf = read("/sys/kernel/security/lsm").as_deref().map(lsm_has_bpf);
