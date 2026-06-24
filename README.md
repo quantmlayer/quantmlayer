@@ -30,6 +30,11 @@ ql run --profile profiles/coding.yaml -- my-agent --task "fix the failing test"
 # everything else, including the cloud-metadata endpoint:
 ql run --broker --profile profiles/coding.yaml -- my-agent --task "..."
 
+# Preflight: which containment walls does THIS host actually give you, and which
+# exec-enforcement tier (kernel BPF-LSM vs userspace seccomp-notify)? Read-only —
+# reads /proc and /sys, loads nothing. Add --json for a machine-readable matrix:
+ql doctor
+
 # Inspect what a profile will enforce:
 ql validate --profile profiles/coding.yaml
 
@@ -115,6 +120,8 @@ The split is deliberate: `ql-profile` is the portable contract, `ql-enforce` is 
 ## Platform support
 
 The kernel containment layer targets Linux and works on every current enterprise kernel (RHEL 8/9, all current Ubuntu LTS, Amazon Linux) — namespaces, mount isolation, classic seccomp-bpf, and cgroups (both v1 and v2 are supported). Where a host lacks a specific control, that wall degrades to a clearly-reported "unsupported" rather than failing the whole cell. The content-addressed exec wall is the one with stricter requirements: it needs a kernel built with BPF-LSM and IMA (Linux ≥ 5.7 with `bpf` in the active LSM list) and is compiled only in an `lsm`-feature build; where either is missing, exec enforcement reports "unsupported" like any other wall while the rest of the cell holds. The broker is pure userspace and runs anywhere. Brokered egress (`ql run --broker`) additionally uses `iproute2` (the ubiquitous `ip` tool) to wire the veth uplink.
+
+**Validated on managed-cloud node images.** The strict-requirement question — "does my cloud node actually have BPF-LSM + IMA?" — is answered by measurement, not assumption. On **Amazon Linux 2023**, the default Amazon EKS node OS (kernel 6.18), a real `ql run` enforces the Tier-1 BPF-LSM exec wall with **no node reconfiguration**: `bpf` is already in the active LSM list, and content-addressed deny-by-default works with the stock IMA setup — no custom AMI and no IMA policy needed (verified live: an approved binary runs, an unapproved one is denied at `execve`). **Google Container-Optimized OS**, the default GKE node OS (kernel 6.6), ships BPF-LSM active the same way and is Tier-1-capable. Run `ql doctor` on any node to see the tier it resolves, or [`scripts/ql-kernel-probe.sh`](scripts/ql-kernel-probe.sh) for the full read-only kernel-capability report.
 
 Both **x86-64** and **aarch64** (ARM64) are supported, including profile learning: syscall numbers are resolved per-architecture and the tracer reads registers via the architecture's native ptrace interface, so `ql learn` works on Apple Silicon VMs and AWS Graviton as well as on x86-64 hosts.
 
