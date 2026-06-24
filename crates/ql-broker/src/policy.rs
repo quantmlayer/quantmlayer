@@ -86,6 +86,14 @@ pub struct BrokerPolicy {
     /// connection threads. A signed action is admitted only if its nonce is
     /// fresh for its leaf token (see [`crate::nonce`]).
     nonce_store: Arc<NonceStore>,
+    /// Canary (honeytoken) destinations: hosts nothing legitimate should ever
+    /// contact. A CONNECT to one is, by construction, an exfiltration/misuse
+    /// attempt — denied unconditionally and recorded as a distinct, high-signal
+    /// `canary.triggered` event, ahead of and regardless of the allow-list or
+    /// token gate. Empty means the feature is off.
+    canary_destinations: Vec<String>,
+    /// Optional label for the planted canary, recorded in the trip's audit detail.
+    canary_id: Option<String>,
 }
 
 impl BrokerPolicy {
@@ -99,6 +107,8 @@ impl BrokerPolicy {
             audit: None,
             system: None,
             nonce_store: Arc::new(NonceStore::new()),
+            canary_destinations: Vec::new(),
+            canary_id: None,
         }
     }
 
@@ -122,6 +132,17 @@ impl BrokerPolicy {
         self
     }
 
+    /// Register canary (honeytoken) destinations. Any CONNECT to one is a
+    /// tripwire: always denied and recorded as a distinct, high-signal
+    /// `canary.triggered` event, ahead of and regardless of the allow-list or
+    /// token gate. `id` is an optional label for the planted credential, carried
+    /// in the audit detail. Additive; an empty host list leaves the feature off.
+    pub fn with_canaries(mut self, hosts: Vec<String>, id: Option<String>) -> Self {
+        self.canary_destinations = hosts;
+        self.canary_id = id;
+        self
+    }
+
     /// Is token-gating enabled?
     pub fn token_gated(&self) -> bool {
         !self.trusted_roots.is_empty()
@@ -139,6 +160,18 @@ impl BrokerPolicy {
         auth: Option<&str>,
         now_ms: u64,
     ) -> Decision {
+        // Canary tripwire takes precedence over every other rule. A connection to
+        // a canary destination is, by construction, an exfiltration/misuse attempt,
+        // so it is refused before the allow-list or token gate is even consulted
+        // (and, like every deny, before any DNS lookup). It is recorded as a
+        // distinct, high-signal `canary.triggered` event rather than a generic
+        // egress deny, and so it returns here without falling through to the
+        // ordinary `egress.connect` logging below.
+        if self.is_canary(host) {
+            self.record_canary(host, port);
+            return Decision::Deny("canary destination (exfiltration attempt blocked)");
+        }
+
         let decision = if self.token_gated() {
             match auth {
                 None => Decision::Deny("missing authorization token"),
@@ -212,6 +245,37 @@ impl BrokerPolicy {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
             host == d || host.ends_with(&format!(".{d}"))
         })
+    }
+
+    /// Does `host` match a registered canary destination? Uses the same
+    /// exact/`*.suffix` semantics as the allow-list ([`host_matches`]) so a
+    /// canary covers its subdomains too, and so there is only one host matcher.
+    fn is_canary(&self, host: &str) -> bool {
+        self.canary_destinations
+            .iter()
+            .any(|c| host_matches(host, c))
+    }
+
+    /// Record a tripped canary as a distinct, high-signal `canary.triggered`
+    /// event in the same tamper-evident log as every other egress decision, so
+    /// `ql audit verify` covers it and a reviewer sees it in sequence. No-op when
+    /// no audit sink is configured (the trip is still denied regardless).
+    fn record_canary(&self, host: &str, port: u16) {
+        if let Some(sink) = &self.audit {
+            let detail = match &self.canary_id {
+                Some(id) => format!("canary_id={id} verdict=blocked (exfiltration attempt)"),
+                None => "verdict=blocked (exfiltration attempt)".to_string(),
+            };
+            sink.record(AuditEvent {
+                ts_millis: AuditLog::now_millis(),
+                actor: "broker".into(),
+                action: "canary.triggered".into(),
+                target: format!("{host}:{port}"),
+                decision: AuditDecision::Deny,
+                detail,
+                system: self.system.clone(),
+            });
+        }
     }
 
     /// Evaluate a destination given its host and the IPs it resolved to.
@@ -345,6 +409,8 @@ mod tests {
             audit: None,
             system: None,
             nonce_store: Arc::new(NonceStore::new()),
+            canary_destinations: vec![],
+            canary_id: None,
         };
         assert!(p.host_allowed("pypi.org"));
         assert!(p.host_allowed("files.pypi.org"));
@@ -362,6 +428,8 @@ mod tests {
             audit: None,
             system: None,
             nonce_store: Arc::new(NonceStore::new()),
+            canary_destinations: vec![],
+            canary_id: None,
         };
         // Allowed host, public IP → allow.
         assert_eq!(
@@ -379,6 +447,75 @@ mod tests {
             Decision::Deny("host not in allow-list")
         );
     }
+
+    fn net(allow: &[&str]) -> NetPolicy {
+        NetPolicy {
+            default_deny: true,
+            allow_domains: allow.iter().map(|s| s.to_string()).collect(),
+            block_private_ranges: true,
+        }
+    }
+
+    /// A canary destination is denied as a tripwire and takes precedence over the
+    /// allow-list: even when the same host is explicitly allow-listed, the canary
+    /// check (which runs first) refuses it. Subdomains of a canary trip it too.
+    #[test]
+    fn canary_denies_and_outranks_allow_list() {
+        let canary = "canary.test";
+        // The canary host is ALSO allow-listed here, so a pass means the canary
+        // check ran first and outranked the allow-list.
+        let p = BrokerPolicy::from_net_policy(&net(&[canary, "pypi.org"]))
+            .with_canaries(vec![canary.into()], Some("aws-key-7".into()));
+        let tripped = Decision::Deny("canary destination (exfiltration attempt blocked)");
+
+        let on_canary = p.authorize_connect(canary, 443, None, 0);
+        let on_sub = p.authorize_connect("sub.canary.test", 443, None, 0);
+        let on_allowed = p.authorize_connect("pypi.org", 443, None, 0);
+        let on_other = p.authorize_connect("evil.com", 443, None, 0);
+
+        assert_eq!(on_canary, tripped); // allow-listed, but the canary wins
+        assert_eq!(on_sub, tripped); // subdomains of a canary trip too
+        assert_eq!(on_allowed, Decision::Allow); // a normal host is unaffected
+        assert_eq!(on_other, Decision::Deny("host not in allow-list")); // plain deny
+    }
+
+    /// A canary trip writes exactly one distinct `canary.triggered` record (and no
+    /// generic `egress.connect`), chained into the tamper-evident log.
+    #[test]
+    fn canary_emits_one_distinct_audit_event() {
+        let dir = std::env::temp_dir().join(format!("qlbk-canary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("egress.jsonl");
+        let _ = std::fs::remove_file(&log);
+
+        let p = BrokerPolicy::from_net_policy(&net(&["pypi.org"]))
+            .with_canaries(vec!["canary.test".into()], Some("aws-key-7".into()))
+            .with_audit(AuditSink::new(&log));
+        let _ = p.authorize_connect("canary.test", 443, None, 0);
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let parsed = AuditLog::from_jsonl(&text).unwrap();
+        assert!(parsed.verify().is_ok());
+
+        let mut trips = 0;
+        let mut generic = 0;
+        for r in parsed.records() {
+            match r.event.action.as_str() {
+                "canary.triggered" => {
+                    trips += 1;
+                    assert_eq!(r.event.target, "canary.test:443");
+                    assert!(matches!(r.event.decision, AuditDecision::Deny));
+                    assert!(r.event.detail.contains("aws-key-7"));
+                }
+                "egress.connect" => generic += 1,
+                _ => {}
+            }
+        }
+        // Exactly one distinct event; the canary path short-circuits generic logging.
+        assert_eq!(trips, 1);
+        assert_eq!(generic, 0);
+        let _ = std::fs::remove_file(&log);
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +532,8 @@ mod token_gating_tests {
             audit: None,
             system: None,
             nonce_store: Arc::new(NonceStore::new()),
+            canary_destinations: vec![],
+            canary_id: None,
         }
     }
 

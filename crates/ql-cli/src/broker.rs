@@ -6,7 +6,10 @@
 //! `--trust <root-pubkey-hex>` it switches to *token-gated* egress: a request
 //! must carry a valid signed delegation token (in `X-QL-Authorization`) whose
 //! capability permits the destination. `--audit <log>` records every decision
-//! to a tamper-evident log.
+//! to a tamper-evident log. `--canary <host>` (repeatable, with optional
+//! `--canary-id <label>`) arms honeytoken destinations: a CONNECT to one is
+//! refused as a tripwire and recorded as a distinct `canary.triggered` event,
+//! ahead of and regardless of the allow-list or token gate.
 
 use ql_audit::SystemIdentity;
 use ql_broker::{serve, AuditSink, BrokerPolicy};
@@ -24,6 +27,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut audit: Option<String> = None;
     let mut system_id: Option<String> = None;
     let mut model_version: Option<String> = None;
+    let mut canary: Vec<String> = Vec::new();
+    let mut canary_id: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -42,6 +47,12 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--audit" => audit = it.next().cloned(),
             "--system-id" => system_id = it.next().cloned(),
             "--model-version" => model_version = it.next().cloned(),
+            "--canary" => {
+                if let Some(v) = it.next() {
+                    canary.push(v.clone());
+                }
+            }
+            "--canary-id" => canary_id = it.next().cloned(),
             other => {
                 eprintln!("ql broker: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -92,6 +103,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
     if let Some(id) = system_id {
         policy = policy.with_system(SystemIdentity::ai_system(id, model_version));
     }
+    if !canary.is_empty() {
+        policy = policy.with_canaries(canary.clone(), canary_id);
+    }
     let policy = Arc::new(policy);
 
     let listener = match TcpListener::bind(&listen) {
@@ -114,6 +128,12 @@ pub fn cmd(args: &[String]) -> ExitCode {
         eprintln!(
             "ql broker: listening on {listen}; {} allow-listed domain(s)",
             profile.network.allow_domains.len()
+        );
+    }
+    if !canary.is_empty() {
+        eprintln!(
+            "ql broker: {} canary destination(s) armed (tripwire denies + canary.triggered audit)",
+            canary.len()
         );
     }
 
