@@ -40,6 +40,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut brokered = false;
     let mut require_signed = false;
     let mut trust_signers: Vec<String> = Vec::new();
+    let mut token_chain_path: Option<String> = None;
+    let mut trust_roots: Vec<String> = Vec::new();
     let mut expect_commit: Option<String> = None;
     let mut expect_image: Option<String> = None;
 
@@ -59,6 +61,12 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--trust-signer" => {
                 if let Some(v) = it.next() {
                     trust_signers.push(v.clone());
+                }
+            }
+            "--token-chain" => token_chain_path = it.next().cloned(),
+            "--trust-root" => {
+                if let Some(v) = it.next() {
+                    trust_roots.push(v.clone());
                 }
             }
             "--expect-commit" => expect_commit = it.next().cloned(),
@@ -110,6 +118,29 @@ pub fn cmd(args: &[String]) -> ExitCode {
         profile.filesystem.readwrite.push(format!("{ws}/**"));
     }
 
+    // Token-to-cell binding. If a delegation chain is supplied, verify it in
+    // userspace (signatures, monotonic narrowing, trusted root, not expired) and
+    // intersect the profile with the proven leaf capability, so the cell the
+    // kernel builds is provably a subset of the parent agent's authority. Bound
+    // AFTER --workspace so an operator's workspace grant can only be narrowed by
+    // the token, never widened; bound BEFORE the audit/issue-token/cell steps so
+    // every downstream artifact reflects the narrowed authority. Fail closed: any
+    // verification error refuses the run rather than falling back un-narrowed.
+    let mut token_binding: Option<(String, Option<String>, String)> = None;
+    if let Some(chain_path) = token_chain_path.as_deref() {
+        match bind_from_token_chain(&mut profile, chain_path, &trust_roots) {
+            Ok(b) => {
+                eprintln!(
+                    "ql: cell bound to delegation token (leaf {}…, cap {})",
+                    &b.0[..16.min(b.0.len())],
+                    b.2
+                );
+                token_binding = Some(b);
+            }
+            Err(code) => return code,
+        }
+    }
+
     // Register this run so `ql ps` can list it and `ql kill` can revoke it
     // from another shell. We record THIS process's pid — the parent of the
     // contained agent — so revoking the tree takes the agent down with it.
@@ -149,6 +180,19 @@ pub fn cmd(args: &[String]) -> ExitCode {
         ) {
             Ok(n) => eprintln!("ql: wrote {n} policy record(s) to {audit}"),
             Err(e) => eprintln!("ql run: could not write policy log {audit}: {e}"),
+        }
+        // Tie the running cell to the delegation chain that authorized it, so a
+        // verifier can later prove "this cell was authorized by this token chain"
+        // and walk to its parent via the leaf's parent_hash.
+        if let Some((leaf_hash, parent_hash, summary)) = &token_binding {
+            write_token_binding_record(
+                audit,
+                &id,
+                leaf_hash,
+                parent_hash.as_deref(),
+                summary,
+                system.as_ref(),
+            );
         }
     }
 
@@ -218,6 +262,110 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Verify a delegation chain and narrow `profile` to its proven leaf capability.
+/// Returns `(leaf_hash, parent_hash, capability_summary)` for the audit binding
+/// on success, or an exit code on any failure. Fail closed: a missing root, an
+/// unreadable/invalid chain file, a bad trust-root key, or any chain-verification
+/// error (bad signature, broadened link, expired, untrusted root) refuses the run
+/// — the un-narrowed profile is never used as a fallback.
+fn bind_from_token_chain(
+    profile: &mut Profile,
+    chain_path: &str,
+    trust_roots: &[String],
+) -> Result<(String, Option<String>, String), ExitCode> {
+    use ql_token::{verify_chain, PublicId, Token};
+
+    if trust_roots.is_empty() {
+        eprintln!("ql run: --token-chain requires at least one --trust-root <hex>");
+        return Err(ExitCode::from(2));
+    }
+    let text = std::fs::read_to_string(chain_path).map_err(|e| {
+        eprintln!("ql run: cannot read token chain {chain_path}: {e}");
+        ExitCode::from(2)
+    })?;
+    let chain: Vec<Token> = serde_json::from_str(&text).map_err(|e| {
+        eprintln!("ql run: invalid token chain {chain_path}: {e}");
+        ExitCode::from(2)
+    })?;
+    let mut roots: Vec<PublicId> = Vec::new();
+    for hex in trust_roots {
+        match PublicId::from_hex(hex) {
+            Ok(p) => roots.push(p),
+            Err(e) => {
+                eprintln!("ql run: bad --trust-root key `{hex}`: {e}");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    let cap = verify_chain(&chain, &roots, now_ms()).map_err(|e| {
+        eprintln!("ql run: token chain rejected ({e}) — refusing to arm");
+        ExitCode::from(2)
+    })?;
+    let leaf = chain.last().expect("verify_chain rejects empty chains");
+    let leaf_hash = leaf.hash();
+    let parent_hash = leaf.body.parent_hash.clone();
+    let summary = crate::token_bind::capability_summary(&cap);
+    *profile = crate::token_bind::bind_profile_to_capability(profile, &cap);
+    Ok((leaf_hash, parent_hash, summary))
+}
+
+/// Append a tamper-evident record (`policy.token_bound`) binding the cell id to
+/// the delegation chain that authorized it: the leaf token hash is the target,
+/// the parent hash and capability summary are in the detail. Chains onto the same
+/// hash-evident log as the policy/exec-tier records, so `ql audit verify` covers
+/// it. No-op when no audit log is set (the caller checks).
+fn write_token_binding_record(
+    audit_path: &str,
+    cell_id: &str,
+    leaf_hash: &str,
+    parent_hash: Option<&str>,
+    summary: &str,
+    system: Option<&SystemIdentity>,
+) {
+    use ql_audit::{AuditEvent, AuditLog, Decision};
+
+    let mut log = match std::fs::read_to_string(audit_path) {
+        Ok(s) => match AuditLog::from_jsonl(&s) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("ql: token bind: cannot parse {audit_path}: {e}");
+                return;
+            }
+        },
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => AuditLog::new(),
+        Err(e) => {
+            eprintln!("ql: token bind: cannot read {audit_path}: {e}");
+            return;
+        }
+    };
+
+    let detail = format!(
+        "cell={cell_id} leaf={leaf_hash} parent={} cap[{summary}]",
+        parent_hash.unwrap_or("-")
+    );
+    let event = AuditEvent {
+        ts_millis: AuditLog::now_millis(),
+        actor: "run".to_string(),
+        action: "policy.token_bound".to_string(),
+        target: leaf_hash.to_string(),
+        decision: Decision::Info,
+        detail,
+        system: system.cloned(),
+    };
+    if log.append(event).is_err() {
+        eprintln!("ql: token bind: append failed");
+        return;
+    }
+    match log.to_jsonl() {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(audit_path, text) {
+                eprintln!("ql: token bind: write {audit_path} failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("ql: token bind: serialize failed: {e}"),
+    }
 }
 
 /// Enforce the operator's signed-profile policy before arming.
@@ -692,6 +840,13 @@ fn load_profile(path: &str) -> Result<Profile, ExitCode> {
         ExitCode::from(2)
     })?;
     profile.validate().map_err(|e| {
+        eprintln!("ql run: profile failed validation: {e}");
+        ExitCode::from(2)
+    })?;
+    // Authoring lints run on the human-authored base profile (not on a
+    // token-narrowed profile, which binds later and may legitimately be more
+    // restrictive than any of these lints would allow).
+    profile.lint_authoring().map_err(|e| {
         eprintln!("ql run: profile failed validation: {e}");
         ExitCode::from(2)
     })?;

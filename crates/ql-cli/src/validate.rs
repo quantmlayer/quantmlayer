@@ -44,6 +44,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
         eprintln!("ql validate: INVALID — {e}");
         return ExitCode::from(1);
     }
+    if let Err(e) = profile.lint_authoring() {
+        eprintln!("ql validate: INVALID — {e}");
+        return ExitCode::from(1);
+    }
 
     print_summary(&path, &profile);
     ExitCode::SUCCESS

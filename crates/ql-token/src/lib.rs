@@ -16,7 +16,7 @@ mod error;
 mod identity;
 mod token;
 
-pub use capability::{Action, Capability};
+pub use capability::{path_contains, Action, Capability};
 pub use error::{Result, TokenError};
 pub use identity::{Identity, PublicId};
 pub use token::{

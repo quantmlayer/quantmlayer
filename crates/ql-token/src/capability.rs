@@ -89,6 +89,16 @@ fn path_within_one(child: &str, parent: &str) -> bool {
     false
 }
 
+/// Public containment predicate over the `/**`-suffix path grammar: does the
+/// single grant `parent` fully cover `child`? This is the *one* authority on
+/// path containment in QuantmLayer. The profile->capability binding in `ql-cli`
+/// calls this rather than reimplementing a second, drift-prone semantics — a
+/// divergent copy could silently widen or narrow a derived cell, which is the
+/// top correctness risk in token-to-cell binding.
+pub fn path_contains(parent: &str, child: &str) -> bool {
+    path_within_one(child, parent)
+}
+
 /// Exact-membership subset for non-path sets (domains, exec).
 fn set_within(child: &[String], parent: &[String]) -> bool {
     child.iter().all(|c| parent.contains(c))

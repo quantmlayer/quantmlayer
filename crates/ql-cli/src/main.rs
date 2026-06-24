@@ -25,6 +25,7 @@ mod profile;
 mod registry;
 mod run;
 mod token;
+mod token_bind;
 mod token_issue;
 mod validate;
 

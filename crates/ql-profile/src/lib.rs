@@ -181,15 +181,6 @@ impl Profile {
             });
         }
 
-        // A coding agent with no executable allowed cannot function; this is
-        // almost certainly a mistake, and a silent empty allowlist is a trap.
-        if self.agent_type == AgentType::Coding && self.processes.allow_exec.is_empty() {
-            return Err(ProfileError::validation(
-                "processes.allow_exec",
-                "a coding agent profile must allow at least one executable",
-            ));
-        }
-
         // Content-addressed exec, when enabled, is strictly allow-listed. An
         // enabled-but-empty digest set would deny every exec — almost always a
         // mistake, since the digests are normally produced by `ql learn`.
@@ -227,6 +218,30 @@ impl Profile {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Authoring lints: checks that flag likely *authoring* mistakes but are not
+    /// cell-construction safety invariants. Run these when a profile is authored
+    /// or loaded (`ql validate`, `ql run`'s profile load) — NOT at cell build.
+    ///
+    /// The distinction matters for token-to-cell binding: a profile narrowed by a
+    /// delegation token may legitimately be *more* restrictive than anything a
+    /// human would hand-author. Narrowing only ever removes grants, so it can
+    /// empty a coding agent's exec allow-list. That yields a valid, maximally
+    /// contained cell — not a mistake — and so it must pass `validate` (the
+    /// fail-closed cell-build gate) even though it would fail this lint.
+    pub fn lint_authoring(&self) -> Result<()> {
+        // A hand-authored coding agent with no executable allowed cannot function;
+        // a silent empty allowlist is almost certainly a mistake. A token-derived
+        // profile may legitimately be empty here, which is why this lives in the
+        // lint and not in `validate`.
+        if self.agent_type == AgentType::Coding && self.processes.allow_exec.is_empty() {
+            return Err(ProfileError::validation(
+                "processes.allow_exec",
+                "a coding agent profile must allow at least one executable",
+            ));
+        }
         Ok(())
     }
 }
@@ -325,13 +340,26 @@ mod tests {
         ));
     }
 
-    /// A coding profile with no allowed executable is a mistake and must fail.
+    /// A hand-authored coding profile with no allowed executable is a likely
+    /// mistake and must fail the authoring lint.
     #[test]
-    fn rejects_coding_profile_with_no_executables() {
+    fn lint_rejects_coding_profile_with_no_executables() {
         let mut p = minimal_valid_coding();
         p.processes.allow_exec.clear();
-        let err = p.validate().unwrap_err();
+        let err = p.lint_authoring().unwrap_err();
         assert!(matches!(err, ProfileError::Validation { .. }));
+    }
+
+    /// ...but the same empty-exec coding profile must PASS `validate`, the
+    /// fail-closed cell-build gate — a delegation token may legitimately narrow a
+    /// coding agent's exec authority to zero, and that maximally-contained cell
+    /// must be buildable. This is the split that lets token-to-cell binding work.
+    #[test]
+    fn validate_permits_empty_exec_coding_for_attenuation() {
+        let mut p = minimal_valid_coding();
+        p.processes.allow_exec.clear();
+        assert!(p.validate().is_ok());
+        assert!(p.lint_authoring().is_err());
     }
 
     /// default_deny=false with an empty allow list must be rejected as an
