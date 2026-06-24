@@ -93,9 +93,9 @@ impl NetworkEnforcer {
             req.name[1] = b'o' as libc::c_char;
 
             // Read current flags, then OR in UP|RUNNING and write them back.
-            if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut req) == 0 {
+            if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut req) == 0 {
                 req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-                let _ = libc::ioctl(fd, libc::SIOCSIFFLAGS, &req);
+                let _ = libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &req);
             }
             libc::close(fd);
         }

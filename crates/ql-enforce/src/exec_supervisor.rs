@@ -307,7 +307,7 @@ impl ExecSupervisor {
         let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
         let req_ptr = std::ptr::addr_of_mut!(req);
         // SAFETY: req_ptr is a live, correctly-sized buffer for the RECV ioctl.
-        let r = unsafe { libc::ioctl(listener.fd, SECCOMP_IOCTL_NOTIF_RECV, req_ptr) };
+        let r = unsafe { libc::ioctl(listener.fd, SECCOMP_IOCTL_NOTIF_RECV as _, req_ptr) };
         if r != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -350,7 +350,7 @@ impl ExecSupervisor {
         }
         // SAFETY: resp is a live, correctly-sized buffer for the SEND ioctl.
         let resp_ptr = std::ptr::addr_of_mut!(resp);
-        let s = unsafe { libc::ioctl(listener.fd, SECCOMP_IOCTL_NOTIF_SEND, resp_ptr) };
+        let s = unsafe { libc::ioctl(listener.fd, SECCOMP_IOCTL_NOTIF_SEND as _, resp_ptr) };
         if s != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -565,7 +565,13 @@ fn hash_target(pid: u32, path: &str) -> io::Result<String> {
 
 fn notif_id_valid(fd: RawFd, id: u64) -> bool {
     // SAFETY: read-only ioctl over a u64 we own.
-    let r = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, std::ptr::addr_of!(id)) };
+    let r = unsafe {
+        libc::ioctl(
+            fd,
+            SECCOMP_IOCTL_NOTIF_ID_VALID as _,
+            std::ptr::addr_of!(id),
+        )
+    };
     r == 0
 }
 

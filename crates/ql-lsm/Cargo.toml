@@ -22,6 +22,26 @@ libbpf-rs = "0.24"
 libc = "0.2" # CLOCK_MONOTONIC, to map kernel ktime to wall time
 thiserror = "1"
 
+# Static musl builds (the portable x86_64 `ql` for locked cloud nodes such as GKE
+# Container-Optimized OS) must link libelf and zlib statically rather than as
+# shared objects. This is a FEATURE-ONLY override of the exact same libbpf-sys
+# that libbpf-rs already pulls transitively: `links = "bpf"` guarantees a single
+# libbpf-sys instance, so these features unify onto it. It adds static-libelf and
+# static-zlib (each implies static-libbpf) on top of the `vendored-libbpf` feature
+# libbpf-rs already selects, and deliberately does NOT add `vendored-libelf` (no
+# elfutils-from-source), so the musl `argp` link blocker never arises.
+#
+# The cfg gate is load-bearing: on any non-musl target — the local aarch64 gnu dev
+# build, CI — this dependency does not exist at all, and libbpf-sys keeps exactly
+# the `vendored-libbpf` feature set it has today (system libelf/zlib, shared).
+# Build the musl binary on x86_64 Alpine with `libelf-static` + `zlib-static`
+# installed (see PORTABILITY_MATRIX_RUNBOOK / the musl builder script).
+[target.'cfg(target_env = "musl")'.dependencies]
+libbpf-sys = { version = "1.7", default-features = false, features = [
+    "static-libelf",
+    "static-zlib",
+] }
+
 [build-dependencies]
 libbpf-cargo = "0.24"
 

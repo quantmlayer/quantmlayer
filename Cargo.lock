@@ -505,6 +505,7 @@ version = "0.1.0"
 dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
+ "libbpf-sys",
  "libc",
  "ql-profile",
  "thiserror",
