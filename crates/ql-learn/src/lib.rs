@@ -24,18 +24,30 @@ mod digest;
 mod error;
 mod observation;
 mod risk;
+mod shim;
 mod synth;
 mod trace;
 
 pub use error::{LearnError, Result};
 pub use observation::Observation;
 pub use risk::{build_risk_report, risk_report_for_profile};
+pub use shim::{exec_shim_gaps, resolve_shebang_interpreter, resolve_shim_interpreters};
 pub use synth::{synthesize, SynthResult};
 
 /// Trace `command` to completion and synthesize a least-privilege profile from
 /// what it did. Returns the profile, the notes, and the raw observation.
 pub fn learn(command: &[String]) -> Result<LearnOutcome> {
     let mut observation = trace::trace(command)?;
+
+    // A `#!` shim (e.g. multi-call `/bin/true` -> `/usr/bin/coreutils`) execs its
+    // interpreter as a SEPARATE kernel event that content-addressed enforcement
+    // gates on its own, and ptrace only ever records one side of the shim (entry
+    // resolves via /proc/<pid>/exe to the interpreter; a child execve records the
+    // script path). Resolve the shebang chain and add the interpreters before
+    // hashing, so an enforced learned profile pins the WHOLE exec chain instead of
+    // denying the interpreter (the gap observed live on GKE COS).
+    let interpreters = shim::resolve_shim_interpreters(&observation.execs);
+    observation.execs.extend(interpreters);
 
     // Turn the observed exec *paths* into content digests before synthesis, so
     // the learned profile can pin the agent's executable set by content. This

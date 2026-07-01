@@ -63,6 +63,13 @@ fn hash_file(path: &str) -> std::io::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// SHA-256 a file's contents as lowercase hex, or `None` if it cannot be read.
+/// Used by the shim advisory ([`crate::shim::exec_shim_gaps`]) to compare an
+/// interpreter's content digest against a profile's `allow_digests`.
+pub(crate) fn sha256_file_hex(path: &str) -> Option<String> {
+    hash_file(path).ok()
+}
+
 /// Lowercase hex encoding (mirrors `ql-audit`'s helper; avoids a hex-crate dep).
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);

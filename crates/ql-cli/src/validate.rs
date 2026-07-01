@@ -49,6 +49,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Advisory only (never fails validation): warn if a `#!` shim is approved but
+    // the interpreter it execs into is not — the multi-call-binary gap that denied
+    // `/usr/bin/coreutils` on GKE COS. Filesystem-dependent, so it is best-effort.
+    for gap in ql_learn::exec_shim_gaps(&profile) {
+        eprintln!("ql validate: note: {gap}");
+    }
+
     print_summary(&path, &profile);
     ExitCode::SUCCESS
 }
