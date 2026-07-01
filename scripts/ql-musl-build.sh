@@ -10,12 +10,15 @@
 # This script just stands up an x86_64 Alpine build environment and runs the
 # build, then proves the result is static.
 #
-# RUN ON: a fresh x86_64 Alpine system. Two equivalent ways:
+# RUN ON: a fresh x86_64 Alpine system. Three equivalent ways:
 #   (a) an x86_64 Alpine cloud VM (the rev 26/27 "stand up a builder" pattern):
 #         doas sh scripts/ql-musl-build.sh        # or run as root
 #   (b) Alpine in Docker on an x86_64 host:
 #         docker run --rm -v "$PWD":/src -w /src alpine:3.21 \
 #           sh scripts/ql-musl-build.sh
+#   (c) CI, no local x86_64 needed: the `musl-static` GitHub Actions workflow
+#         runs (b) on a native x86_64 runner and uploads the binary as an
+#         artifact — the reproducible way to get an x86_64-BTF build.
 #
 # Must be x86_64 so /sys/kernel/btf/vmlinux and the produced binary are x86_64
 # (the BPF object is CO-RE and relocates on the target kernel at load). Building

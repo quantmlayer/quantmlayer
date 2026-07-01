@@ -1,0 +1,63 @@
+# .github/workflows/musl-static.yml
+#
+# Build a FULLY STATIC x86_64 `ql` (kernel exec wall included) on a NATIVE
+# x86_64 runner, so the embedded BPF object is compiled against x86_64 BTF — the
+# architecture that actually loads on GKE Container-Optimized OS.
+#
+# Why a runner and not a local build: GitHub's `ubuntu-latest` is x86_64, so
+# running the existing builder inside a native x86_64 Alpine container (NO qemu,
+# NO --platform) dumps the runner's x86_64 `/sys/kernel/btf/vmlinux`. An
+# aarch64-host qemu build links fine (proving the musl static-link) but dumps
+# aarch64 BTF into the object. The object is CO-RE and relocates to the target
+# node's kernel at load either way; this workflow just guarantees the right
+# architecture at compile time, and produces a downloadable, verified binary.
+#
+# Triggers are manual + release tags only: the build is heavy (clang/llvm +
+# rustup + a full `--features lsm` release build), so it stays off the every-push
+# path. `make check` (ci.yml) remains the fast gate.
+name: musl-static
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    name: static x86_64 musl ql (native Alpine)
+    runs-on: ubuntu-latest # x86_64 -> native build, no qemu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity — native x86_64 host with kernel BTF
+        run: |
+          echo "host arch: $(uname -m)   kernel: $(uname -r)"
+          test "$(uname -m)" = x86_64 || { echo "runner is not x86_64"; exit 1; }
+          if [ -r /sys/kernel/btf/vmlinux ]; then
+            echo "host BTF present -> the container will dump x86_64 vmlinux.h"
+          else
+            echo "WARNING: /sys/kernel/btf/vmlinux not readable on host"
+          fi
+
+      # Native x86_64 Alpine (the runner's own kernel is shared, so the container
+      # sees x86_64 /sys/kernel/btf). The script apk-adds its toolchain, installs
+      # the pinned Rust, dumps+cleans vmlinux.h, and builds the static binary.
+      - name: Build static musl ql in a native x86_64 Alpine container
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:3.21 \
+            sh scripts/ql-musl-build.sh
+
+      - name: Confirm the artifact is a static x86_64 ELF
+        run: |
+          file target/release/ql
+          file target/release/ql | grep -q 'x86-64' \
+            || { echo "FAIL: not an x86-64 binary"; exit 1; }
+          file target/release/ql | grep -Eq 'statically linked|static-pie' \
+            || { echo "FAIL: not statically linked"; exit 1; }
+
+      - name: Upload ql (static x86_64 musl)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ql-x86_64-musl-static
+          path: target/release/ql
+          if-no-files-found: error
