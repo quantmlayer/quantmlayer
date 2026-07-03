@@ -84,7 +84,10 @@ fn report(label: &str, got: &io::Result<std::process::ExitStatus>, expect: Expec
         Expect::Killed => "KILLED",
     };
     let ok = outcome == want;
-    println!("  [{}] {label} -> {outcome}", if ok { "PASS" } else { "FAIL" });
+    println!(
+        "  [{}] {label} -> {outcome}",
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

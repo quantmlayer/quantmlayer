@@ -123,7 +123,10 @@ fn hex(bytes: &[u8]) -> String {
 /// The kernel monotonic clock (`CLOCK_MONOTONIC`), matching what
 /// `bpf_ktime_get_ns` stamps into each event. In nanoseconds.
 fn mono_now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: `ts` is a valid, writable timespec; clock_gettime only writes it.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     let secs = ts.tv_sec as u64;
@@ -152,7 +155,10 @@ fn parse_event(data: &[u8], mono_now_ns: u64, wall_now_ms: u64) -> Option<ExecRe
     let hashed = data[61] != 0;
     let digest_hex = hashed.then(|| hex(&data[8..40]));
     let comm_raw = &data[40..56];
-    let end = comm_raw.iter().position(|&b| b == 0).unwrap_or(comm_raw.len());
+    let end = comm_raw
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(comm_raw.len());
     let comm = String::from_utf8_lossy(&comm_raw[..end]).into_owned();
     let pid = u32::from_ne_bytes(data[56..60].try_into().ok()?);
     let allowed = data[60] != 0;

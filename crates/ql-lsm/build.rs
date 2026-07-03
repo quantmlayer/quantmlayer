@@ -29,14 +29,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=QL_VMLINUX_H");
     match env::var("QL_VMLINUX_H") {
         Ok(path) if !path.is_empty() => {
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("read QL_VMLINUX_H={path}: {e}"));
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("read QL_VMLINUX_H={path}: {e}"));
             std::fs::write(&vmlinux, bytes).expect("write vmlinux.h");
             println!("cargo:rerun-if-changed={path}");
         }
         _ => {
             let dump = Command::new("bpftool")
-                .args(["btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "c"])
+                .args([
+                    "btf",
+                    "dump",
+                    "file",
+                    "/sys/kernel/btf/vmlinux",
+                    "format",
+                    "c",
+                ])
                 .output()
                 .expect("run `bpftool btf dump` (install bpftool / linux-tools)");
             assert!(
