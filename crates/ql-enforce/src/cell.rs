@@ -104,8 +104,27 @@ impl Cell {
 
         // Capture host identity BEFORE we enter the user namespace, so the
         // namespace enforcer can map it correctly inside the child.
-        let host_uid = Uid::current().as_raw();
-        let host_gid = Gid::current().as_raw();
+        //
+        // Sudo case (probe-verified on Ubuntu 24.04 / kernel 6.8): when `ql`
+        // runs via sudo, the human's files (workspace, `~/.claude`) belong to
+        // the *invoking* user, and the agent profiles drop all capabilities —
+        // so a cell mapped `0 <- 0` cannot read them, and files it creates
+        // land root-owned. Sudo is only needed for the PARENT's privileged
+        // setup (veth uplink, BPF-LSM attach, cgroups). So under sudo the
+        // cell maps in-ns root from `SUDO_UID` instead: the child drops to
+        // that user before `unshare`, and the PARENT (real root, and thus
+        // holding the required authority) writes the child's uid/gid maps by
+        // pid. `QL_NO_PRIV_DROP=1` opts out and keeps the old root mapping.
+        let sudo_target = resolve_sudo_identity(
+            Uid::effective().is_root(),
+            std::env::var("SUDO_UID").ok().as_deref(),
+            std::env::var("SUDO_GID").ok().as_deref(),
+            std::env::var("QL_NO_PRIV_DROP").is_ok_and(|v| v == "1"),
+        );
+        let (host_uid, host_gid) = match sudo_target {
+            Some(t) => t,
+            None => (Uid::current().as_raw(), Gid::current().as_raw()),
+        };
 
         let ns_flags = self.required_namespaces();
 
@@ -119,12 +138,14 @@ impl Cell {
             || self.profile.exec.enforce;
         let cgroup_leaf: Option<String> = needs_cgroup.then(Self::cell_cgroup_leaf_name);
 
-        // A sync channel is created ONLY when a parent hook is registered.
-        // Without a hook this is `None` and the fork path below is identical to
-        // the simple model — no pipes, no synchronization.
-        let sync = match self.parent_hook {
-            Some(_) => Some(SyncPipes::new()?),
-            None => None,
+        // A sync channel is created when a parent hook is registered OR when
+        // the parent must write the child's id maps (sudo case). Without
+        // either, this is `None` and the fork path below is identical to the
+        // simple model — no pipes, no synchronization.
+        let sync = if self.parent_hook.is_some() || sudo_target.is_some() {
+            Some(SyncPipes::new()?)
+        } else {
+            None
         };
 
         // The exec wall's fd-passing channel, created only when supervision is
@@ -144,13 +165,26 @@ impl Cell {
             source: e,
         })? {
             ForkResult::Parent { child } => {
-                // If there is a parent hook, run the synchronized handshake:
-                // wait for the child to create its namespaces, perform the
-                // privileged setup against the child by pid, then release it.
-                if let (Some(hook), Some(sync)) = (self.parent_hook.as_ref(), sync.as_ref()) {
+                // If there is any privileged parent-side setup — a registered
+                // hook (veth, BPF attach) and/or writing the child's id maps
+                // (sudo case) — run the synchronized handshake: wait for the
+                // child to create its namespaces, perform the setup against
+                // the child by pid, then release it. Maps are written FIRST:
+                // the child's in-namespace identity must exist before any
+                // other setup relies on it.
+                if let Some(sync) = sync.as_ref() {
                     sync.parent_close_child_ends();
                     sync.parent_wait_ready()?;
-                    match hook(child) {
+                    let setup = || -> Result<()> {
+                        if let Some((uid, gid)) = sudo_target {
+                            Self::write_child_maps(child, uid, gid)?;
+                        }
+                        if let Some(hook) = self.parent_hook.as_ref() {
+                            hook(child)?;
+                        }
+                        Ok(())
+                    };
+                    match setup() {
                         Ok(()) => sync.parent_signal_go(),
                         Err(e) => {
                             // Abort: closing the "go" pipe without writing makes
@@ -211,6 +245,7 @@ impl Cell {
                     ns_flags,
                     host_uid,
                     host_gid,
+                    sudo_target,
                     command,
                     sync.as_ref(),
                     exec_chan.as_ref(),
@@ -244,6 +279,7 @@ impl Cell {
         ns_flags: CloneFlags,
         host_uid: u32,
         host_gid: u32,
+        sudo_target: Option<(u32, u32)>,
         command: &[String],
         sync: Option<&SyncPipes>,
         exec_chan: Option<&ExecChannel>,
@@ -255,6 +291,11 @@ impl Cell {
         }
 
         let mut ctx = ChildContext::new(host_uid, host_gid);
+        if sudo_target.is_some() {
+            // The PARENT writes this cell's id maps during the handshake; the
+            // namespace enforcer must not attempt the (write-once) self-map.
+            ctx = ctx.with_maps_preset();
+        }
         if let Some(leaf) = cgroup_leaf {
             ctx = ctx.with_cgroup_leaf(leaf.to_string());
         }
@@ -281,6 +322,16 @@ impl Cell {
             }
         }
 
+        // --- Become the invoking user (sudo case) — BEFORE unshare ---
+        // Probe-verified ordering: the process that calls `unshare` must
+        // already BE the user the map will name, or the kernel leaves it as
+        // the overflow uid (65534) inside the namespace. All child-side work
+        // that needs real root (phase 2a: cgroups) is done; everything after
+        // `unshare` runs as root-in-userns, which needs no host privilege.
+        if let Some((uid, gid)) = sudo_target {
+            Self::drop_to(uid, gid)?;
+        }
+
         // --- Enter the requested namespaces (cell core) ---
         // `unshare` here (rather than clone flags) keeps the fork path simple
         // and is equivalent for our single-child model. Skip the call entirely
@@ -292,10 +343,11 @@ impl Cell {
             nix::sched::unshare(ns_flags).map_err(|e| EnforceError::syscall("unshare", e))?;
         }
 
-        // --- Synchronize with the parent hook, if any ---
+        // --- Synchronize with the parent, if required ---
         // The namespaces now exist. Tell the parent it may perform privileged
-        // setup against them (e.g. wire a veth into our netns), and block until
-        // it confirms. If the parent aborts, we refuse to exec (fail-closed).
+        // setup against them — write this cell's id maps (sudo case) and/or
+        // wire a veth into our netns — and block until it confirms. If the
+        // parent aborts, we refuse to exec (fail-closed).
         if let Some(sync) = sync {
             sync.child_signal_ready();
             sync.child_wait_go()?;
@@ -349,6 +401,51 @@ impl Cell {
             source: e,
         })?;
         unreachable!("execvp returns only on error, which is handled above");
+    }
+
+    /// Parent-side (sudo case): write the child's uid/gid maps by pid,
+    /// mapping in-namespace root from the invoking user. The parent is real
+    /// root here, which is exactly the authority the kernel requires to map
+    /// an id other than the writer's own. Probe-verified (map_probe2,
+    /// variant B). Runs once, immediately after the child signals that its
+    /// namespaces exist and before any other parent-side setup.
+    fn write_child_maps(child: Pid, uid: u32, gid: u32) -> Result<()> {
+        let write = |file: &str, content: String| -> Result<()> {
+            std::fs::write(format!("/proc/{}/{file}", child.as_raw()), &content).map_err(|e| {
+                EnforceError::enforcer("cell", format!("parent map write ({file}): {e}"))
+            })
+        };
+        write("setgroups", "deny".to_string())?;
+        write("gid_map", format!("0 {gid} 1"))?;
+        write("uid_map", format!("0 {uid} 1"))?;
+        eprintln!(
+            "ql-enforce: cell mapped to invoking user uid={uid} (sudo detected; QL_NO_PRIV_DROP=1 keeps root)"
+        );
+        Ok(())
+    }
+
+    /// Child-side (sudo case): permanently become the invoking user before
+    /// `unshare` — supplementary groups first (needs root), then gid, then
+    /// uid; real, effective, and saved, so there is no way back. Verified
+    /// after the fact: a partially-applied drop must never reach exec.
+    fn drop_to(uid: u32, gid: u32) -> Result<()> {
+        let (u, g) = (Uid::from_raw(uid), Gid::from_raw(gid));
+        nix::unistd::setgroups(&[g]).map_err(|e| {
+            EnforceError::enforcer("cell", format!("privilege drop: setgroups: {e}"))
+        })?;
+        nix::unistd::setresgid(g, g, g).map_err(|e| {
+            EnforceError::enforcer("cell", format!("privilege drop: setresgid: {e}"))
+        })?;
+        nix::unistd::setresuid(u, u, u).map_err(|e| {
+            EnforceError::enforcer("cell", format!("privilege drop: setresuid: {e}"))
+        })?;
+        if Uid::effective().as_raw() != uid || Gid::effective().as_raw() != gid {
+            return Err(EnforceError::enforcer(
+                "cell",
+                "privilege drop: identity verification failed after setres{u,g}id",
+            ));
+        }
+        Ok(())
     }
 
     /// Tier-2 supervise loop: drive the seccomp notify `listener` while waiting
@@ -723,4 +820,80 @@ fn record_tier2_exec(e: &ExecEvent, killed_reason: Option<String>) {
 /// Empty when no Tier-2 wall was active.
 pub fn drain_tier2_exec_events() -> Vec<Tier2ExecRecord> {
     TIER2_EXEC_EVENTS.with(|b| std::mem::take(&mut *b.borrow_mut()))
+}
+
+/// Resolve whether the cell should map the invoking user instead of the
+/// current identity (the sudo case). Pure so it is testable. Returns
+/// `Some((uid, gid))` only when ALL hold: we are effectively root, the
+/// `QL_NO_PRIV_DROP=1` opt-out is not set, both `SUDO_UID`/`SUDO_GID` parse
+/// as numbers, and `SUDO_UID` is not itself root. Anything malformed returns
+/// `None` — a garbled environment must never select a surprising identity.
+fn resolve_sudo_identity(
+    euid_is_root: bool,
+    sudo_uid: Option<&str>,
+    sudo_gid: Option<&str>,
+    no_drop: bool,
+) -> Option<(u32, u32)> {
+    if !euid_is_root || no_drop {
+        return None;
+    }
+    match (
+        sudo_uid.and_then(|s| s.parse::<u32>().ok()),
+        sudo_gid.and_then(|s| s.parse::<u32>().ok()),
+    ) {
+        (Some(uid), Some(gid)) if uid != 0 => Some((uid, gid)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod sudo_identity_tests {
+    use super::resolve_sudo_identity;
+
+    /// Root via sudo: the invoking user's ids are selected.
+    #[test]
+    fn sudo_maps_invoking_user() {
+        assert_eq!(
+            resolve_sudo_identity(true, Some("1000"), Some("1000"), false),
+            Some((1000, 1000))
+        );
+    }
+
+    /// Unprivileged runs never activate the sudo path, even with SUDO_* set.
+    #[test]
+    fn unprivileged_ignores_sudo_vars() {
+        assert_eq!(
+            resolve_sudo_identity(false, Some("1000"), Some("1000"), false),
+            None
+        );
+    }
+
+    /// Direct root (no sudo vars) keeps the root mapping.
+    #[test]
+    fn direct_root_stays_root() {
+        assert_eq!(resolve_sudo_identity(true, None, None, false), None);
+    }
+
+    /// The opt-out keeps the root mapping even under sudo.
+    #[test]
+    fn opt_out_keeps_root() {
+        assert_eq!(
+            resolve_sudo_identity(true, Some("1000"), Some("1000"), true),
+            None
+        );
+    }
+
+    /// Malformed or root-valued SUDO_* values never activate the sudo path.
+    #[test]
+    fn malformed_or_root_sudo_is_ignored() {
+        assert_eq!(
+            resolve_sudo_identity(true, Some("abc"), Some("1000"), false),
+            None
+        );
+        assert_eq!(resolve_sudo_identity(true, Some("1000"), None, false), None);
+        assert_eq!(
+            resolve_sudo_identity(true, Some("0"), Some("0"), false),
+            None
+        );
+    }
 }

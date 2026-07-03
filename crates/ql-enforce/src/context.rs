@@ -26,6 +26,10 @@ pub struct ChildContext {
     /// enforcement); `Some(name)` means the cgroup enforcer creates/joins a
     /// leaf with this name under whichever hierarchy the host provides.
     pub cgroup_leaf: Option<String>,
+    /// When `true`, the PARENT wrote this cell's uid/gid maps during the
+    /// fork handshake (the sudo case). uid/gid maps are write-once, so the
+    /// namespace enforcer must skip its in-namespace self-map.
+    pub maps_preset: bool,
 }
 
 impl ChildContext {
@@ -36,7 +40,15 @@ impl ChildContext {
             host_uid,
             host_gid,
             cgroup_leaf: None,
+            maps_preset: false,
         }
+    }
+
+    /// Mark that the parent writes this cell's id maps during the handshake
+    /// (see the field docs). Called by the cell in the sudo case.
+    pub(crate) fn with_maps_preset(mut self) -> Self {
+        self.maps_preset = true;
+        self
     }
 
     /// Set the shared cell cgroup leaf name (see the field docs). Called by the

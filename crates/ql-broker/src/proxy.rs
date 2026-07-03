@@ -169,10 +169,48 @@ fn write_status(client: &mut TcpStream, code: u16, reason: &str, body: &str) -> 
     client.write_all(payload.as_bytes())
 }
 
-/// Emit a one-line audit record. In production this would be structured and
-/// shipped to the control plane; the broker is the natural egress audit point.
+/// Emit a one-line decision record to stderr, de-duplicated. The broker is
+/// the natural egress audit point, but an interactive agent reconnects to its
+/// API and retries failed telemetry constantly, so streaming every decision
+/// floods (and corrupts) a TUI's terminal. We therefore print each distinct
+/// `(host, port, decision-kind)` only ONCE — the first-seen ALLOW or DENY for
+/// a destination is the signal (it is how new required domains are found); the
+/// 40th identical retry is noise. `QL_BROKER_VERBOSE=1` restores printing
+/// every decision. The full, un-deduplicated stream is still recorded in the
+/// audit log when one is configured — this affects only the stderr view.
 fn log_decision(host: &str, port: u16, decision: &str) {
-    eprintln!("ql-broker: {decision} {host}:{port}");
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    if std::env::var("QL_BROKER_VERBOSE").is_ok_and(|v| v == "1") {
+        eprintln!("ql-broker: {decision} {host}:{port}");
+        return;
+    }
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = seen
+        .lock()
+        .map(|mut s| first_time_seen(&mut s, host, port, decision))
+        .unwrap_or(true);
+    if first {
+        eprintln!("ql-broker: {decision} {host}:{port}");
+    }
+}
+
+/// Record a decision in `seen` and report whether this is its first sighting.
+/// The key is host+port+decision KIND (the word before any parenthetical), so
+/// a destination first denied and later allowed prints both, but identical
+/// repeats print once. Pure over an explicit set so it is unit-testable.
+fn first_time_seen(
+    seen: &mut std::collections::HashSet<String>,
+    host: &str,
+    port: u16,
+    decision: &str,
+) -> bool {
+    let kind = decision.split_whitespace().next().unwrap_or(decision);
+    seen.insert(format!("{kind} {host}:{port}"))
 }
 
 /// Read up to `limit` bytes from a stream — small helper for tests/diagnostics.
@@ -181,4 +219,68 @@ pub(crate) fn read_some(stream: &mut TcpStream, limit: usize) -> io::Result<Stri
     let mut buf = vec![0u8; limit];
     let n = stream.read(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::first_time_seen;
+    use std::collections::HashSet;
+
+    #[test]
+    fn repeats_are_suppressed_but_new_destinations_print() {
+        let mut seen = HashSet::new();
+        // First sighting of each prints.
+        assert!(first_time_seen(
+            &mut seen,
+            "api.anthropic.com",
+            443,
+            "ALLOW"
+        ));
+        assert!(first_time_seen(
+            &mut seen,
+            "datadoghq.com",
+            443,
+            "DENY (authorization)"
+        ));
+        // Repeats do not.
+        assert!(!first_time_seen(
+            &mut seen,
+            "api.anthropic.com",
+            443,
+            "ALLOW"
+        ));
+        assert!(!first_time_seen(
+            &mut seen,
+            "datadoghq.com",
+            443,
+            "DENY (authorization)"
+        ));
+        // A brand-new destination still prints.
+        assert!(first_time_seen(
+            &mut seen,
+            "platform.claude.com",
+            443,
+            "ALLOW"
+        ));
+    }
+
+    #[test]
+    fn deny_then_allow_same_host_prints_both() {
+        let mut seen = HashSet::new();
+        assert!(first_time_seen(
+            &mut seen,
+            "example.com",
+            443,
+            "DENY (policy)"
+        ));
+        // Same host, different decision KIND — must still print.
+        assert!(first_time_seen(&mut seen, "example.com", 443, "ALLOW"));
+        // But a second DENY of the same kind is suppressed.
+        assert!(!first_time_seen(
+            &mut seen,
+            "example.com",
+            443,
+            "DENY (unresolved)"
+        ));
+    }
 }

@@ -76,7 +76,14 @@ impl Enforcer for NamespaceEnforcer {
     /// Phase 2b (in-namespace): establish the uid/gid mapping inside the new
     /// user namespace. This makes us root-in-namespace so the mount enforcer
     /// can operate. No host privilege is conferred.
+    ///
+    /// Sudo case: the PARENT already wrote our maps by pid during the fork
+    /// handshake (maps are write-once), so there is nothing to do here — we
+    /// are root-in-namespace the moment the handshake completes.
     fn apply_in_namespace(&self, _profile: &Profile, ctx: &ChildContext) -> Result<()> {
+        if ctx.maps_preset {
+            return Ok(());
+        }
         Self::write_id_maps(ctx.host_uid, ctx.host_gid)
     }
 }

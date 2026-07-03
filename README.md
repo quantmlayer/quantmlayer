@@ -16,6 +16,29 @@ An autonomous coding agent runs with your shell's privileges: it can read `~/.ss
 ```sh
 cargo build --release
 
+# ONE COMMAND — contain a known coding agent with a curated profile that is
+# embedded in the `ql` binary (nothing to install or point at). The current
+# directory becomes the workspace; SSH/AWS/GPG/kube/gcloud credentials are
+# invisible; network egress is allow-listed to the agent's own endpoints
+# plus package registries. Bundled: claude, codex, gemini, aider.
+ql agent claude
+ql agent codex --broker --audit run.jsonl   # brokered egress + audit trail
+ql agent list                                # what's bundled
+ql validate --agent claude                   # inspect a bundled profile
+
+# MCP SERVERS — an MCP server is third-party code your MCP client runs with
+# YOUR shell's privileges. One command rewrites a client config (Claude
+# Desktop, Claude Code .mcp.json, Cursor, ...) so every stdio server it
+# launches runs inside a containment cell. Transparent to the protocol:
+# the JSON-RPC stream over stdin/stdout passes through the cell untouched.
+# The default MCP profile hides credentials and FAILS CLOSED on network
+# egress — grant a network-backed server its domains via a per-config
+# profile override, derived with `ql learn` rather than guessed.
+ql mcp wrap ~/.config/Claude/claude_desktop_config.json --in-place
+ql mcp wrap .mcp.json --in-place --broker --audit mcp.jsonl
+ql mcp list .mcp.json                        # who is contained, who is not
+ql mcp unwrap .mcp.json --in-place           # reverse the rewrite
+
 # THE MOAT — learn a least-privilege profile by observing an agent, then
 # enforce it. The generated profile reruns the agent fine but denies everything
 # it never needed (SSH keys, ptrace, network, binaries it never ran, ...):

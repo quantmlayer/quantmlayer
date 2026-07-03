@@ -72,7 +72,7 @@ fn main() -> ExitCode {
     };
 
     eprintln!(
-        "ql-broker: listening on {listen}; {} allow-listed domain(s); default_deny={}, block_private_ranges={}",
+        "ql-broker: listening on {listen}; {} allow-listed domain(s); default_deny={}, block_private_ranges={} (stderr shows first-seen decisions only; QL_BROKER_VERBOSE=1 for all)",
         profile.network.allow_domains.len(),
         profile.network.default_deny,
         profile.network.block_private_ranges,
