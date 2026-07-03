@@ -1,10 +1,6 @@
 # QuantmLayer
 
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
-![tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg)
-![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
 
@@ -95,23 +91,6 @@ ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
 
 `ql run` is transparent: the command's output passes through and `ql` exits with the command's own exit code.
 
-## Field-validated agents
-
-`ql agent` ships curated profiles for the coding agents below, each run **contained end-to-end** — a real bug fixed in the workspace, an SSH-key read denied, and egress to a novel domain blocked at the broker. Domain allow-lists were tuned from each agent's **observed** behavior (broker denials + the `--audit` log), not from vendor documentation.
-
-| Agent | Version | Auth | In the cell |
-|---|---|---|---|
-| Claude Code | v2.1.199 | subscription / API key | fixes workspace files; `~/.ssh` an empty tmpfs; own telemetry (Datadog) denied, agent unaffected |
-| OpenAI Codex CLI | v0.142.5 | ChatGPT / API key | ran clean as shipped; a direct `curl` to a blocked host returns `CONNECT tunnel failed, 403` |
-| Google Gemini CLI | current | API key¹ | fixes workspace files; novel-domain WebFetch denied |
-| Aider | v0.86.2 | API key | fixes workspace files; when it tried to `apt install` a browser to reach a blocked URL, the cell denied the privileged writes **and** the broker denied the egress |
-
-The Aider case is the point of the whole design: an agent's *own* guardrails won't stop it from installing software to route around a restriction — a kernel boundary does. Tighten any bundled profile for your environment by re-deriving it from a real session: `ql learn --out my.yaml -- <agent> ...`.
-
-*Measured on one host (aarch64, Ubuntu 24.04, kernel 6.8). This table is agent coverage, not a platform-portability claim — see [Platform support](#platform-support) for which walls a given host provides.*
-
-¹ Google retired the personal "Sign in with Google" flow in Gemini CLI v0.47.0; individual accounts authenticate with an API key.
-
 ## What it blocks
 
 Every row below is measured by a reproducible benchmark (`make benchmark`) — never asserted. **Docker** is a default `docker run` with the workspace mounted (no hardening flags); each attack's exact scenario and target wall is documented under [`benchmark/`](benchmark/), and the live scorecard is regenerated into [`benchmark/RESULTS.md`](benchmark/RESULTS.md) on every run.
@@ -146,6 +125,41 @@ The trade-offs are the other side of the same coin:
 - Isolation stops at the host boundary, not *within* the sandbox: unless the provider restricts it, an agent inside the sandbox still has broad latitude over that machine's resources and network (including, potentially, the cloud instance-metadata endpoint).
 
 QuantmLayer is built for the opposite situation: contain an agent running **locally, on your own machine and your real files**, with a least-privilege profile learned from its behavior — no remote machine, no code-sync, no third-party trust. The two approaches are complementary; this benchmark scores host-threat containment, which is QuantmLayer's domain, so remote-execution sandboxes are described here rather than scored as a column.
+
+## How this differs from prompt-injection defenses
+
+A separate line of defense — exemplified by Google DeepMind's **CaMeL** ("Defeating Prompt Injections by Design," extending Simon Willison's Dual-LLM pattern) — keeps a quarantined, untrusted model from taking privileged action by having the *orchestration layer* hold the boundary: a privileged LLM plans from the trusted query, a quarantined LLM processes untrusted data with no tool access, and a custom interpreter tracks data provenance and enforces capability policies before each tool call. It's a strong, well-regarded design, and it's solving an adjacent problem to ours.
+
+QuantmLayer makes the quarantine boundary a **kernel** boundary rather than an interpreter boundary. Where CaMeL trusts the surrounding Python interpreter to hold the air gap, QuantmLayer runs the untrusted work in a **zero-capability cell that can return text and nothing else** — no files, no network, no exec — enforced below userspace by namespaces, seccomp, and BPF-LSM rather than by orchestration discipline. If the interpreter has a bug, that boundary can leak; the kernel boundary does not depend on the interpreter being correct.
+
+To be precise about scope: we harden the **quarantine** half of that model — making the untrusted boundary a kernel boundary. We do **not** replicate CaMeL's privileged-side contribution, its capability and data-flow provenance tracking through the trusted interpreter. The claim is "we make the quarantine boundary a kernel boundary," not "we are CaMeL, but better."
+
+## Where it fits: OWASP Agentic Top 10 and EU AI Act
+
+QuantmLayer is a **runtime containment and evidence** layer. It governs what an agent is *allowed to do* on the host — not what the model *thinks* or *says*. That scope maps cleanly onto part of the [OWASP Agentic Top 10 (2026)](https://genai.owasp.org/): the risks that manifest as **actions** are addressed by a specific wall; the risks that live inside the model's reasoning are explicitly **out of scope**, and are marked so below rather than papered over. Each "addressed" row points at a wall that is measured in the [What it blocks](#what-it-blocks) benchmark, not asserted.
+
+| OWASP Agentic risk | QuantmLayer | How |
+|---|---|---|
+| Tool misuse / unexpected code execution | **Addressed** | Content-addressed `execve` (exec wall) admits only binaries on the learned allow-list; a dropped payload or injection-pulled tool cannot start. |
+| Privilege compromise / escalation | **Addressed** | Dropped capabilities + seccomp deny-list + user-namespace mapping; the agent holds only the rights its profile grants. |
+| Resource / availability abuse | **Addressed** | cgroups caps (pids/memory/cpu) contain fork bombs and exhaustion. |
+| Identity abuse (non-human identity) | **Partial** | Ed25519 agent identity with attenuating delegation (`ql-token`): authority only ever *narrows* down the agent tree, kernel-bound to the cell. Vault-issued ephemeral credentials are on the roadmap, not shipped. |
+| Unexpected RCE / privileged data access | **Addressed** | mount wall makes out-of-workspace secrets (`~/.ssh`, cloud creds) invisible; network wall blocks the cloud-metadata SSRF path. |
+| Cascading failures / rogue agent action | **Partial** | Kill switch (`ql kill`) revokes an agent and its whole process tree instantly; per-subtask containment bounds blast radius. Does not prevent an in-profile action from being wrong. |
+| Memory poisoning | **Out of scope** | A model-context / reasoning risk; QuantmLayer governs actions, not model memory. |
+| Goal hijacking / intent manipulation | **Out of scope** | Prompt-layer risk. QuantmLayer's value here is *downstream*: even a fully hijacked agent can only take actions its profile permits — but detecting the hijack itself is not what this layer does. |
+
+**On prompt injection specifically:** QuantmLayer does not detect or block prompt injection — that is a model-layer problem. What it does is make injection *less consequential*: a subverted agent still cannot read a secret the mount wall hid, reach a domain the broker denied, or run a binary the exec wall didn't admit. The containment holds regardless of *why* the agent tried.
+
+**EU AI Act (Article 12 logging).** The Act's high-risk-system logging obligations take effect **August 2026**. QuantmLayer's audit layer is a technical substrate for that record-keeping: every governed action (`exec.run`/`exec.deny`, egress decisions, policy changes) is written to a **hash-chained, tamper-evident log**, each record stamped with the `ai_system` identity (`system_id`, `model_version`) and independently verifiable by a third party with no QuantmLayer dependency (`ql audit export` ships a stdlib-only verifier). This is a **strong technical control that produces the evidence Article 12 is about — not a turnkey or certified compliance product**; the legal determination of compliance is the deployer's, made with counsel. Full control-by-control detail is maintained in a separate mapping document.
+
+## Agent identity, enforced
+
+An agent's identity in QuantmLayer is an **Ed25519 keypair** — the public key *is* the identity, and every action or delegation is a signature the holder of the private key produced. On top of that sit **attenuating delegation tokens**: when a planner agent spawns a coder, and the coder spawns a reviewer, each hands down a token that can only *narrow* authority, never broaden it. That monotonic-narrowing property is enforced, not conventional — a delegated token that tries to grant a right its parent didn't hold is rejected (`attenuation violation`).
+
+The tokens are **bound to the containment cell**: a profile can be narrowed by the token that launches it, before the cell is built, so the credential and the enforcement are the same decision. This is non-human identity with **zero standing privilege** — an agent holds exactly the rights its token carries for exactly the subtask it runs, checked at the kernel boundary rather than trusted by convention. `ql token demo` walks the full issue → attenuate → reject-broadening path.
+
+*Scope note: this is the identity and delegation substrate. Integration with enterprise secret vaults (Vault, AWS Secrets Manager, CyberArk) to issue ephemeral, auto-revoked credentials is on the roadmap, not yet shipped.*
 
 ## Architecture
 
