@@ -1,6 +1,10 @@
 # QuantmLayer
 
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+![tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg)
+![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
 
@@ -90,6 +94,23 @@ ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
 ```
 
 `ql run` is transparent: the command's output passes through and `ql` exits with the command's own exit code.
+
+## Field-validated agents
+
+`ql agent` ships curated profiles for the coding agents below, each run **contained end-to-end** — a real bug fixed in the workspace, an SSH-key read denied, and egress to a novel domain blocked at the broker. Domain allow-lists were tuned from each agent's **observed** behavior (broker denials + the `--audit` log), not from vendor documentation.
+
+| Agent | Version | Auth | In the cell |
+|---|---|---|---|
+| Claude Code | v2.1.199 | subscription / API key | fixes workspace files; `~/.ssh` an empty tmpfs; own telemetry (Datadog) denied, agent unaffected |
+| OpenAI Codex CLI | v0.142.5 | ChatGPT / API key | ran clean as shipped; a direct `curl` to a blocked host returns `CONNECT tunnel failed, 403` |
+| Google Gemini CLI | current | API key¹ | fixes workspace files; novel-domain WebFetch denied |
+| Aider | v0.86.2 | API key | fixes workspace files; when it tried to `apt install` a browser to reach a blocked URL, the cell denied the privileged writes **and** the broker denied the egress |
+
+The Aider case is the point of the whole design: an agent's *own* guardrails won't stop it from installing software to route around a restriction — a kernel boundary does. Tighten any bundled profile for your environment by re-deriving it from a real session: `ql learn --out my.yaml -- <agent> ...`.
+
+*Measured on one host (aarch64, Ubuntu 24.04, kernel 6.8). This table is agent coverage, not a platform-portability claim — see [Platform support](#platform-support) for which walls a given host provides.*
+
+¹ Google retired the personal "Sign in with Google" flow in Gemini CLI v0.47.0; individual accounts authenticate with an API key.
 
 ## What it blocks
 
