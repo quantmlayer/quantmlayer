@@ -1,0 +1,99 @@
+# QuantmLayer bundled profile: MCP server (default)
+#
+# The strict base profile for Model Context Protocol servers, embedded into
+# the `ql` binary and selected with `ql run --mcp -- <server command>` —
+# usually via `ql mcp wrap`, which rewrites an MCP client config so every
+# stdio server it launches runs inside a containment cell.
+#
+# Threat model: an MCP server is third-party code that the MCP client runs
+# with YOUR shell's privileges, speaking JSON-RPC over stdio. A malicious or
+# compromised server (or one confused by a prompt-injected tool call) can
+# read ~/.ssh, exfiltrate cloud credentials, or hit the cloud-metadata
+# endpoint — exactly the coding-agent threat, minus the compiler long tail.
+#
+# Design notes (read before editing):
+# * FAIL CLOSED ON NETWORK: default-deny with an EMPTY domain allow-list.
+#   A filesystem-only server (files, git, sqlite, ...) works out of the box;
+#   a network-backed server (GitHub, Slack, ...) will have its egress denied
+#   until you grant its domains in a per-server override:
+#       ql mcp wrap config.json --profile my-github-mcp.yaml
+#   Derive that override from observed behavior instead of guessing:
+#       ql learn --out my-github-mcp.yaml -- npx -y @modelcontextprotocol/server-github
+#   Run wrapped servers with `--broker --audit <log>` (ql mcp wrap --broker)
+#   to get a tamper-evident record of every allowed and denied connection.
+# * The secret locations below are DENIED (invisible), the same list
+#   `ql learn` synthesizes. The server's own config under $HOME stays
+#   reachable; credentials do not.
+# * Servers are long-lived: no wall-clock limit. Resources are capped well
+#   below the coding-agent profile — an MCP server that needs 4 GiB or 256
+#   processes is telling you something.
+
+schema_version: 1
+agent_type: workflow
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the server — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains: []            # FAIL CLOSED — grant per server (see header)
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # node/python runtimes need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 1073741824 # 1 GiB
+  cpu_max_percent: 100         # 1 core
+  pids_max: 128
+  # wall_clock_secs deliberately unset: servers are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/usr/bin/node"
+    - "/usr/bin/npx"
+    - "/usr/bin/python3"
+    - "/usr/bin/uvx"
+    - "/usr/bin/uv"
