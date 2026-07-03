@@ -10,10 +10,14 @@ use std::process::ExitCode;
 /// Entry point for `ql validate`.
 pub fn cmd(args: &[String]) -> ExitCode {
     let mut profile_path: Option<String> = None;
+    let mut agent_name: Option<String> = None;
+    let mut mcp = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--profile" => profile_path = it.next().cloned(),
+            "--agent" => agent_name = it.next().cloned(),
+            "--mcp" => mcp = true,
             other => {
                 eprintln!("ql validate: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -21,15 +25,36 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     }
 
-    let Some(path) = profile_path else {
-        eprintln!("ql validate: --profile <p.yaml> is required");
-        return ExitCode::from(2);
-    };
-
-    let yaml = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ql validate: cannot read {path}: {e}");
+    // Exactly one profile source: an on-disk path, a bundled agent name, or
+    // the embedded MCP-server profile.
+    let (path, yaml) = match (profile_path, agent_name, mcp) {
+        (Some(p), None, false) => {
+            let yaml = match std::fs::read_to_string(&p) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ql validate: cannot read {p}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            (p, yaml)
+        }
+        (None, Some(name), false) => match crate::agent::bundled(&name) {
+            Some(a) => (format!("<bundled:{}>", a.name), a.yaml.to_string()),
+            None => {
+                eprintln!("ql validate: unknown agent `{name}` (see `ql agent list`)");
+                return ExitCode::from(2);
+            }
+        },
+        (None, None, true) => (
+            "<bundled:mcp>".to_string(),
+            crate::mcp::MCP_PROFILE_YAML.to_string(),
+        ),
+        (None, None, false) => {
+            eprintln!("ql validate: --profile <p.yaml>, --agent <name>, or --mcp is required");
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("ql validate: --profile, --agent, and --mcp are mutually exclusive");
             return ExitCode::from(2);
         }
     };

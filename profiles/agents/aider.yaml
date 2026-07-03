@@ -1,0 +1,123 @@
+# QuantmLayer bundled profile: Aider (`aider`)
+#
+# Field-validated 2026-07-03 against Aider v0.86.2 (claude-sonnet-4-5):
+# contained calc.py fix, SSH-key read declined, and a novel-domain fetch
+# blocked at TWO walls — when aider tried to auto-install Playwright + a
+# browser to scrape the URL, the cell denied the privileged `apt` writes
+# (/var/lib/apt lock), and the broker then denied the egress (403). `aider.chat`
+# added from an observed version-check denial. Note: Aider calls `xdg-open` on
+# its docs URL at startup; on a headless host this prints harmless "browser not
+# found" errors and does not affect containment. Run with
+# `--no-show-release-notes` to silence them. Aider only edits files explicitly
+# added via `/add`; auth is API-key only (pass the key through sudo env).
+#
+# Curated for Aider. Embedded into the `ql` binary and selected with
+# `ql agent aider` or `ql run --agent aider -- aider ...`.
+#
+# Design notes (read before editing):
+# * Aider keeps state in the repo (`.aider*`) and caches under
+#   `~/.aider`, so this profile CANNOT hide all of `$HOME` the way
+#   `profiles/coding.yaml` does. Instead it denies the well-known secret
+#   locations individually — the same list `ql learn` synthesizes. The
+#   tradeoff is explicit: non-secret files in `$HOME` remain visible; the
+#   SSH/AWS/GPG/kube/gcloud credentials and /etc/shadow do not.
+# * Aider is model-agnostic; this profile allows the Anthropic, OpenAI and
+#   OpenRouter endpoints. Remove the providers you do not use, or re-derive
+#   with: `ql learn --out aider.yaml -- aider --message "your task"`.
+# * No wall-clock limit: sessions are interactive and long-lived.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+    - "/home/*/.aider/**"      # caches, history
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # Aider model providers (trim to the ones you use)
+    - "api.anthropic.com"
+    - "api.openai.com"
+    - "openrouter.ai"
+    # Aider itself
+    - "aider.chat"                # version / release-notes check — field-confirmed
+    # Package registries a coding task legitimately needs
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # Source hosting
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # compilers need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 4294967296 # 4 GiB
+  cpu_max_percent: 200         # 2 cores
+  pids_max: 512
+  # wall_clock_secs deliberately unset: interactive sessions are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/bash"
+    - "/usr/bin/git"
+    - "/usr/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/bin/npm"
+    - "/usr/bin/pip3"
+    - "/usr/bin/gcc"
+    - "/usr/bin/make"
+    - "/usr/bin/cargo"
+    - "/usr/bin/rg"

@@ -30,6 +30,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     };
 
     let mut profile_path: Option<String> = None;
+    let mut agent_name: Option<String> = None;
+    let mut mcp = false;
     let mut workspace: Option<String> = None;
     let mut audit_path: Option<String> = None;
     let mut proposed_path: Option<String> = None;
@@ -49,6 +51,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--profile" => profile_path = it.next().cloned(),
+            "--agent" => agent_name = it.next().cloned(),
+            "--mcp" => mcp = true,
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
@@ -78,19 +82,51 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     }
 
-    let Some(path) = profile_path else {
-        eprintln!("ql run: --profile <p.yaml> is required");
-        return ExitCode::from(2);
+    // Exactly one profile source: an on-disk path, a bundled agent name, or
+    // the embedded MCP-server profile.
+    enum Source {
+        Path(String),
+        Yaml(&'static str, &'static str),
+    }
+    let source = match (profile_path, agent_name, mcp) {
+        (Some(p), None, false) => Source::Path(p),
+        (None, Some(name), false) => match crate::agent::bundled(&name) {
+            Some(a) => Source::Yaml(a.yaml, a.name),
+            None => {
+                eprintln!("ql run: unknown agent `{name}` (see `ql agent list`)");
+                return ExitCode::from(2);
+            }
+        },
+        (None, None, true) => Source::Yaml(crate::mcp::MCP_PROFILE_YAML, "mcp"),
+        (None, None, false) => {
+            eprintln!("ql run: --profile <p.yaml>, --agent <name>, or --mcp is required");
+            return ExitCode::from(2);
+        }
+        _ => {
+            eprintln!("ql run: --profile, --agent, and --mcp are mutually exclusive");
+            return ExitCode::from(2);
+        }
+    };
+    let path = match &source {
+        Source::Path(p) => p.clone(),
+        Source::Yaml(_, name) => format!("<bundled:{name}>"),
     };
     if command.is_empty() {
         eprintln!("ql run: no command given (everything after `--` is the command)");
         return ExitCode::from(2);
     }
 
-    // Load and validate the profile.
-    let mut profile = match load_profile(&path) {
-        Ok(p) => p,
-        Err(code) => return code,
+    // Load and validate the profile — an embedded one goes through exactly
+    // the same parse / validate / lint gates as one read from disk.
+    let mut profile = match &source {
+        Source::Yaml(yaml, _) => match load_profile_str(yaml, &path) {
+            Ok(p) => p,
+            Err(code) => return code,
+        },
+        Source::Path(p) => match load_profile(p) {
+            Ok(p) => p,
+            Err(code) => return code,
+        },
     };
 
     // Signed-profile gate. A profile carrying a signature must verify; with
@@ -835,8 +871,17 @@ fn load_profile(path: &str) -> Result<Profile, ExitCode> {
         eprintln!("ql run: cannot read {path}: {e}");
         ExitCode::from(2)
     })?;
-    let profile = Profile::from_yaml(&yaml).map_err(|e| {
-        eprintln!("ql run: invalid profile: {e}");
+    load_profile_str(&yaml, path)
+}
+
+/// Parse, validate, and lint a profile from YAML already in memory (an
+/// embedded bundled-agent profile, or one just read from `origin`). The
+/// gates are identical to [`load_profile`]'s — bundled profiles get no
+/// shortcut.
+fn load_profile_str(yaml: &str, origin: &str) -> Result<Profile, ExitCode> {
+    let path = origin;
+    let profile = Profile::from_yaml(yaml).map_err(|e| {
+        eprintln!("ql run: invalid profile {path}: {e}");
         ExitCode::from(2)
     })?;
     profile.validate().map_err(|e| {

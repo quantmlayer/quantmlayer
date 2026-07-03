@@ -13,6 +13,7 @@
 //! Argument parsing is intentionally hand-rolled to keep the dependency
 //! surface minimal; each subcommand lives in its own module.
 
+mod agent;
 mod audit;
 mod broker;
 mod doctor;
@@ -20,6 +21,7 @@ mod exec_tier;
 mod export;
 mod kill;
 mod learn;
+mod mcp;
 mod policy;
 mod profile;
 mod registry;
@@ -38,6 +40,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => run::cmd(&args[1..]),
+        Some("agent") => agent::cmd(&args[1..]),
+        Some("mcp") => mcp::cmd(&args[1..]),
         Some("learn") => learn::cmd(&args[1..]),
         Some("validate") => validate::cmd(&args[1..]),
         Some("doctor") => doctor::cmd(&args[1..]),
@@ -70,9 +74,11 @@ fn print_usage() {
         "ql {VERSION} — security runtime for coding agents\n\
          \n\
          USAGE:\n\
-         \x20 ql run      --profile <p.yaml> [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--verbose] [--broker] -- <cmd...>\n\
+         \x20 ql agent    list | <name> [run options] [-- <extra agent args>]   (claude, codex, gemini, aider)\n\
+         \x20 ql mcp      list <config.json> | wrap <config.json> (--in-place|--out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] | unwrap <config.json> (--in-place|--out <path>)\n\
+         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--verbose] [--broker] -- <cmd...>\n\
          \x20 ql learn    [--out <p.yaml>] [--verbose] -- <cmd...>\n\
-         \x20 ql validate --profile <p.yaml>\n\
+         \x20 ql validate --profile <p.yaml> | --agent <name> | --mcp\n\
          \x20 ql doctor   [--json]\n\
          \x20 ql profile  sign <p.yaml> --key <seed-hex> [--out <path>] | verify <p.yaml> [--signer <pubkey>]\n\
          \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
@@ -82,6 +88,12 @@ fn print_usage() {
          \x20 ql token    demo | keygen\n\
          \x20 ql broker   --profile <p.yaml> [--listen 127.0.0.1:8080] [--trust <root-hex>] [--audit <log.jsonl>] [--system-id <id> [--model-version <v>]]\n\
          \x20 ql version\n\
+         \n\
+         Contain a known coding agent with one command (bundled profile, cwd as workspace):\n\
+         \x20 ql agent claude\n\
+         \n\
+         Contain every MCP server an MCP client launches (Claude Desktop, .mcp.json, ...):\n\
+         \x20 ql mcp wrap .mcp.json --in-place\n\
          \n\
          Learn a least-privilege profile by observing an agent, then enforce it:\n\
          \x20 ql learn --out agent.yaml -- ./my-agent build\n\

@@ -1,0 +1,122 @@
+# QuantmLayer bundled profile: Google Gemini CLI (`gemini`)
+#
+# Field-validated 2026-07-03 against Gemini CLI with API-key auth (11/11 tool
+# calls, contained calc.py fix + egress denials confirmed). NOTE: Google
+# sunsetted the personal "Sign in with Google" OAuth path in Gemini CLI
+# v0.47.0 — individual accounts must use API-key auth (GEMINI_API_KEY, or
+# picker option 2). Pass the key through sudo explicitly:
+#   sudo env "PATH=$PATH" "HOME=$HOME" GEMINI_API_KEY=$GEMINI_API_KEY \
+#       ql agent gemini --broker
+#
+# Curated for Google's Gemini CLI. Embedded into the `ql` binary and selected
+# with `ql agent gemini` or `ql run --agent gemini -- gemini ...`.
+#
+# Design notes (read before editing):
+# * Gemini CLI keeps its auth/config state under `~/.gemini`, so this profile
+#   CANNOT hide all of `$HOME` the way `profiles/coding.yaml` does. Instead it
+#   denies the well-known secret locations individually — the same list
+#   `ql learn` synthesizes. The tradeoff is explicit: non-secret files in
+#   `$HOME` remain visible; the SSH/AWS/GPG/kube/gcloud credentials and
+#   /etc/shadow do not. (Note: `~/.config/gcloud` stays DENIED — Gemini CLI
+#   API-key / OAuth flows do not need gcloud application-default credentials;
+#   re-derive with `ql learn` if your setup authenticates through gcloud.)
+# * The domain allow-list is a curated first cut. Tighten it for your
+#   environment by re-deriving with:
+#   `ql learn --out gemini.yaml -- gemini -p "your task"`.
+# * No wall-clock limit: sessions are interactive and long-lived.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+    - "/home/*/.gemini/**"     # auth, config, sessions
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # Gemini CLI itself
+    - "generativelanguage.googleapis.com"
+    - "cloudcode-pa.googleapis.com"   # Code Assist backend
+    - "play.googleapis.com"           # Play Integrity attestation / telemetry — field-confirmed (blocks tool actions if denied)
+    - "oauth2.googleapis.com"         # token exchange
+    - "accounts.google.com"           # login flow
+    # Package registries a coding task legitimately needs
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # Source hosting
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # compilers need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 8589934592 # 8 GiB
+  cpu_max_percent: 400         # 4 cores
+  pids_max: 512
+  # wall_clock_secs deliberately unset: interactive sessions are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/bash"
+    - "/usr/bin/git"
+    - "/usr/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/bin/npm"
+    - "/usr/bin/pip3"
+    - "/usr/bin/gcc"
+    - "/usr/bin/make"
+    - "/usr/bin/cargo"
+    - "/usr/bin/rg"
