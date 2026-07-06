@@ -26,11 +26,13 @@
 
 mod diff;
 mod error;
+mod eval;
 mod export;
 mod policy;
 
 pub use diff::{diff, GrantRef, PolicyDiff};
 pub use error::{ProfileError, Result};
+pub use eval::{host_matches, path_matches, Decision, PathDecision};
 pub use export::{
     to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,
 };

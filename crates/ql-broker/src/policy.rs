@@ -240,11 +240,9 @@ impl BrokerPolicy {
         if !self.default_deny {
             return true;
         }
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.allow_domains.iter().any(|d| {
-            let d = d.trim_end_matches('.').to_ascii_lowercase();
-            host == d || host.ends_with(&format!(".{d}"))
-        })
+        self.allow_domains
+            .iter()
+            .any(|d| ql_profile::host_matches(host, d))
     }
 
     /// Does `host` match a registered canary destination? Uses the same
@@ -344,11 +342,11 @@ fn is_blocked_v6(ip: &Ipv6Addr) -> bool {
 }
 
 /// Does `host` match a granted `domain` (exact or subdomain)?
-fn host_matches(host: &str, domain: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    let d = domain.trim_end_matches('.').to_ascii_lowercase();
-    h == d || h.ends_with(&format!(".{d}"))
-}
+// Domain matching is defined once in `ql-profile` so the broker's allow-list,
+// the token-grant check, and the canary check all use identical semantics —
+// and so `--observe` (which also calls `ql_profile::host_matches`) can never
+// disagree with what the broker actually enforces.
+use ql_profile::host_matches;
 
 #[cfg(test)]
 mod tests {

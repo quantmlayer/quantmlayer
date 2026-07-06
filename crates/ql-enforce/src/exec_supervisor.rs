@@ -680,6 +680,45 @@ mod tests {
         assert_eq!(s.decide(None), Decision::Deny);
     }
 
+    /// Faithfulness guard: the hot-path `ExecSupervisor::decide` (HashSet
+    /// membership) and the shared `Profile::admits_exec` (the function
+    /// `--observe` consults) MUST agree on every input. They are kept as
+    /// separate implementations for performance — the supervisor caches a
+    /// `HashSet`, the evaluator stays allocation-free over the profile — so
+    /// this test is what guarantees observe cannot report a `would-deny` that
+    /// enforce would allow, or vice versa. If it ever fails, observe is lying.
+    #[test]
+    fn decide_agrees_with_shared_admits_exec() {
+        use ql_profile::{Decision as PDecision, ExecDigest, ExecPolicy, Profile};
+
+        let allowed = "a".repeat(64);
+        let unlisted = "b".repeat(64);
+        let profile = Profile {
+            exec: ExecPolicy {
+                enforce: true,
+                allow_digests: vec![ExecDigest::new(HashAlgo::Sha256, allowed.clone()).unwrap()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sup = ExecSupervisor::from_profile(&profile);
+
+        let cases: [Option<&str>; 4] = [
+            Some(&allowed),  // listed → allow
+            Some(&unlisted), // unlisted → deny
+            Some("short"),   // malformed → deny
+            None,            // un-hashable → deny (fail-closed)
+        ];
+        for input in cases {
+            let sup_allow = matches!(sup.decide(input), Decision::Allow);
+            let shared_allow = matches!(profile.admits_exec(input), PDecision::Allow);
+            assert_eq!(
+                sup_allow, shared_allow,
+                "supervisor and admits_exec disagree on {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn filter_has_expected_shape() {
         assert_eq!(build_filter().len(), 8);
