@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 /// Per-wall verdict.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     /// Present and usable.
     Ok,
@@ -52,6 +52,15 @@ struct Wall {
     name: &'static str,
     status: Status,
     detail: String,
+}
+
+/// Small constructor to keep the wall checks readable.
+fn wall(name: &'static str, status: Status, detail: String) -> Wall {
+    Wall {
+        name,
+        status,
+        detail,
+    }
 }
 
 /// One layer of the exec-wall degradation ladder (see MASTER_PLAN §5 P0).
@@ -202,20 +211,75 @@ fn wall_seccomp() -> Wall {
 }
 
 fn wall_cgroups_v2() -> Wall {
-    let (status, detail) = match read("/sys/fs/cgroup/cgroup.controllers") {
-        Some(c) if c.split_whitespace().any(|x| x == "pids") => {
-            (Status::Ok, "cgroup v2; pids controller present".to_string())
+    // Presence of a controller at the ROOT says nothing about whether *this*
+    // process can create a usable leaf — the runtime failure we must predict.
+    // So test the operations the cgroup enforcer actually performs: the pids
+    // controller must be available, AND we must be able to create a child
+    // cgroup. Anything less can report green on a host that then degrades at
+    // run time. See `ql-enforce`'s cgroup enforcer for the mirror.
+    let controllers = read("/sys/fs/cgroup/cgroup.controllers");
+    let pids_present = controllers
+        .as_deref()
+        .map(|c| c.split_whitespace().any(|x| x == "pids"))
+        .unwrap_or(false);
+
+    // Probe the real operation: try to create a uniquely-named child dir under
+    // the cgroup root. Success means the hierarchy is delegated to us (the
+    // common rootless case is that it is NOT — exactly where doctor used to
+    // lie). Only probe when the v2 hierarchy exists. Clean up after.
+    let leaf_writable = if controllers.is_some() {
+        let probe = std::path::Path::new("/sys/fs/cgroup")
+            .join(format!("ql-doctor-probe-{}", std::process::id()));
+        match std::fs::create_dir(&probe) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir(&probe);
+                Some(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(false),
+            Err(_) => Some(false),
         }
-        Some(_) => (
-            Status::Degraded,
-            "cgroup v2; pids not delegated".to_string(),
-        ),
-        None => (Status::Off, "no cgroup v2 unified hierarchy".to_string()),
+    } else {
+        None
     };
-    Wall {
-        name: "cgroups_v2",
-        status,
-        detail,
+
+    let (status, detail) = cgroup_verdict(controllers.is_some(), pids_present, leaf_writable);
+    wall("cgroups_v2", status, detail)
+}
+
+/// Pure decision for the cgroup v2 wall, given: whether the v2 unified
+/// hierarchy exists, whether the pids controller is present at root, and
+/// whether a child cgroup could actually be created (`Some(true/false)`), or
+/// `None` when there was no hierarchy to probe. Separated so the delegation
+/// logic is unit-testable without a specific host cgroup layout.
+fn cgroup_verdict(
+    v2_present: bool,
+    pids_present: bool,
+    leaf_writable: Option<bool>,
+) -> (Status, String) {
+    if !v2_present {
+        return (Status::Off, "no cgroup v2 unified hierarchy".to_string());
+    }
+    if !pids_present {
+        return (
+            Status::Degraded,
+            "cgroup v2; pids controller not available at root".to_string(),
+        );
+    }
+    match leaf_writable {
+        Some(true) => (
+            Status::Ok,
+            "cgroup v2; pids present and a child cgroup is writable (delegated)".to_string(),
+        ),
+        Some(false) => (
+            Status::Degraded,
+            "cgroup v2; pids present but no writable delegated sub-tree \
+             (run under sudo, or delegate the cgroup) — resource limits will not apply"
+                .to_string(),
+        ),
+        None => (
+            Status::Degraded,
+            "cgroup v2; pids present but delegation could not be probed".to_string(),
+        ),
     }
 }
 
@@ -458,6 +522,42 @@ mod tests {
         assert!(r.active() <= 6);
         assert!(r.walls.iter().all(|w| !w.detail.is_empty()));
         assert_eq!(r.exec.tiers.len(), 3);
+    }
+
+    #[test]
+    fn cgroup_off_when_no_v2_hierarchy() {
+        let (s, _) = cgroup_verdict(false, false, None);
+        assert_eq!(s, Status::Off);
+    }
+
+    #[test]
+    fn cgroup_degraded_when_pids_absent() {
+        let (s, _) = cgroup_verdict(true, false, Some(true));
+        assert_eq!(s, Status::Degraded);
+    }
+
+    /// The bug this fix targets: pids present at root but NO writable delegated
+    /// sub-tree must report Degraded, not Ok. Presence is not delegation.
+    #[test]
+    fn cgroup_degraded_when_present_but_not_delegated() {
+        let (s, detail) = cgroup_verdict(true, true, Some(false));
+        assert_eq!(s, Status::Degraded);
+        assert!(detail.contains("delegated") || detail.contains("resource limits will not apply"));
+    }
+
+    /// Only a genuinely writable child cgroup earns Ok — this is what predicts
+    /// the runtime succeeding rather than degrading.
+    #[test]
+    fn cgroup_ok_only_when_leaf_is_writable() {
+        let (s, _) = cgroup_verdict(true, true, Some(true));
+        assert_eq!(s, Status::Ok);
+    }
+
+    /// An unprobeable hierarchy is Degraded, never a false Ok.
+    #[test]
+    fn cgroup_degraded_when_unprobeable() {
+        let (s, _) = cgroup_verdict(true, true, None);
+        assert_eq!(s, Status::Degraded);
     }
 
     #[test]
