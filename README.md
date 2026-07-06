@@ -18,6 +18,9 @@ An autonomous coding agent runs with your shell's privileges: it can read `~/.ss
 ## Quickstart
 
 ```sh
+# Install the static x86_64 binary (no runtime deps) + AppArmor profile:
+curl -fsSL https://raw.githubusercontent.com/quantmlayer/quantmlayer/main/scripts/install.sh | sh
+# ...or build from source:
 cargo build --release
 
 # ONE COMMAND — contain a known coding agent with a curated profile that is
