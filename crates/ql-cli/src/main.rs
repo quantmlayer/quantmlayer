@@ -22,6 +22,7 @@ mod export;
 mod kill;
 mod learn;
 mod mcp;
+mod observe;
 mod policy;
 mod profile;
 mod registry;
@@ -76,7 +77,7 @@ fn print_usage() {
          USAGE:\n\
          \x20 ql agent    list | <name> [run options] [-- <extra agent args>]   (claude, codex, gemini, aider)\n\
          \x20 ql mcp      list <config.json> | wrap <config.json> (--in-place|--out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] | unwrap <config.json> (--in-place|--out <path>)\n\
-         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--verbose] [--broker] -- <cmd...>\n\
+         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--observe [--strict]] [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--verbose] [--broker] -- <cmd...>\n\
          \x20 ql learn    [--out <p.yaml>] [--verbose] -- <cmd...>\n\
          \x20 ql validate --profile <p.yaml> | --agent <name> | --mcp\n\
          \x20 ql doctor   [--json]\n\
@@ -94,6 +95,9 @@ fn print_usage() {
          \n\
          Contain every MCP server an MCP client launches (Claude Desktop, .mcp.json, ...):\n\
          \x20 ql mcp wrap .mcp.json --in-place\n\
+         \n\
+         Dry-run an agent WITHOUT enforcing, to see what would break before flipping to enforce:\n\
+         \x20 ql run --observe --agent claude -- claude          # report-only; --strict fails CI on any would-deny\n\
          \n\
          Learn a least-privilege profile by observing an agent, then enforce it:\n\
          \x20 ql learn --out agent.yaml -- ./my-agent build\n\

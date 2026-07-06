@@ -46,6 +46,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut trust_roots: Vec<String> = Vec::new();
     let mut expect_commit: Option<String> = None;
     let mut expect_image: Option<String> = None;
+    let mut observe = false;
+    let mut strict = false;
 
     let mut it = opts.iter();
     while let Some(a) = it.next() {
@@ -53,6 +55,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--profile" => profile_path = it.next().cloned(),
             "--agent" => agent_name = it.next().cloned(),
             "--mcp" => mcp = true,
+            "--observe" => observe = true,
+            "--strict" => strict = true,
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
@@ -80,6 +84,25 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+
+    // Observe mode: a non-enforcing dry run. Diverges here BEFORE any cell is
+    // built — observe never contains the agent. `--strict` gates CI on
+    // would-deny findings. Shares --profile/--agent/--audit/--system-id.
+    if observe {
+        return crate::observe::cmd(crate::observe::ObserveOpts {
+            profile_path,
+            agent_name,
+            audit_path,
+            strict,
+            system_id,
+            model_version,
+            command: command.to_vec(),
+        });
+    }
+    if strict {
+        eprintln!("ql run: --strict is only meaningful with --observe");
+        return ExitCode::from(2);
     }
 
     // Exactly one profile source: an on-disk path, a bundled agent name, or
@@ -872,6 +895,37 @@ fn load_profile(path: &str) -> Result<Profile, ExitCode> {
         ExitCode::from(2)
     })?;
     load_profile_str(&yaml, path)
+}
+
+/// Resolve the profile an observe run diffs against — an on-disk `--profile`
+/// or a bundled `--agent`, using the exact same parse/validate/lint gates as
+/// `ql run`. Returns the profile and a human-readable origin for the banner.
+/// (`--mcp` is not an observe source; observe targets agents, not servers.)
+pub(crate) fn resolve_profile_for_observe(
+    profile_path: Option<&str>,
+    agent_name: Option<&str>,
+) -> Result<(Profile, String), ExitCode> {
+    match (profile_path, agent_name) {
+        (Some(p), None) => Ok((load_profile(p)?, p.to_string())),
+        (None, Some(name)) => match crate::agent::bundled(name) {
+            Some(a) => {
+                let origin = format!("<bundled:{}>", a.name);
+                Ok((load_profile_str(a.yaml, &origin)?, origin))
+            }
+            None => {
+                eprintln!("ql run --observe: unknown agent `{name}` (see `ql agent list`)");
+                Err(ExitCode::from(2))
+            }
+        },
+        (Some(_), Some(_)) => {
+            eprintln!("ql run --observe: --profile and --agent are mutually exclusive");
+            Err(ExitCode::from(2))
+        }
+        (None, None) => {
+            eprintln!("ql run --observe: --profile <p.yaml> or --agent <name> is required");
+            Err(ExitCode::from(2))
+        }
+    }
 }
 
 /// Parse, validate, and lint a profile from YAML already in memory (an

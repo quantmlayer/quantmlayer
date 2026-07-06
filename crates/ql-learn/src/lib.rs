@@ -23,6 +23,7 @@
 mod digest;
 mod error;
 mod observation;
+mod observe;
 mod risk;
 mod shim;
 mod synth;
@@ -30,6 +31,7 @@ mod trace;
 
 pub use error::{LearnError, Result};
 pub use observation::Observation;
+pub use observe::{evaluate, Finding, ObserveReport, Verdict};
 pub use risk::{build_risk_report, risk_report_for_profile};
 pub use shim::{exec_shim_gaps, resolve_shebang_interpreter, resolve_shim_interpreters};
 pub use synth::{synthesize, SynthResult};
@@ -76,4 +78,20 @@ pub struct LearnOutcome {
     pub notes: Vec<String>,
     /// The raw observation the profile was derived from.
     pub observation: Observation,
+}
+
+/// Trace `command` to completion and return the digest-filled [`Observation`]
+/// **without** synthesizing a profile — the input `--observe` needs.
+///
+/// Identical to the first half of [`learn`]: run the tracer, resolve the
+/// shebang/shim exec chain, and hash the executables into content digests, so
+/// the observation's `exec_digests` match exactly what the exec wall would
+/// hash. The agent is *not* contained during this trace (same as learning).
+pub fn observe_trace(command: &[String]) -> Result<Observation> {
+    let mut observation = trace::trace(command)?;
+    let interpreters = shim::resolve_shim_interpreters(&observation.execs);
+    observation.execs.extend(interpreters);
+    let (digests, _notes) = digest::hash_executables(&observation.execs);
+    observation.exec_digests = digests;
+    Ok(observation)
 }
