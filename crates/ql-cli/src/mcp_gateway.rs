@@ -297,6 +297,7 @@ use std::process::ExitCode;
 pub fn cmd(args: &[String]) -> ExitCode {
     // Parse options up to `--`, then the server command after it.
     let mut policy = GatewayPolicy::new();
+    let mut audit_path: Option<String> = None;
     let mut it = args.iter();
     let mut server_cmd: Vec<String> = Vec::new();
     while let Some(a) = it.next() {
@@ -312,6 +313,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
                 }
             }
             "--open" => policy.deny_unknown_tools = false,
+            "--audit" => audit_path = it.next().cloned(),
             "--" => {
                 server_cmd = it.by_ref().cloned().collect();
                 break;
@@ -324,17 +326,38 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
     if server_cmd.is_empty() {
         eprintln!(
-            "usage: ql mcp gateway [--gate <tool>]... [--allow <tool>]... [--open] -- <server cmd...>"
+            "usage: ql mcp gateway [--gate <tool>]... [--allow <tool>]... [--open] [--audit <log.jsonl>] -- <server cmd...>"
         );
         return ExitCode::from(2);
     }
 
-    match run_proxy(policy, &server_cmd) {
+    match run_proxy(policy, &server_cmd, audit_path.as_deref()) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("ql mcp gateway: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Build a hash-chain audit event for one gateway decision. `actor` is the
+/// recording component ("mcp-gateway"); the decision, tool name, and reason are
+/// stamped so a reviewer can grep "which tool call was blocked and why". No
+/// argument *values* are recorded (they may carry secrets) — only the tool name
+/// and the verdict reason.
+fn audit_event(tool: &str, verdict: &Verdict) -> ql_audit::AuditEvent {
+    let (decision, detail) = match verdict {
+        Verdict::Allow => (ql_audit::Decision::Allow, "forwarded".to_string()),
+        Verdict::Deny(reason) => (ql_audit::Decision::Deny, reason.clone()),
+    };
+    ql_audit::AuditEvent {
+        ts_millis: ql_audit::AuditLog::now_millis(),
+        actor: "mcp-gateway".to_string(),
+        action: "mcp.tools_call".to_string(),
+        target: tool.to_string(),
+        decision,
+        detail,
+        system: None,
     }
 }
 
@@ -354,9 +377,18 @@ fn deny_reply(id: &Value, reason: &str) -> Value {
 
 /// Drive the proxy. Spawns the server, relays server→client on a thread, and
 /// inspects client→server on the main thread. Returns the server's exit code.
-fn run_proxy(policy: GatewayPolicy, server_cmd: &[String]) -> std::io::Result<ExitCode> {
+/// When `audit_path` is set, every `tools/call` decision (allow and deny) is
+/// appended to a hash-chained audit log flushed on exit.
+fn run_proxy(
+    policy: GatewayPolicy,
+    server_cmd: &[String],
+    audit_path: Option<&str>,
+) -> std::io::Result<ExitCode> {
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
+
+    // Optional hash-chained audit log for gateway decisions.
+    let mut audit_log = audit_path.map(|_| ql_audit::AuditLog::new());
 
     let mut child = Command::new(&server_cmd[0])
         .args(&server_cmd[1..])
@@ -479,6 +511,10 @@ fn run_proxy(policy: GatewayPolicy, server_cmd: &[String]) -> std::io::Result<Ex
                     let p = policy.lock().unwrap();
                     inspect_tools_call(&p, &name, &arguments)
                 };
+                // Record the decision (allow or deny) to the audit chain.
+                if let Some(log) = audit_log.as_mut() {
+                    let _ = log.append(audit_event(&name, &verdict));
+                }
                 if let Verdict::Deny(reason) = verdict {
                     // Do not forward. Reply to the client with an error instead.
                     let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -500,6 +536,24 @@ fn run_proxy(policy: GatewayPolicy, server_cmd: &[String]) -> std::io::Result<Ex
     drop(to_server);
     let status = child.wait()?;
     let _ = relay.join();
+
+    // Flush the audit chain, if any.
+    if let (Some(path), Some(log)) = (audit_path, audit_log.as_ref()) {
+        match log.to_jsonl() {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(path, text) {
+                    eprintln!("ql mcp gateway: could not write audit log {path}: {e}");
+                } else {
+                    eprintln!(
+                        "ql mcp gateway: wrote {} decision record(s) to {path}",
+                        log.records().len()
+                    );
+                }
+            }
+            Err(e) => eprintln!("ql mcp gateway: audit serialize failed: {e}"),
+        }
+    }
+
     Ok(if status.success() {
         ExitCode::SUCCESS
     } else {

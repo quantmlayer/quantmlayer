@@ -59,6 +59,9 @@ fn wrap_or_unwrap(args: &[String], mode: Mode) -> ExitCode {
     let mut broker = false;
     let mut audit: Option<String> = None;
     let mut ql_path: Option<String> = None;
+    let mut gateway = false;
+    let mut gate: Vec<String> = Vec::new();
+    let mut allow: Vec<String> = Vec::new();
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -69,6 +72,17 @@ fn wrap_or_unwrap(args: &[String], mode: Mode) -> ExitCode {
             "--broker" => broker = true,
             "--audit" => audit = it.next().cloned(),
             "--ql" => ql_path = it.next().cloned(),
+            "--gateway" => gateway = true,
+            "--gate" => {
+                if let Some(t) = it.next() {
+                    gate.push(t.clone());
+                }
+            }
+            "--allow" => {
+                if let Some(t) = it.next() {
+                    allow.push(t.clone());
+                }
+            }
             other if !other.starts_with("--") && config_path.is_none() => {
                 config_path = Some(other.to_string());
             }
@@ -147,6 +161,9 @@ fn wrap_or_unwrap(args: &[String], mode: Mode) -> ExitCode {
         profile,
         broker,
         audit,
+        gateway,
+        gate,
+        allow,
     };
     let report = match mode {
         Mode::Wrap => rewrite(&mut root, |name, server| wrap_server(name, server, &opts)),
@@ -202,6 +219,13 @@ struct WrapOptions {
     profile: Option<String>,
     broker: bool,
     audit: Option<String>,
+    /// Route the contained server through the MCP inspection gateway as well,
+    /// so tool calls are schema-validated and state-change-gated inside the cell.
+    gateway: bool,
+    /// Tools to gate as state-changing (passed to the gateway's --gate).
+    gate: Vec<String>,
+    /// Tools pre-authorized to perform state changes (gateway --allow).
+    allow: Vec<String>,
 }
 
 /// Apply `f` to every server under `mcpServers`, collecting report lines.
@@ -271,6 +295,25 @@ fn wrap_server(name: &str, server: &mut Map<String, Value>, opts: &WrapOptions) 
         args.push(Value::from(log.as_str()));
     }
     args.push(Value::from("--"));
+    // If requested, route the contained server through the MCP inspection
+    // gateway: the cell runs `ql mcp gateway [--gate ..] [--allow ..] -- <cmd>`,
+    // so tool calls are schema-validated and state-change-gated *inside* the
+    // same containment cell. Without --gateway, the cell runs the command
+    // directly (unchanged behavior).
+    if opts.gateway {
+        args.push(Value::from(opts.ql.as_str()));
+        args.push(Value::from("mcp"));
+        args.push(Value::from("gateway"));
+        for g in &opts.gate {
+            args.push(Value::from("--gate"));
+            args.push(Value::from(g.as_str()));
+        }
+        for a in &opts.allow {
+            args.push(Value::from("--allow"));
+            args.push(Value::from(a.as_str()));
+        }
+        args.push(Value::from("--"));
+    }
     args.push(Value::from(command));
     args.extend(orig_args);
 
@@ -354,7 +397,7 @@ fn print_usage() {
     eprintln!(
         "USAGE:\n\
          \x20 ql mcp list   <config.json>\n\
-         \x20 ql mcp wrap   <config.json> (--in-place | --out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] [--ql <path>]\n\
+         \x20 ql mcp wrap   <config.json> (--in-place | --out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] [--gateway [--gate <tool>]... [--allow <tool>]...] [--ql <path>]\n\
          \x20 ql mcp unwrap <config.json> (--in-place | --out <path>)\n\
          \x20 ql mcp gateway [--gate <tool>]... [--allow <tool>]... [--open] -- <server cmd...>\n\
          \n\
@@ -383,6 +426,9 @@ mod tests {
             profile: None,
             broker: false,
             audit: None,
+            gateway: false,
+            gate: Vec::new(),
+            allow: Vec::new(),
         }
     }
 
@@ -485,6 +531,58 @@ mod tests {
 
     /// Wrapping with a profile override and broker/audit bakes them into the
     /// launch arguments, before the `--` separator.
+    #[test]
+    fn wrap_routes_through_gateway_when_requested() {
+        let mut cfg = sample();
+        let o = WrapOptions {
+            gateway: true,
+            gate: vec!["delete_file".into()],
+            allow: vec!["read_file".into()],
+            ..opts()
+        };
+        rewrite(&mut cfg, |n, s| wrap_server(n, s, &o)).unwrap();
+        let args: Vec<&str> = cfg["mcpServers"]["github"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // The cell runs `ql mcp gateway --gate .. --allow .. -- <original cmd>`.
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--mcp",
+                "--",
+                "/usr/local/bin/ql",
+                "mcp",
+                "gateway",
+                "--gate",
+                "delete_file",
+                "--allow",
+                "read_file",
+                "--",
+                "npx",
+                "-y",
+                "@modelcontextprotocol/server-github"
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_without_gateway_is_unchanged() {
+        // No --gateway → the cell runs the command directly (no gateway hop).
+        let mut cfg = sample();
+        rewrite(&mut cfg, |n, s| wrap_server(n, s, &opts())).unwrap();
+        let args: Vec<&str> = cfg["mcpServers"]["github"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!args.contains(&"gateway"));
+    }
+
     #[test]
     fn wrap_bakes_profile_broker_and_audit() {
         let mut cfg = sample();
