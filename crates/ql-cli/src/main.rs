@@ -22,6 +22,7 @@ mod export;
 mod kill;
 mod learn;
 mod mcp;
+mod mcp_gateway;
 mod observe;
 mod policy;
 mod profile;

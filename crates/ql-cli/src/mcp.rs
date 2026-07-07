@@ -32,6 +32,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Some("wrap") => wrap_or_unwrap(&args[1..], Mode::Wrap),
         Some("unwrap") => wrap_or_unwrap(&args[1..], Mode::Unwrap),
         Some("list") => list(&args[1..]),
+        Some("gateway") => crate::mcp_gateway::cmd(&args[1..]),
         _ => {
             print_usage();
             ExitCode::from(2)
@@ -355,6 +356,7 @@ fn print_usage() {
          \x20 ql mcp list   <config.json>\n\
          \x20 ql mcp wrap   <config.json> (--in-place | --out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] [--ql <path>]\n\
          \x20 ql mcp unwrap <config.json> (--in-place | --out <path>)\n\
+         \x20 ql mcp gateway [--gate <tool>]... [--allow <tool>]... [--open] -- <server cmd...>\n\
          \n\
          Rewrites an MCP client config (Claude Desktop, Claude Code .mcp.json,\n\
          Cursor, ...) so every stdio server it launches runs inside a\n\
