@@ -1,0 +1,151 @@
+# QuantmLayer bundled profile: opencode (`opencode`)
+#
+# PARTIALLY FIELD-VALIDATED (2026-07-15, Ubuntu 24.04 aarch64):
+#   * Filesystem + exec walls: observe-validated against a real session
+#     (`opencode run`, free model gpt-5.6-terra-fast) — 0 would-deny across
+#     ~900 file-opens and 4 execs. The readwrite/readonly/denied paths and the
+#     allow_exec list match what opencode actually touches.
+#   * Network domains + live enforcement: NOT yet validated. The 4 external
+#     endpoints opencode opened were observed but not resolved to domains
+#     (domain decisions run on the broker/enforce path). Validate on a clean
+#     Linux host with:
+#       ql run --agent opencode --observe --broker -- opencode run "small task"
+#     and fold any observed domain not already in allow_domains into the list.
+#     Free-model traffic routes through opencode's own backend, so expect
+#     models.dev / opencode.ai (already listed) plus possibly a gateway
+#     subdomain — confirm and add if needed.
+#
+# To re-derive from scratch:
+#   ql learn --out opencode.yaml -- opencode run "your task"
+#
+# Curated for opencode's terminal agent. Embedded into the `ql` binary and
+# selected with `ql agent opencode` or `ql run --agent opencode -- opencode ...`.
+#
+# Design notes (read before editing):
+# * opencode is BYOK and provider-agnostic: it can talk to Anthropic, OpenAI,
+#   Google, OpenRouter, xAI, Bedrock, or a LOCAL model (Ollama/LM Studio) via
+#   its Models.dev-backed provider directory. That means there is no single
+#   "the agent's endpoint" to allow — the network list below covers the common
+#   hosted providers, and you should PRUNE it to just the provider you use (a
+#   tighter allow-list is a smaller blast radius) or ADD your gateway/endpoint.
+#   For a fully local model (Ollama on 127.0.0.1) you can drop every hosted
+#   provider domain; note `block_private_ranges` interacts with localhost — a
+#   loopback model is not a private-range SSRF, but verify with observe mode.
+# * opencode keeps config under `~/.config/opencode` and CREDENTIALS under
+#   `~/.local/share/opencode/auth.json`. Both are made readable/writable so the
+#   agent can authenticate and persist sessions; this profile does NOT hide all
+#   of `$HOME`, it denies the well-known secret locations individually — the
+#   same list `ql learn` synthesizes. Non-secret files in `$HOME` remain
+#   visible; SSH/AWS/GPG/kube/gcloud credentials and /etc/shadow do not.
+#   NOTE the deliberate tension: opencode's own auth.json is a credential store
+#   we permit (the agent needs it), while the cloud-vendor credential dirs are
+#   denied. If you run opencode with a cloud provider via env vars instead of
+#   auth.json, prefer QuantmLayer credential injection over exposing the dir.
+# * The domain allow-list is a curated first cut. Tighten it for your
+#   environment by re-deriving with `ql learn`.
+# * No wall-clock limit: sessions are interactive and long-lived.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+    - "/home/*/.config/opencode/**"        # config, agents, plugins, themes
+    - "/home/*/.local/share/opencode/**"   # auth.json, sessions, database
+    - "/home/*/.cache/opencode/**"         # model list cache
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # --- opencode's own provider directory / model metadata ---
+    - "models.dev"                # opencode's provider+model catalog
+    - "opencode.ai"               # config schema, install, share
+    # --- hosted model providers (PRUNE to the one you use) ---
+    - "api.anthropic.com"         # Anthropic
+    - "api.openai.com"            # OpenAI
+    - "auth.openai.com"
+    - "generativelanguage.googleapis.com"  # Google Gemini
+    - "openrouter.ai"             # OpenRouter (multi-provider gateway)
+    - "api.x.ai"                  # xAI Grok
+    # (Bedrock, Vercel AI Gateway, STACKIT, etc.: add the specific endpoint
+    #  your deployment uses; they are intentionally NOT all listed here.)
+    # --- package registries a coding task legitimately needs ---
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # --- source hosting ---
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # compilers need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 8589934592 # 8 GiB
+  cpu_max_percent: 400         # 4 cores
+  pids_max: 512
+  # wall_clock_secs deliberately unset: interactive sessions are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/bash"
+    - "/usr/bin/git"
+    - "/usr/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/bin/npm"
+    - "/usr/bin/pip3"
+    - "/usr/bin/gcc"
+    - "/usr/bin/make"
+    - "/usr/bin/cargo"
+    - "/usr/bin/rg"
+    - "/usr/local/bin/opencode"   # opencode itself (Go single-binary install)

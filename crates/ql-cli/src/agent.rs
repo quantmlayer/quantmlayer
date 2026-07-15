@@ -45,16 +45,34 @@ pub const AGENTS: &[BundledAgent] = &[
         yaml: include_str!("../../../profiles/agents/claude.yaml"),
     },
     BundledAgent {
+        name: "cline",
+        binary: "cline",
+        description: "Cline CLI (open-source, provider-agnostic)",
+        yaml: include_str!("../../../profiles/agents/cline.yaml"),
+    },
+    BundledAgent {
         name: "codex",
         binary: "codex",
         description: "OpenAI Codex CLI",
         yaml: include_str!("../../../profiles/agents/codex.yaml"),
     },
     BundledAgent {
+        name: "cursor",
+        binary: "cursor-agent",
+        description: "Cursor CLI (cursor-agent)",
+        yaml: include_str!("../../../profiles/agents/cursor.yaml"),
+    },
+    BundledAgent {
         name: "gemini",
         binary: "gemini",
         description: "Google Gemini CLI",
         yaml: include_str!("../../../profiles/agents/gemini.yaml"),
+    },
+    BundledAgent {
+        name: "opencode",
+        binary: "opencode",
+        description: "opencode (open-source, provider-agnostic terminal agent)",
+        yaml: include_str!("../../../profiles/agents/opencode.yaml"),
     },
 ];
 

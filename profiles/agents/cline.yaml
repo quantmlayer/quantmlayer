@@ -1,0 +1,140 @@
+# QuantmLayer bundled profile: Cline CLI (`cline`)
+#
+# NOT YET FIELD-VALIDATED. Curated first cut for Cline's standalone CLI
+# (Cline 2.0, npm `cline`). Before trusting it, re-derive against a real
+# session with:
+#   ql learn --out cline.yaml -- cline "your task"
+# and diff the result into this file.
+#
+# Curated for Cline CLI. Embedded into the `ql` binary and selected with
+# `ql agent cline` or `ql run --agent cline -- cline ...`.
+#
+# Design notes (read before editing):
+# * Cline is provider-agnostic (Anthropic/OpenAI/Gemini/Bedrock/Ollama/any
+#   OpenAI-compatible endpoint). Like the opencode profile, the domain list
+#   covers the common hosted providers — PRUNE it to the provider you use, or
+#   drop all hosted domains for a local Ollama model.
+# * Cline keeps ALL state under `~/.cline/`. A third-party sandbox analysis
+#   (Agent Safehouse, 2026-02) documents why containment matters here:
+#   standalone mode stores secrets in PLAIN JSON at ~/.cline/data/secrets.json,
+#   runs an INSECURE gRPC server on port 26040, and can download and launch
+#   its own Chromium with remote debugging on port 9222 — with "no built-in
+#   sandboxing." This profile is the sandbox that report says to run it in:
+#   - ~/.cline is readwrite (the agent needs its own state; note its
+#     secrets.json is plaintext — one more reason nothing else sensitive
+#     should be visible from inside the cell),
+#   - the well-known credential dirs are DENIED (invisible),
+#   - default-deny egress means the gRPC/debug ports and analytics can't
+#     reach anything not allow-listed, and private-range blocking stops
+#     metadata SSRF.
+# * Cline has its own auto-approve / Plan-Act permission model. That is
+#   in-agent userspace policy; QuantmLayer's walls enforce below it. Defense
+#   in depth: keep both. `--auto-approve` defaults to true in headless mode —
+#   containment is what makes that acceptable.
+# * No wall-clock limit: sessions are interactive and long-lived. For CI
+#   (`cline -y --json`), consider setting wall_clock_secs in a derived profile.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+    - "/home/*/.cline/**"        # data/settings, sessions, secrets.json, hooks
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # --- hosted model providers (PRUNE to the one you use) ---
+    - "api.anthropic.com"         # Anthropic (Cline's default provider)
+    - "api.openai.com"            # OpenAI
+    - "generativelanguage.googleapis.com"  # Google Gemini
+    - "openrouter.ai"             # OpenRouter
+    # Cline's own account/backend (OAuth login, Cline provider)
+    - "cline.bot"
+    - "api.cline.bot"
+    # (Bedrock/Mistral/LiteLLM/vLLM endpoints: add the specific one your
+    #  deployment uses; deliberately not all listed.)
+    # --- package registries a coding task legitimately needs ---
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # --- source hosting ---
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # compilers need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 8589934592 # 8 GiB
+  cpu_max_percent: 400         # 4 cores
+  pids_max: 512
+  # wall_clock_secs deliberately unset: interactive sessions are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/bash"
+    - "/usr/bin/git"
+    - "/usr/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/bin/npm"
+    - "/usr/bin/pip3"
+    - "/usr/bin/gcc"
+    - "/usr/bin/make"
+    - "/usr/bin/cargo"
+    - "/usr/bin/rg"
+  # NOTE: Cline can download and launch its own Chromium (browser tool) with
+  # remote debugging enabled. That binary lives under ~/.cline and is NOT on
+  # this allow list — under the exec wall it will be denied. If you need the
+  # browser tool, add its path deliberately after observing a real session;
+  # denying it by default is the safer posture the Safehouse analysis suggests.

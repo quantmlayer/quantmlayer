@@ -1,0 +1,128 @@
+# QuantmLayer bundled profile: Cursor CLI (`cursor-agent`)
+#
+# NOT YET FIELD-VALIDATED. Curated first cut for Cursor's terminal agent
+# (launched January 2026). Before trusting it, re-derive against a real
+# session with:
+#   ql learn --out cursor.yaml -- cursor-agent chat "your task"
+# and diff the result into this file.
+#
+# Curated for Cursor CLI. Embedded into the `ql` binary and selected with
+# `ql agent cursor` or `ql run --agent cursor -- cursor-agent ...`.
+#
+# Design notes (read before editing):
+# * The binary is `cursor-agent` (the CLI), not `cursor` (the IDE). This
+#   profile targets terminal usage; the IDE is a GUI app outside `ql agent`'s
+#   scope.
+# * Cursor keeps CLI config under `~/.cursor` (cli-config.json, mcp.json,
+#   rules), so this profile CANNOT hide all of `$HOME`. It denies the
+#   well-known secret locations individually — the same list `ql learn`
+#   synthesizes. Non-secret files in `$HOME` remain visible; the SSH/AWS/GPG/
+#   kube/gcloud credentials and /etc/shadow do not.
+# * Cursor is a subscription product: model traffic goes through Cursor's own
+#   backend (api2/api3/agent.api5 endpoints), NOT directly to model vendors.
+#   The domain list reflects that — you should not need api.openai.com etc.
+# * Cursor CLI has its own permission system (cli-config.json allow/deny for
+#   Shell(...) etc.). That is an in-agent, userspace policy; QuantmLayer's
+#   walls enforce below it. Defense in depth: keep both.
+# * No wall-clock limit: sessions are interactive and long-lived.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/workspace/**"
+    - "/tmp/agent/**"
+    - "/home/*/.cursor/**"       # cli-config.json, mcp.json, rules, auth
+    - "/home/*/.config/cursor/**"
+    - "/home/*/.cache/cursor/**"
+  readonly:
+    - "/usr/**"
+    - "/bin/**"
+    - "/lib/**"
+    - "/etc/ssl/certs/**"
+  denied:                      # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # Cursor's backend (model traffic is proxied through Cursor, not vendors)
+    - "api2.cursor.sh"            # primary API + OAuth token refresh
+    - "api3.cursor.sh"            # telemetry/services (deny to cut telemetry;
+                                  #  verify with observe mode first)
+    - "agent.api5.cursor.sh"      # agent API (privacy mode)
+    - "agentn.api5.cursor.sh"     # agent API (non-privacy mode)
+    - "cursor.com"                # login flow, docs
+    - "cursor.sh"
+    # Package registries a coding task legitimately needs
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # Source hosting
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []                   # drop everything
+
+syscalls:
+  default_action: allow        # compilers need the long tail
+  deny:                        # never-legitimate escape hatches
+    - mount
+    - umount2
+    - pivot_root
+    - chroot
+    - setns
+    - unshare
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+    - bpf
+    - ptrace
+    - process_vm_readv
+    - process_vm_writev
+    - perf_event_open
+  notify:
+    - execve
+    - connect
+
+resources:
+  memory_max_bytes: 8589934592 # 8 GiB
+  cpu_max_percent: 400         # 4 cores
+  pids_max: 512
+  # wall_clock_secs deliberately unset: interactive sessions are long-lived.
+
+processes:
+  allow_exec:
+    - "/usr/bin/env"
+    - "/bin/sh"
+    - "/usr/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/bash"
+    - "/usr/bin/git"
+    - "/usr/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/bin/npm"
+    - "/usr/bin/pip3"
+    - "/usr/bin/gcc"
+    - "/usr/bin/make"
+    - "/usr/bin/cargo"
+    - "/usr/bin/rg"
+    - "/usr/local/bin/cursor-agent"
