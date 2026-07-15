@@ -3,8 +3,8 @@
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.96](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
-![tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg)
-![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider-blueviolet.svg)
+![tests](https://img.shields.io/badge/tests-186%20passing-brightgreen.svg)
+![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider%20%C2%B7%20cline%20%C2%B7%20cursor%20%C2%B7%20opencode-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
 
@@ -18,7 +18,8 @@ An autonomous coding agent runs with your shell's privileges: it can read `~/.ss
 ## Quickstart
 
 ```sh
-# Install the static x86_64 binary (no runtime deps) + AppArmor profile:
+# Install the static binary (x86_64 or aarch64, auto-detected; no runtime
+# deps) + AppArmor profile:
 curl -fsSL https://raw.githubusercontent.com/quantmlayer/quantmlayer/main/scripts/install.sh | sh
 # ...or build from source:
 cargo build --release
@@ -27,7 +28,8 @@ cargo build --release
 # embedded in the `ql` binary (nothing to install or point at). The current
 # directory becomes the workspace; SSH/AWS/GPG/kube/gcloud credentials are
 # invisible; network egress is allow-listed to the agent's own endpoints
-# plus package registries. Bundled: claude, codex, gemini, aider.
+# plus package registries. Bundled: claude, codex, gemini, aider, cline,
+# cursor, opencode.
 ql agent claude
 ql agent codex --broker --audit run.jsonl   # brokered egress + audit trail
 ql agent list                                # what's bundled
@@ -46,11 +48,29 @@ ql mcp wrap .mcp.json --in-place --broker --audit mcp.jsonl
 ql mcp list .mcp.json                        # who is contained, who is not
 ql mcp unwrap .mcp.json --in-place           # reverse the rewrite
 
+# INSPECTION GATEWAY — beyond containing the server process, inspect the
+# JSON-RPC stream itself. `ql mcp gateway` is a stdio proxy that validates
+# each tools/call against the server's advertised schema (rejecting unknown
+# tools, missing required args, wrong types) and blocks tools gated as
+# state-changing unless allow-listed. Denied calls never reach the server;
+# every decision (allow + deny) can be written to a hash-chained audit log.
+ql mcp gateway --gate delete_file --audit gw.jsonl -- <server cmd>
+# Compose both layers in one wrap: server runs INSIDE the cell AND behind
+# the gateway (ql run --mcp -- ql mcp gateway ... -- <server>):
+ql mcp wrap .mcp.json --in-place --gateway --gate delete_file
+
 # THE MOAT — learn a least-privilege profile by observing an agent, then
 # enforce it. The generated profile reruns the agent fine but denies everything
 # it never needed (SSH keys, ptrace, network, binaries it never ran, ...):
 ql learn --out agent.yaml -- ./my-agent build
 ql run   --profile agent.yaml -- ./my-agent build
+
+# ON-RAMP — dry-run without enforcing. `--observe` traces the agent and
+# reports what enforce mode WOULD have denied, writing a would-deny report to
+# a NOT-ENFORCING audit log, so you can see a profile is right before it
+# blocks real work. `--strict` exits non-zero on any would-deny (a CI gate):
+ql run --observe --agent claude -- claude
+ql run --observe --strict --profile agent.yaml -- ./my-agent build
 
 # Run a coding agent inside a containment cell:
 ql run --profile profiles/coding.yaml -- my-agent --task "fix the failing test"
@@ -148,6 +168,7 @@ QuantmLayer is a **runtime containment and evidence** layer. It governs what an 
 | OWASP Agentic risk | QuantmLayer | How |
 |---|---|---|
 | Tool misuse / unexpected code execution | **Addressed** | Content-addressed `execve` (exec wall) admits only binaries on the learned allow-list; a dropped payload or injection-pulled tool cannot start. |
+| MCP tool-call abuse (out-of-contract / unauthorized state change) | **Addressed** | The MCP inspection gateway (`ql mcp gateway`) validates each `tools/call` against the server's advertised schema and blocks tools gated as state-changing unless allow-listed; denied calls never reach the server, and every decision is auditable. |
 | Privilege compromise / escalation | **Addressed** | Dropped capabilities + seccomp deny-list + user-namespace mapping; the agent holds only the rights its profile grants. |
 | Resource / availability abuse | **Addressed** | cgroups caps (pids/memory/cpu) contain fork bombs and exhaustion. |
 | Identity abuse (non-human identity) | **Partial** | Ed25519 agent identity with attenuating delegation (`ql-token`): authority only ever *narrows* down the agent tree, kernel-bound to the cell. Vault-issued ephemeral credentials are on the roadmap, not shipped. |
