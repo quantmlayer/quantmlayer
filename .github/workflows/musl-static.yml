@@ -1,16 +1,15 @@
 # .github/workflows/musl-static.yml
 #
-# Build a FULLY STATIC x86_64 `ql` (kernel exec wall included) on a NATIVE
-# x86_64 runner, so the embedded BPF object is compiled against x86_64 BTF — the
-# architecture that actually loads on GKE Container-Optimized OS.
+# Build FULLY STATIC `ql` binaries (kernel exec wall included) for BOTH
+# x86_64 and aarch64, each on a NATIVE runner of that architecture, so the
+# embedded BPF object is compiled against the RIGHT architecture's BTF.
 #
-# Why a runner and not a local build: GitHub's `ubuntu-latest` is x86_64, so
-# running the existing builder inside a native x86_64 Alpine container (NO qemu,
-# NO --platform) dumps the runner's x86_64 `/sys/kernel/btf/vmlinux`. An
-# aarch64-host qemu build links fine (proving the musl static-link) but dumps
-# aarch64 BTF into the object. The object is CO-RE and relocates to the target
-# node's kernel at load either way; this workflow just guarantees the right
-# architecture at compile time, and produces a downloadable, verified binary.
+# Why native runners per arch (not one runner + qemu): the build dumps the
+# host's `/sys/kernel/btf/vmlinux`. A qemu cross-build links fine (proving the
+# musl static-link) but bakes the WRONG arch's BTF into the object. GitHub
+# provides `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (aarch64) as native
+# Linux runners, so the matrix gives each target its own correct BTF at compile
+# time. The object is CO-RE and relocates to the target node's kernel at load.
 #
 # Triggers are manual + release tags only: the build is heavy (clang/llvm +
 # rustup + a full `--features lsm` release build), so it stays off the every-push
@@ -28,62 +27,76 @@ on:
 
 jobs:
   build:
-    name: static x86_64 musl ql (native Alpine)
-    runs-on: ubuntu-latest # x86_64 -> native build, no qemu
+    name: static ${{ matrix.arch }} musl ql (native ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false          # one arch failing must not cancel the other
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            triple: x86_64-unknown-linux-musl
+            elf_grep: 'x86-64'
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-musl
+            elf_grep: 'aarch64|ARM aarch64'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Sanity — native x86_64 host with kernel BTF
+      - name: Sanity — native ${{ matrix.arch }} host with kernel BTF
         run: |
           echo "host arch: $(uname -m)   kernel: $(uname -r)"
-          test "$(uname -m)" = x86_64 || { echo "runner is not x86_64"; exit 1; }
+          test "$(uname -m)" = "${{ matrix.arch }}" \
+            || { echo "runner is not ${{ matrix.arch }}"; exit 1; }
           if [ -r /sys/kernel/btf/vmlinux ]; then
-            echo "host BTF present -> the container will dump x86_64 vmlinux.h"
+            echo "host BTF present -> the container will dump ${{ matrix.arch }} vmlinux.h"
           else
             echo "WARNING: /sys/kernel/btf/vmlinux not readable on host"
           fi
 
-      # Native x86_64 Alpine (the runner's own kernel is shared, so the container
-      # sees x86_64 /sys/kernel/btf). The script apk-adds its toolchain, installs
-      # the pinned Rust, dumps+cleans vmlinux.h, and builds the static binary.
-      - name: Build static musl ql in a native x86_64 Alpine container
+      # Native Alpine of the runner's arch (the runner's own kernel is shared,
+      # so the container sees the right /sys/kernel/btf). The script derives its
+      # musl target from `uname -m`, apk-adds its toolchain, installs the pinned
+      # Rust, dumps+cleans vmlinux.h, and builds the static binary.
+      - name: Build static musl ql in a native ${{ matrix.arch }} Alpine container
         run: |
           docker run --rm -v "$PWD":/src -w /src alpine:3.21 \
             sh scripts/ql-musl-build.sh
 
-      - name: Confirm the artifact is a static x86_64 ELF
+      - name: Confirm the artifact is a static ${{ matrix.arch }} ELF
         run: |
           file target/release/ql
-          file target/release/ql | grep -q 'x86-64' \
-            || { echo "FAIL: not an x86-64 binary"; exit 1; }
+          file target/release/ql | grep -Eq '${{ matrix.elf_grep }}' \
+            || { echo "FAIL: not a ${{ matrix.arch }} binary"; exit 1; }
           file target/release/ql | grep -Eq 'statically linked|static-pie' \
             || { echo "FAIL: not statically linked"; exit 1; }
 
-      - name: Upload ql (static x86_64 musl)
+      - name: Upload ql (static ${{ matrix.arch }} musl)
         uses: actions/upload-artifact@v4
         with:
-          name: ql-x86_64-musl-static
+          name: ql-${{ matrix.arch }}-musl-static
           path: target/release/ql
           if-no-files-found: error
 
-      # On a version tag (not manual dispatch), publish a GitHub Release with the
-      # static binary attached under a STABLE, PUBLIC name — this is the URL the
-      # `curl | sh` installer downloads. Named with the target triple so the
-      # asset is self-describing (and future arches don't collide).
+      # On a version tag, stage the asset under a STABLE, PUBLIC name (the target
+      # triple) so the asset is self-describing and arches don't collide. Each
+      # matrix job publishes its own asset to the SAME release; action-gh-release
+      # appends files to an existing release rather than replacing it.
       - name: Stage release asset
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           mkdir -p dist
-          cp target/release/ql dist/ql-x86_64-unknown-linux-musl
-          ( cd dist && sha256sum ql-x86_64-unknown-linux-musl > ql-x86_64-unknown-linux-musl.sha256 )
+          cp target/release/ql "dist/ql-${{ matrix.triple }}"
+          ( cd dist && sha256sum "ql-${{ matrix.triple }}" > "ql-${{ matrix.triple }}.sha256" )
           echo "staged:"; ls -l dist
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release (append this arch's asset)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/ql-x86_64-unknown-linux-musl
-            dist/ql-x86_64-unknown-linux-musl.sha256
+            dist/ql-${{ matrix.triple }}
+            dist/ql-${{ matrix.triple }}.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -29,13 +29,19 @@
 # It changes NOTHING in your tree except target/ (cargo output).
 set -eu
 
-TARGET=x86_64-unknown-linux-musl
-
-echo "== host: $(uname -m) $(uname -r)"
-case "$(uname -m)" in
-  x86_64) : ;;
-  *) echo "NOTE: not x86_64 — see the qemu caveat in this script's header." >&2 ;;
+# Derive the musl target triple from the host arch, so this script builds a
+# native binary with the CORRECT architecture's BTF on either an x86_64 or an
+# aarch64 Alpine host. Building under qemu (host arch != intended target) still
+# compiles and links but dumps the host's BTF — run this on a NATIVE host of the
+# arch you want (the CI matrix does exactly that: one native runner per arch).
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  x86_64)  TARGET=x86_64-unknown-linux-musl ;;
+  aarch64) TARGET=aarch64-unknown-linux-musl ;;
+  *) echo "unsupported host arch: $HOST_ARCH (need x86_64 or aarch64)" >&2; exit 1 ;;
 esac
+
+echo "== host: $HOST_ARCH $(uname -r)  ->  target: $TARGET"
 
 echo "== apk: build toolchain + BPF tooling + STATIC libelf/zlib"
 # build-base/clang/llvm: compile libbpf + the BPF object. bpftool: dump vmlinux.h.

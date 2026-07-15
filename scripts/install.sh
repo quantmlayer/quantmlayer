@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/quantmlayer/quantmlayer/main/scripts/install.sh | sh
 #
-# Downloads the static x86_64 `ql` binary from the latest (or a pinned) GitHub
+# Downloads the static `ql` binary (x86_64 or aarch64, auto-detected) from the
 # Release, verifies its SHA-256, installs it to /usr/local/bin, and — on a
 # hardened kernel — installs the AppArmor profile that lets `ql` use
 # unprivileged user namespaces. Static musl binary: no runtime dependencies.
@@ -21,7 +21,6 @@ set -eu
 REPO="quantmlayer/quantmlayer"
 PREFIX="${QL_PREFIX:-/usr/local}"
 BINDIR="$PREFIX/bin"
-ASSET="ql-x86_64-unknown-linux-musl"
 RAW="https://raw.githubusercontent.com/$REPO"
 
 say()  { printf 'ql-install: %s\n' "$*"; }
@@ -29,8 +28,14 @@ die()  { printf 'ql-install: error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # --- preflight ---------------------------------------------------------------
+# Map the host arch to the release asset triple. The release ships a native
+# static binary per arch (see .github/workflows/musl-static.yml).
 arch="$(uname -m)"
-[ "$arch" = "x86_64" ] || die "this release ships an x86_64 binary; detected '$arch'. Build from source instead: https://github.com/$REPO"
+case "$arch" in
+  x86_64)           ASSET="ql-x86_64-unknown-linux-musl";  ELF_GREP='x86-64' ;;
+  aarch64|arm64)    ASSET="ql-aarch64-unknown-linux-musl"; ELF_GREP='aarch64|ARM aarch64' ;;
+  *) die "no prebuilt binary for arch '$arch' (have: x86_64, aarch64). Build from source: https://github.com/$REPO" ;;
+esac
 
 os="$(uname -s)"
 [ "$os" = "Linux" ] || die "QuantmLayer enforces via the Linux kernel; detected '$os'."
@@ -85,9 +90,9 @@ else
   say "warning: no published checksum for this asset; skipping verification."
 fi
 
-# Sanity: it should be a static x86_64 ELF.
+# Sanity: it should be a static ELF of the detected arch.
 if have file; then
-  file "$TMP/ql" | grep -q 'x86-64' || die "downloaded file is not an x86-64 binary."
+  file "$TMP/ql" | grep -Eq "$ELF_GREP" || die "downloaded file is not a $arch binary."
 fi
 
 # --- install the binary ------------------------------------------------------
