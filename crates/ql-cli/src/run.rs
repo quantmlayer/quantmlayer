@@ -286,6 +286,19 @@ pub fn cmd(args: &[String]) -> ExitCode {
     };
     if profile.exec.enforce {
         eprintln!("ql: exec enforcement tier: {}", tier.label());
+    } else {
+        // Honest notice: the filesystem and network walls arm regardless, but
+        // content-verified exec is OFF unless the profile opts in with
+        // `exec.enforce: true` and measured `allow_digests`. Bundled agent
+        // profiles ship portable path allow-lists, not host-specific digests,
+        // so `ql agent`/`--agent` run with exec NOT content-verified. Say so,
+        // rather than letting the operator assume a wall that isn't armed.
+        eprintln!(
+            "ql: note — exec wall NOT content-verified this run (profile has no \
+             exec.enforce+digests). Filesystem and network walls are enforced; \
+             an unlisted binary can still exec. Run `ql learn` to measure \
+             binaries and enable content-verified exec."
+        );
     }
     // Tamper-evident record of which exec tier actually governs this session.
     if let Some(audit) = audit_path.as_deref() {
