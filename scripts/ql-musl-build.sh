@@ -108,7 +108,25 @@ echo "== build: static musl ql with the kernel exec wall (--features lsm)"
 # them via cc's default path; the normal graph's `static=` makes rustc do the
 # lookup, and rustc does not search /usr/lib.)
 export LIBBPF_SYS_LIBRARY_PATH=/usr/lib
-RUSTFLAGS="-C link-arg=-l:libzstd.a" \
+
+# --- aarch64 atomics fix -----------------------------------------------------
+# On aarch64, GCC emits "outline atomics" by default: calls to helper symbols
+# like `__aarch64_ldadd4_sync` that live in libgcc. libbpf's C (compiled by
+# libbpf-sys via cc) references them, but our fully-static `-nodefaultlibs` link
+# drops libgcc, so they come up undefined at link time. Two-part fix, aarch64
+# only (x86_64 inlines these atomics and needs neither):
+#   1. -mno-outline-atomics on the C build so GCC inlines the atomics and never
+#      emits the helper references in the first place.
+#   2. -lgcc on the link as a belt-and-suspenders for any helper still pulled in
+#      (named plainly so it doesn't flip the linker's -Bstatic/-Bdynamic mode).
+EXTRA_RUSTFLAGS=""
+if [ "$HOST_ARCH" = "aarch64" ]; then
+  export CFLAGS="${CFLAGS:-} -mno-outline-atomics"
+  EXTRA_RUSTFLAGS=" -C link-arg=-lgcc"
+  echo "== aarch64: -mno-outline-atomics (C) + -lgcc (link) for libbpf atomics"
+fi
+
+RUSTFLAGS="-C link-arg=-l:libzstd.a${EXTRA_RUSTFLAGS}" \
   cargo build -p ql-cli --features lsm --release
 
 BIN="target/release/ql"
