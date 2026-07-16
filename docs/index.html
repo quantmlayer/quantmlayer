@@ -110,7 +110,7 @@
 
   /* demo frame */
   .demo-frame{
-    margin:52px auto 0; border:1px solid var(--line); border-radius:6px; overflow:hidden;
+    margin:52px 0 0; border:1px solid var(--line); border-radius:6px; overflow:hidden;
     background:var(--panel-2); box-shadow:0 24px 60px -30px rgba(0,0,0,.7); width:fit-content; max-width:100%;
   }
   .demo-frame .chrome{
@@ -182,6 +182,56 @@
   @media(prefers-reduced-motion:reduce){ .reveal{ opacity:1; transform:none; transition:none; } html{ scroll-behavior:auto; } }
 
   :focus-visible{ outline:2px solid var(--allow); outline-offset:2px; border-radius:2px; }
+
+  /* ---- mobile ---- */
+  @media(max-width:720px){
+    body{ background-size:44px 44px, 44px 44px; }
+    .wrap{ padding:0 18px; }
+    .bar .wrap{ height:56px; }
+    .brand{ font-size:15px; gap:9px; }
+    .brand .glyph{ width:22px; height:22px; }
+    .bar nav{ gap:14px; }
+
+    .hero{ padding:44px 0 28px; }
+    .hero h1{ font-size:clamp(30px,9vw,44px); max-width:100%; margin-top:16px; }
+    .hero .sub{ font-size:15px; max-width:100%; }
+    .eyebrow{ font-size:11px; }
+
+    .cta-row{ gap:10px; margin-top:26px; }
+    .btn{ width:100%; justify-content:center; font-size:13.5px; padding:13px 16px; }
+
+    .install{ margin-top:24px; max-width:100%; }
+    .install .lbl{ padding:11px 11px; font-size:11px; }
+    .install code{ font-size:12px; padding:11px 12px; }
+
+    .demo-frame{ margin:34px 0 0; width:100%; }
+    .demo-frame .chrome{ padding:9px 12px; font-size:11px; }
+    .demo-frame img{ width:100%; max-height:none; }
+
+    section{ padding:52px 0; }
+    .sec-head h2{ font-size:clamp(23px,6.5vw,32px); }
+    .sec-head p{ font-size:15.5px; }
+
+    .incidents{ gap:12px; margin:28px 0 4px; }
+    .incident{ padding:17px 18px; }
+    .pull{ font-size:19px; }
+
+    .walls{ margin-top:30px; }
+    .wall{ padding:22px 20px; border-right:none; }
+
+    .ent .box{ padding:24px 22px; }
+    .ent .box .txt h3{ font-size:18px; }
+
+    .final h2{ font-size:clamp(25px,7vw,36px); }
+    .final .cta-row .btn{ width:100%; }
+
+    footer .wrap{ flex-direction:column; align-items:flex-start; gap:14px; }
+  }
+
+  @media(max-width:400px){
+    .install code{ font-size:11px; white-space:normal; word-break:break-all; }
+    .hero h1{ font-size:29px; }
+  }
 </style>
 </head>
 <body>
