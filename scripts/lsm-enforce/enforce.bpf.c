@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//
 // scripts/lsm-enforce/enforce.bpf.c
 //
 // QuantmLayer — content-addressed exec ENFORCER (cgroup-scoped).
@@ -20,8 +22,12 @@
 // they do. An approved interpreter can still run arbitrary scripts; that is the
 // seccomp / filesystem / network walls' job, not exec hashing's.
 //
-// LICENSE: bpf_ima_file_hash is a GPL-only helper, so this object declares GPL.
-// That governs only this .bpf.c object; the rest of QuantmLayer is Apache-2.0.
+// LICENSE: bpf_ima_file_hash is a GPL-only helper, so the loaded BPF object
+// must declare a GPL-compatible license; accordingly this single source file is
+// licensed GPL-2.0-only (see the SPDX tag above). It is a standalone program
+// loaded into the kernel, not linked into the `ql` binary; every other file in
+// QuantmLayer remains Apache-2.0 (see LICENSE and the License section of the
+// README).
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>

@@ -247,3 +247,15 @@ Every source file begins with a comment naming its path, and the enforcement pat
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+One documented exception: [`scripts/lsm-enforce/enforce.bpf.c`](scripts/lsm-enforce/enforce.bpf.c)
+is **GPL-2.0-only**, because it uses the GPL-only kernel helper
+`bpf_ima_file_hash` and the kernel requires the loaded BPF object to declare a
+GPL-compatible license. That file is a standalone program loaded into the
+kernel at runtime — it is compiled to a BPF object, not linked into the `ql`
+binary — so the `ql` binary and every other file in this repository remain
+Apache-2.0. Third-party dependency licenses are inventoried in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+Contributions are accepted under the same terms with a required DCO sign-off —
+see [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -63,7 +63,8 @@ fn wall(name: &'static str, status: Status, detail: String) -> Wall {
     }
 }
 
-/// One layer of the exec-wall degradation ladder (see MASTER_PLAN §5 P0).
+/// One layer of the exec-wall degradation ladder (tier1 BPF-LSM ->
+/// tier2 seccomp-notify -> tier3 Landlock; see `ql doctor` output).
 struct ExecTier {
     name: &'static str,
     available: bool,

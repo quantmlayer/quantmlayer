@@ -13,7 +13,7 @@
 //!
 //! We never mark an attack "blocked" without actually running it and
 //! observing the block. Pending rows name the exact wall that will close
-//! them. This is what lets an acquirer re-run the harness and trust it.
+//! them. This is what lets a third party re-run the harness and trust it.
 
 /// Whether an attack can be executed now, or is waiting on an unbuilt wall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
