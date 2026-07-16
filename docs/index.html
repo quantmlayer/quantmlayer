@@ -110,8 +110,8 @@
 
   /* demo frame */
   .demo-frame{
-    margin-top:52px; border:1px solid var(--line); border-radius:6px; overflow:hidden;
-    background:var(--panel-2); box-shadow:0 24px 60px -30px rgba(0,0,0,.7);
+    margin:52px auto 0; border:1px solid var(--line); border-radius:6px; overflow:hidden;
+    background:var(--panel-2); box-shadow:0 24px 60px -30px rgba(0,0,0,.7); width:fit-content; max-width:100%;
   }
   .demo-frame .chrome{
     display:flex; align-items:center; gap:8px; padding:11px 15px; border-bottom:1px solid var(--line-soft);
@@ -119,7 +119,7 @@
   }
   .demo-frame .dot{ width:10px; height:10px; border-radius:50%; background:var(--line); }
   .demo-frame .cap{ margin-left:8px; }
-  .demo-frame img{ display:block; width:100%; height:auto; max-height:520px; object-fit:contain; object-position:top; background:#05080f; }
+  .demo-frame img{ display:block; max-width:100%; height:auto; max-height:560px; background:#05080f; }
 
   /* ---- section scaffold ---- */
   section{ padding:74px 0; border-top:1px solid var(--line-soft); position:relative; }
