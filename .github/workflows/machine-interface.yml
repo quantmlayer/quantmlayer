@@ -1,0 +1,106 @@
+# .github/workflows/machine-interface.yml
+#
+# Exercises the machine-interface CONTRACT itself (docs/MACHINE-INTERFACE.md) on
+# every push/PR: the documented exit codes and JSON schemas are asserted against
+# a real `ql` binary, so "ql is scriptable with a stable exit-code contract" is a
+# tested claim, not an assertion. This is the "measured, never asserted" idea
+# applied to the CLI surface.
+#
+# It deliberately avoids anything that needs a privileged cell (namespaces,
+# mounts, cgroups) — those are #[ignore]-gated and run via `make test-priv` on a
+# permitted host. Audit logs here are built with `ql audit append`, which only
+# reads/writes a file and hash-chains records, so the test is deterministic on a
+# stock GitHub runner.
+name: machine-interface
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: exit-code + JSON contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build ql
+        run: cargo build -p ql-cli
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: audit verify — INTACT is exit 0, ok:true, versioned schema
+        run: |
+          set -eu
+          QL=./target/debug/ql
+          LOG="$(mktemp)"
+          # Build a valid, hash-chained log with three records (no privilege needed).
+          "$QL" audit append "$LOG" --actor agent --action read  --target /etc/hostname --decision allow
+          "$QL" audit append "$LOG" --actor agent --action exec  --target /bin/echo     --decision allow
+          "$QL" audit append "$LOG" --actor agent --action write --target /tmp/out      --decision deny
+
+          out="$("$QL" audit verify "$LOG" --json)"; code=$?
+          echo "$out"
+          test "$code" -eq 0                                   || { echo "expected exit 0, got $code"; exit 1; }
+          test "$(echo "$out" | jq -r .schema)" = "ql.audit.verify/v1" || { echo "wrong schema"; exit 1; }
+          test "$(echo "$out" | jq -r .ok)"     = "true"       || { echo "expected ok:true"; exit 1; }
+          test "$(echo "$out" | jq -r .records)" -ge 3         || { echo "record count wrong"; exit 1; }
+          echo "OK: intact log verifies, exit 0, ok:true"
+
+      - name: audit verify — TAMPER is exit 3, ok:false (distinct from 'could not run')
+        run: |
+          set -eu
+          QL=./target/debug/ql
+          LOG="$(mktemp)"
+          "$QL" audit append "$LOG" --actor agent --action read  --target /etc/hostname --decision allow
+          "$QL" audit append "$LOG" --actor agent --action exec  --target /bin/echo     --decision allow
+          "$QL" audit append "$LOG" --actor agent --action write --target /secret       --decision deny
+
+          # Semantic tamper: change a value inside a record but keep it valid JSON,
+          # so the parser succeeds and the HASH CHAIN is what breaks (exit 3), not
+          # a parse error (which is exit 1 — a different, also-correct path).
+          python3 - "$LOG" <<'PY'
+          import json, sys
+          p = sys.argv[1]
+          lines = open(p).read().splitlines()
+          i = len(lines) // 2                       # a middle record
+          rec = json.loads(lines[i])
+          for k, v in rec.items():
+              if isinstance(v, str) and len(v) > 2:
+                  rec[k] = v[:-1] + ("X" if v[-1] != "X" else "Y")
+                  break
+          lines[i] = json.dumps(rec)
+          open(p, "w").write("\n".join(lines) + "\n")
+          PY
+
+          set +e
+          out="$("$QL" audit verify "$LOG" --json)"; code=$?
+          set -e
+          echo "$out"
+          test "$code" -eq 3                              || { echo "expected exit 3 (tamper), got $code"; exit 1; }
+          test "$(echo "$out" | jq -r .ok)" = "false"     || { echo "expected ok:false"; exit 1; }
+          test "$(echo "$out" | jq -r .error)" != "null"  || { echo "expected a break location in error"; exit 1; }
+          echo "OK: tampered chain detected, exit 3, ok:false, break located"
+
+      - name: validate --json emits a versioned document for a valid profile
+        run: |
+          set -eu
+          QL=./target/debug/ql
+          # Any bundled agent profile is valid; --json must emit ql.validate.result/v1.
+          out="$("$QL" validate --agent claude --json)"; code=$?
+          echo "$out"
+          test "$code" -eq 0                                             || { echo "expected exit 0"; exit 1; }
+          test "$(echo "$out" | jq -r .schema)" = "ql.validate.result/v1" || { echo "wrong schema"; exit 1; }
+          test "$(echo "$out" | jq -r .valid)"  = "true"                 || { echo "expected valid:true"; exit 1; }
+          echo "OK: validate --json contract holds"
