@@ -27,6 +27,7 @@ mod observe;
 mod policy;
 mod profile;
 mod registry;
+mod result;
 mod run;
 mod token;
 mod token_bind;
@@ -78,13 +79,13 @@ fn print_usage() {
          USAGE:\n\
          \x20 ql agent    list | <name> [run options] [-- <extra agent args>]   (claude, codex, gemini, aider)\n\
          \x20 ql mcp      list <config.json> | wrap <config.json> (--in-place|--out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] | unwrap <config.json> (--in-place|--out <path>)\n\
-         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--observe [--strict]] [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--verbose] [--broker] -- <cmd...>\n\
-         \x20 ql learn    [--out <p.yaml>] [--verbose] -- <cmd...>\n\
-         \x20 ql validate --profile <p.yaml> | --agent <name> | --mcp\n\
+         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--observe [--strict]] [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--result-json <out.json>] [--verbose] [--broker] -- <cmd...>\n\
+         \x20 ql learn    [--out <p.yaml>] [--json] [--verbose] -- <cmd...>\n\
+         \x20 ql validate (--profile <p.yaml> | --agent <name> | --mcp) [--json]\n\
          \x20 ql doctor   [--json]\n\
          \x20 ql profile  sign <p.yaml> --key <seed-hex> [--out <path>] | verify <p.yaml> [--signer <pubkey>]\n\
          \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
-         \x20 ql audit    verify <log> | append <log> ... | export <log> --out <dir> | rotate <log> --archive-dir <dir> | retention <dir> | keygen\n\
+         \x20 ql audit    verify <log> [--json] | append <log> ... | export <log> --out <dir> | rotate <log> --archive-dir <dir> | retention <dir> | keygen\n\
          \x20 ql ps\n\
          \x20 ql kill     <id> [--audit <log.jsonl>]\n\
          \x20 ql token    demo | keygen\n\

@@ -48,6 +48,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut expect_image: Option<String> = None;
     let mut observe = false;
     let mut strict = false;
+    let mut result_json: Option<String> = None;
 
     let mut it = opts.iter();
     while let Some(a) = it.next() {
@@ -57,6 +58,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--mcp" => mcp = true,
             "--observe" => observe = true,
             "--strict" => strict = true,
+            "--result-json" => result_json = it.next().cloned(),
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
@@ -97,6 +99,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             strict,
             system_id,
             model_version,
+            result_json,
             command: command.to_vec(),
         });
     }
@@ -313,6 +316,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             audit_path.as_deref(),
             system.as_ref(),
             tier,
+            result_json.as_deref(),
         )
     } else {
         run_default(
@@ -322,6 +326,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             audit_path.as_deref(),
             system.as_ref(),
             tier,
+            result_json.as_deref(),
         )
     };
     crate::registry::deregister(&id);
@@ -528,6 +533,7 @@ fn run_default(
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
     tier: ExecTier,
+    result_json: Option<&str>,
 ) -> ExitCode {
     if verbose {
         eprintln!(
@@ -543,6 +549,9 @@ fn run_default(
         Ok(c) => c,
         Err(e) => {
             eprintln!("ql run: could not build containment cell: {e}");
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, false, tier.label(), None, Some(&e.to_string()));
+            }
             return ExitCode::from(1);
         }
     };
@@ -550,9 +559,17 @@ fn run_default(
     write_exec_events(audit_path, system);
     write_tier2_exec_events(audit_path, system);
     match result {
-        Ok(code) => ExitCode::from(clamp_code(code)),
+        Ok(code) => {
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, false, tier.label(), Some(code), None);
+            }
+            ExitCode::from(clamp_code(code))
+        }
         Err(e) => {
             eprintln!("ql run: containment failure (command not executed): {e}");
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, false, tier.label(), None, Some(&e.to_string()));
+            }
             ExitCode::from(1)
         }
     }
@@ -568,6 +585,7 @@ fn run_brokered(
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
     tier: ExecTier,
+    result_json: Option<&str>,
 ) -> ExitCode {
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
@@ -623,6 +641,9 @@ fn run_brokered(
         Ok(c) => c,
         Err(e) => {
             eprintln!("ql run: could not build brokered cell: {e}");
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, true, tier.label(), None, Some(&e.to_string()));
+            }
             return ExitCode::from(1);
         }
     };
@@ -634,9 +655,17 @@ fn run_brokered(
     veth::teardown(&plan);
 
     match result {
-        Ok(code) => ExitCode::from(clamp_code(code)),
+        Ok(code) => {
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, true, tier.label(), Some(code), None);
+            }
+            ExitCode::from(clamp_code(code))
+        }
         Err(e) => {
             eprintln!("ql run: containment failure (command not executed): {e}");
+            if let Some(path) = result_json {
+                crate::result::write_enforce(path, true, tier.label(), None, Some(&e.to_string()));
+            }
             ExitCode::from(1)
         }
     }

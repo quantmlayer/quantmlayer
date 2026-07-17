@@ -35,7 +35,19 @@ pub fn cmd(args: &[String]) -> ExitCode {
 }
 
 fn verify(args: &[String]) -> ExitCode {
-    let Some(path) = args.first() else {
+    let mut path: Option<&String> = None;
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            other if path.is_none() && !other.starts_with('-') => path = Some(a),
+            other => {
+                eprintln!("ql audit verify: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
         eprintln!("ql audit verify: a log file path is required");
         return ExitCode::from(2);
     };
@@ -53,18 +65,46 @@ fn verify(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Exit codes are part of the machine contract (docs/MACHINE-INTERFACE.md):
+    // 0 = chain verified, 3 = chain verification FAILED (tamper finding),
+    // 1 = could not parse, 2 = usage / unreadable file. A CI gate can
+    // therefore distinguish "the ledger is bad" from "the check didn't run".
     match log.verify() {
         Ok(()) => {
-            println!(
-                "{path}: INTACT — {} record(s), chain verified",
-                log.records().len()
-            );
+            if json {
+                print_verify_json(path, true, log.records().len(), None);
+            } else {
+                println!(
+                    "{path}: INTACT — {} record(s), chain verified",
+                    log.records().len()
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{path}: TAMPERED — {e}");
-            ExitCode::from(1)
+            if json {
+                print_verify_json(path, false, log.records().len(), Some(&e.to_string()));
+            } else {
+                eprintln!("{path}: TAMPERED — {e}");
+            }
+            ExitCode::from(3)
         }
+    }
+}
+
+/// Emit the machine-readable verify result on stdout. Stable contract: see
+/// docs/MACHINE-INTERFACE.md.
+fn print_verify_json(path: &str, ok: bool, records: usize, error: Option<&str>) {
+    let obj = serde_json::json!({
+        "schema": "ql.audit.verify/v1",
+        "file": path,
+        "ok": ok,
+        "records": records,
+        "error": error,
+    });
+    match serde_json::to_string_pretty(&obj) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("ql audit verify: cannot render json: {e}"),
     }
 }
 

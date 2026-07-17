@@ -258,6 +258,15 @@ make benchmark   # run the attack benchmark and render the scorecard
 
 Every source file begins with a comment naming its path, and the enforcement path contains no panics — a wall that can't be applied returns a structured error and the cell fails closed.
 
+## Machine interface (CI / scripting)
+
+Every CI-relevant command speaks JSON and has a documented exit-code contract —
+`ql run --result-json`, `ql learn --json`, `ql validate --json`,
+`ql audit verify --json`, `ql doctor --json`. Exit code `3` is the "policy
+finding" code (`--strict` would-deny, audit tamper), distinct from `1`
+(couldn't run) and `2` (usage), so pipelines can gate without scraping stderr.
+Full contract: [docs/MACHINE-INTERFACE.md](docs/MACHINE-INTERFACE.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

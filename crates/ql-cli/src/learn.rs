@@ -19,11 +19,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
 
     let mut out: Option<String> = None;
     let mut verbose = false;
+    let mut json = false;
     let mut it = opts.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = it.next().cloned(),
             "--verbose" => verbose = true,
+            "--json" => json = true,
             other => {
                 eprintln!("ql learn: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -76,7 +78,14 @@ pub fn cmd(args: &[String]) -> ExitCode {
         Some(path) => match std::fs::write(&path, &yaml) {
             Ok(()) => {
                 eprintln!("ql learn: wrote least-privilege profile to {path}");
-                write_risk_report(&outcome, &path)
+                if write_risk_report(&outcome, &path) {
+                    if json {
+                        print_json(&outcome, &yaml, Some(&path));
+                    }
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
             }
             Err(e) => {
                 eprintln!("ql learn: cannot write {path}: {e}");
@@ -84,15 +93,48 @@ pub fn cmd(args: &[String]) -> ExitCode {
             }
         },
         None => {
-            print!("{yaml}");
+            if json {
+                print_json(&outcome, &yaml, None);
+            } else {
+                print!("{yaml}");
+            }
             ExitCode::SUCCESS
         }
     }
 }
 
-/// Write the per-grant risk report next to the profile at `out`. Returns the
-/// command's exit code: success only if both files were written.
-fn write_risk_report(outcome: &ql_learn::LearnOutcome, out: &str) -> ExitCode {
+/// Emit the machine-readable learn result on stdout. Stable contract: see
+/// docs/MACHINE-INTERFACE.md. The profile itself is embedded verbatim as a
+/// YAML string so a consumer needs no second read; when `--out` was given the
+/// written paths are reported as well.
+fn print_json(outcome: &ql_learn::LearnOutcome, yaml: &str, out: Option<&str>) {
+    let o = &outcome.observation;
+    let mut obj = serde_json::json!({
+        "schema": "ql.learn.result/v1",
+        "observation": {
+            "processes": o.process_count,
+            "reads": o.reads.len(),
+            "writes": o.writes.len(),
+            "execs": o.execs.len(),
+            "connects": o.connects.len(),
+            "syscalls": o.syscalls.len(),
+        },
+        "notes": outcome.notes,
+        "profile_yaml": yaml,
+    });
+    if let Some(path) = out {
+        obj["profile_path"] = serde_json::Value::from(path);
+        obj["risk_report_path"] = serde_json::Value::from(risk_report_path(path));
+    }
+    match serde_json::to_string_pretty(&obj) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("ql learn: cannot render json: {e}"),
+    }
+}
+
+/// Write the per-grant risk report next to the profile at `out`. Returns
+/// `true` only if the report was written (the profile itself already was).
+fn write_risk_report(outcome: &ql_learn::LearnOutcome, out: &str) -> bool {
     // The directory the agent was launched in is the project root, so files
     // under it classify as project-local rather than generic home paths.
     let project_root = std::env::current_dir().ok();
@@ -111,11 +153,11 @@ fn write_risk_report(outcome: &ql_learn::LearnOutcome, out: &str) -> ExitCode {
                  ({} allow-candidate, {} review, {} deny-by-default)",
                 s.allow_candidate, s.review, s.deny_by_default
             );
-            ExitCode::SUCCESS
+            true
         }
         Err(e) => {
             eprintln!("ql learn: wrote profile but could not write {report_path}: {e}");
-            ExitCode::from(1)
+            false
         }
     }
 }

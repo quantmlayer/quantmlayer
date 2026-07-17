@@ -35,6 +35,8 @@ pub struct ObserveOpts {
     pub system_id: Option<String>,
     /// `--model-version` (only with `--system-id`).
     pub model_version: Option<String>,
+    /// `--result-json <path>`: write the machine-readable outcome here.
+    pub result_json: Option<String>,
     /// The command to observe (everything after `--`).
     pub command: Vec<String>,
 }
@@ -90,11 +92,22 @@ pub fn cmd(opts: ObserveOpts) -> ExitCode {
     print_summary(&report);
     eprintln!("{BANNER}");
 
-    // --strict: any would-deny fails the run (CI gate).
+    // --strict: any would-deny fails the run (CI gate). Exit code 3 is the
+    // documented "policy finding" code (docs/MACHINE-INTERFACE.md): distinct
+    // from 1 (ql could not run) and from the agent's own failure, so a CI
+    // step can gate on findings without ambiguity.
     let wd = report.would_deny_count();
-    if opts.strict && wd > 0 {
+    let strict_failed = opts.strict && wd > 0;
+    if let Some(path) = opts.result_json.as_deref() {
+        let findings: Vec<(String, String)> = report
+            .would_deny()
+            .map(|f| (f.kind.to_string(), f.target.clone()))
+            .collect();
+        crate::result::write_observe(path, &origin, opts.strict, &findings, strict_failed);
+    }
+    if strict_failed {
         eprintln!("ql observe: --strict: {wd} would-deny finding(s) — failing run");
-        return ExitCode::from(1);
+        return ExitCode::from(3);
     }
     ExitCode::SUCCESS
 }
