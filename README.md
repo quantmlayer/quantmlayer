@@ -1,4 +1,18 @@
-# QuantmLayer
+<p align="center">
+  <a href="https://quantmlayer.com">
+    <img src="docs/demo/ql-logo.png" alt="QuantmLayer" width="96" height="96">
+  </a>
+</p>
+
+<h1 align="center">QuantmLayer</h1>
+
+<p align="center">
+  <b>Kernel-enforced containment for AI coding agents.</b><br>
+  <a href="https://quantmlayer.com">quantmlayer.com</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="demo/">Demo</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
 
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
