@@ -132,6 +132,8 @@ ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
 
 `ql run` is transparent: the command's output passes through and `ql` exits with the command's own exit code.
 
+**Not on Linux?** `ql`'s walls are Linux kernel primitives, so Windows and macOS run the real cell inside a Linux environment they already have — WSL2 on Windows, a lightweight Linux VM on macOS. Full wall fidelity; `ql doctor` reports the exact tier you get. See [docs/PLATFORMS.md](docs/PLATFORMS.md).
+
 ## What it blocks
 
 Every row below is measured by a reproducible benchmark (`make benchmark`) — never asserted. **Docker** is a default `docker run` with the workspace mounted (no hardening flags); each attack's exact scenario and target wall is documented under [`benchmark/`](benchmark/), and the live scorecard is regenerated into [`benchmark/RESULTS.md`](benchmark/RESULTS.md) on every run.
