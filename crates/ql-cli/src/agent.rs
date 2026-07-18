@@ -74,6 +74,12 @@ pub const AGENTS: &[BundledAgent] = &[
         description: "opencode (open-source, provider-agnostic terminal agent)",
         yaml: include_str!("../../../profiles/agents/opencode.yaml"),
     },
+    BundledAgent {
+        name: "openhands",
+        binary: "openhands",
+        description: "OpenHands CLI (All Hands AI; pip/pipx/uv install, model-agnostic)",
+        yaml: include_str!("../../../profiles/agents/openhands.yaml"),
+    },
 ];
 
 /// Look up a bundled agent by name.
@@ -101,7 +107,7 @@ fn list() {
     println!("bundled agents (profiles compiled into this binary):\n");
     for a in AGENTS {
         println!(
-            "  {:<8} {:<14} {}",
+            "  {:<9} {:<14} {}",
             a.name,
             format!("[{}]", a.binary),
             a.description

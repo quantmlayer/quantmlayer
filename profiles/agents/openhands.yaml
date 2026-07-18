@@ -1,0 +1,225 @@
+# QuantmLayer bundled profile: OpenHands CLI (`openhands`)
+#
+# FIELD-VALIDATED (2026-07-18, Ubuntu 24.04 x86_64, kernel 6.17 GCP,
+# exec tier1 BPF-LSM available) against **OpenHands CLI 1.16.0 / SDK 1.21.0**
+# installed with `pipx install openhands`:
+#   * Derived with `ql learn` from a real headless task, then confirmed with
+#     `ql run --observe --strict`: **0 would-deny** across 23 execs, 5,498
+#     file-opens and 19 external endpoints.
+#   * Enforced live (`ql run --profile ... --broker`): the agent completed the
+#     task normally inside the cell. Brokered egress decided every connection
+#     by name — ALLOW api.anthropic.com, github.com, raw.githubusercontent.com,
+#     pypi.org; an unlisted host (example.com:443) was DENIED (authorization),
+#     surfacing to the agent as curl exit 56 / 403.
+#   * Filesystem wall verified two ways: a decoy key at `~/.ssh/` returned
+#     "No such file or directory" both to a direct `cat` in the cell AND to the
+#     agent's own tooling when instructed to read it. Uncontained, the same
+#     agent with the same prompt read and printed the key. The wall — not model
+#     refusal — is what stopped it.
+#   * Audit chains verified INTACT (`ql audit verify --json`, 191 and 99
+#     records).
+#
+# NOT validated here: content-verified exec (`exec.enforce`) — see EXEC below.
+#
+# Curated for the OpenHands CLI (All Hands AI). Embedded into the `ql` binary
+# and selected with `ql agent openhands` or
+# `ql run --agent openhands -- openhands ...`.
+#
+# WHY THIS AGENT NEEDS A PROFILE MORE THAN MOST:
+# The OpenHands CLI runs with "no Docker" — it is a pip/pipx/uv-installed Python
+# CLI that executes the agent's shell commands directly on the host with the
+# user's full privileges. Its own `--help` documents that `--headless` "auto-
+# approve[s] actions", and `--always-approve` removes per-action confirmation
+# entirely. Headless is precisely the mode that runs in CI, unattended. That is
+# a fully autonomous agent with an unrestricted shell: exactly the case these
+# walls exist for. The `--llm-approve` security analyzer is complementary, not
+# redundant — an LLM judging its own next action is probabilistic and reasons
+# about *intent*; these walls are deterministic and constrain *capability*. The
+# walls hold when the analyzer is wrong, and they are still there when
+# confirmation is switched off.
+#
+# Design notes (read before editing):
+# * INSTALL PATH IS NOT /usr/bin. OpenHands is installed with pip/pipx/uv, so
+#   its entry point lands in `~/.local/bin/openhands` — under pipx a symlink
+#   into `~/.local/share/pipx/venvs/openhands/`. Under `uv tool install` it is
+#   `~/.local/share/uv/tools/`. Both layouts are covered below; `ql learn`
+#   resolves the real ones for YOUR host and this remains the most likely thing
+#   to need adjusting.
+# * CANNOT HIDE ALL OF $HOME. OpenHands keeps state in `~/.openhands/`
+#   (agent_settings.json, cache/, conversations/, mcp.json), created on first
+#   run; older installs used `~/.openhands-state`. Because the agent needs its
+#   own state, this profile does NOT restrict the cell to the workspace alone:
+#   non-secret files elsewhere in `$HOME` remain readable. It denies the
+#   well-known credential locations individually instead. State that tradeoff
+#   accurately — this profile is "credentials denied, workspace read-write",
+#   not "workspace-only". To tighten it, narrow `readonly` to the venv +
+#   `~/.openhands` + your workspace and re-run
+#   `ql run --observe --strict` to confirm nothing breaks.
+# * PLAINTEXT PROVIDER KEY. `~/.openhands/agent_settings.json` stores the model
+#   API key in plaintext (observed 2026-07-18). The agent needs that file to
+#   function, so it is granted — which means the *egress* wall, not the mount
+#   wall, is what stops that key leaving. Keep `default_deny: true` and prune
+#   the provider list to the one you actually use.
+# * DOCKER SOCKET IS DENIED. `ql learn` grants `/var/run` because the CLI
+#   touches it, but a writable `/var/run/docker.sock` is a full escape to host
+#   root — `openhands serve` shells out to Docker. It is denied explicitly
+#   below; if you genuinely need the GUI server, run it outside the cell rather
+#   than opening the socket inside one.
+# * MODEL-AGNOSTIC. OpenHands routes through LiteLLM and supports any provider,
+#   so no allow-list is right for everyone. The endpoints below are a starting
+#   set — DELETE the providers you do not use. A narrower egress list is a
+#   stronger wall.
+# * MCP SERVERS. `openhands mcp add` commonly launches servers via `npx`, which
+#   pulls from the npm registry at run time and execs Node. If you use MCP,
+#   add `npx`/`node` to `allow_exec` and keep `registry.npmjs.org` — or, better,
+#   contain the servers separately with
+#   `ql mcp wrap ~/.openhands/mcp.json --in-place`, which is the tighter answer.
+# * TELEMETRY is deliberately NOT allow-listed. If a product-analytics endpoint
+#   appears as a denial, leave it denied unless you want it.
+# * No wall-clock limit: CLI sessions are interactive and long-lived. For
+#   headless/CI use consider setting `wall_clock_secs`, since an unattended
+#   agent has no one watching hour five.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/home/*/.openhands/**"          # settings, cache/skills, conversations, mcp.json
+    - "/home/*/.openhands-state/**"    # legacy state dir (older installs)
+    - "/tmp/**"
+    - "/dev/null"
+    - "/dev/urandom"
+    - "/dev/tty"
+  readonly:
+    - "/etc/**"
+    - "/usr/bin/**"
+    - "/usr/lib/**"
+    - "/usr/share/**"
+    - "/lib/**"
+    - "/opt/pyca/**"
+    - "/proc/self/**"
+    - "/proc/sys/**"
+    - "/sys/devices/**"
+    - "/sys/fs/**"
+    # The pip/pipx/uv install: entry point, interpreter, site-packages.
+    # Verify against YOUR install with `ql learn` — venv layouts vary.
+    - "/home/*/.local/bin/**"
+    - "/home/*/.local/share/pipx/venvs/**"
+    - "/home/*/.local/share/uv/**"
+    - "/home/*/.local/lib/python3*/**"
+    - "/home/*/.venv/**"
+    # See "CANNOT HIDE ALL OF $HOME" above: broad by design, with the
+    # credential paths denied below. Narrow this if your workflow allows.
+    - "/home/*/**"
+  denied:                              # invisible to the agent — not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/root/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/root/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"           # escape to host root; see design notes
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # --- hosted model providers (PRUNE to the one you use) ---
+    - "api.anthropic.com"         # Anthropic  (observed in validation)
+    - "api.openai.com"            # OpenAI
+    - "auth.openai.com"
+    - "generativelanguage.googleapis.com"  # Google Gemini
+    - "openrouter.ai"             # OpenRouter (multi-provider gateway)
+    - "api.x.ai"                  # xAI Grok
+    # (Bedrock, Vercel AI Gateway, etc.: add the specific endpoint your
+    #  deployment uses; they are intentionally NOT all listed here.)
+    # --- package registries a coding task legitimately needs ---
+    - "pypi.org"                  # observed in validation
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    # --- source hosting ---
+    - "github.com"                # observed in validation
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com" # observed in validation (SDK fetches on start)
+    - "objects.githubusercontent.com"
+
+capabilities:
+  retain: []
+
+syscalls:
+  default_action: allow
+  deny:
+    - ptrace
+    - mount
+    - umount2
+    - unshare
+    - pivot_root
+    - process_vm_readv
+    - process_vm_writev
+    - bpf
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+  notify: []
+
+resources:
+  memory_max_bytes: 4294967296   # 4 GiB
+  cpu_max_percent: null
+  # Observed peak during validation was ~704 PIDs (the CLI is thread-heavy).
+  # Shipped with headroom so a busier task does not trip the limit; lower it if
+  # you want a tighter bound and re-validate with --observe.
+  pids_max: 1024
+  wall_clock_secs: null
+
+processes:
+  # Paths only. Content-verified exec needs host-specific digests — see EXEC.
+  allow_exec:
+    - /bin/bash
+    - /bin/sh
+    - /usr/bin/basename
+    - /usr/bin/dircolors
+    - /usr/bin/dirname
+    - /usr/bin/git
+    - /usr/bin/groups
+    - /usr/bin/lesspipe
+    - /usr/bin/locale
+    - /usr/bin/locale-check
+    - /usr/bin/python3
+    - /usr/bin/python3.12
+    - /usr/bin/tmux
+    - /usr/lib/git-core/git
+    - /usr/lib/git-core/git-remote-https
+    - /usr/lib/x86_64-linux-gnu/utempter/utempter
+    # The OpenHands entry point and its venv interpreter (pipx/uv layouts).
+    - /home/*/.local/bin/openhands
+    - /home/*/.local/share/pipx/venvs/openhands/bin/openhands
+    - /home/*/.local/share/pipx/venvs/openhands/bin/python
+    - /home/*/.local/share/pipx/venvs/openhands/bin/python3
+    # Uncomment if you use MCP servers launched via npx:
+    # - /usr/bin/node
+    # - /usr/bin/npx
+
+# EXEC — content-verified execution is OFF in this bundled profile, on purpose.
+# `allow_digests` are SHA-256 hashes of the binaries on ONE host; they are
+# meaningless on yours. Shipping someone else's digests would be worse than
+# shipping none. To pin binaries by content on your machine:
+#
+#   ql learn --out openhands.yaml -- openhands --headless -t "<a real task>"
+#   # then set exec.enforce: true in the generated profile
+#   ql run --profile openhands.yaml -- openhands --headless -t "<same task>"
+#
+# `ql run` prints a notice on every run where exec is not content-verified, so
+# you are never told a wall is armed when it is not.
+exec:
+  enforce: false
+  allow_digests: []

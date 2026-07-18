@@ -18,7 +18,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.96](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
 ![tests](https://img.shields.io/badge/tests-186%20passing-brightgreen.svg)
-![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider%20%C2%B7%20cline%20%C2%B7%20cursor%20%C2%B7%20opencode-blueviolet.svg)
+![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider%20%C2%B7%20cline%20%C2%B7%20cursor%20%C2%B7%20opencode%20%C2%B7%20openhands-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
 
@@ -43,7 +43,7 @@ cargo build --release
 # directory becomes the workspace; SSH/AWS/GPG/kube/gcloud credentials are
 # invisible; network egress is allow-listed to the agent's own endpoints
 # plus package registries. Bundled: claude, codex, gemini, aider, cline,
-# cursor, opencode.
+# cursor, opencode, openhands.
 ql agent claude
 ql agent codex --broker --audit run.jsonl   # brokered egress + audit trail
 ql agent list                                # what's bundled
