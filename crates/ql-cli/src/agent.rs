@@ -175,12 +175,66 @@ fn launch(name: &str, rest: &[String]) -> ExitCode {
 
 /// Resolve a binary name against `PATH`. Returns the absolute path, so the
 /// command we register and audit is unambiguous.
+///
+/// Under `sudo`, `PATH` has already been sanitized by sudo's `secure_path`
+/// before `ql` starts, so a user-installed agent in `~/.local/bin` (where
+/// goose, openhands, aider, etc. land) is invisible on the inherited `PATH`.
+/// To avoid a spurious "not found on PATH" for agents that are in fact
+/// installed, we additionally search the *invoking* user's local bin dirs,
+/// resolved from `SUDO_USER`. This only augments the search — a binary found
+/// on the real `PATH` still wins first.
 fn which(binary: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // sudo fallback: check the invoking user's ~/.local/bin and ~/bin.
+    for dir in invoking_user_bin_dirs() {
         let candidate = dir.join(binary);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// The invoking user's local bin directories (`~/.local/bin`, `~/bin`) when
+/// running under `sudo`, resolved from `SUDO_USER` via the passwd database.
+/// Returns empty when not under sudo, when `SUDO_USER` is unset/root, or when
+/// the home directory cannot be resolved — a garbled environment must never
+/// select a surprising path.
+fn invoking_user_bin_dirs() -> Vec<std::path::PathBuf> {
+    let home = match sudo_user_home() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    vec![home.join(".local/bin"), home.join("bin")]
+}
+
+/// Resolve the invoking (`SUDO_USER`) user's home directory from the passwd
+/// database. Returns `None` unless `SUDO_USER` is set to a non-root user whose
+/// home resolves. Pure lookup, no side effects.
+fn sudo_user_home() -> Option<std::path::PathBuf> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    // Read the home field for this user from /etc/passwd. Avoids a libc dep and
+    // is sufficient for the local-account case sudo targets.
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        // passwd fields: name:passwd:uid:gid:gecos:home:shell
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first() == Some(&user.as_str()) {
+            let home = fields.get(5).copied().unwrap_or("");
+            if home.is_empty() {
+                return None;
+            }
+            return Some(std::path::PathBuf::from(home));
         }
     }
     None
@@ -266,5 +320,53 @@ mod tests {
             assert!(bundled(a.name).is_some());
         }
         assert!(bundled("no-such-agent").is_none());
+    }
+
+    /// The sudo PATH-fallback must not select a path when SUDO_USER is unset,
+    /// empty, or root — a garbled environment must never resolve a binary from
+    /// a surprising location. These manipulate process env, so they are
+    /// serialized behind a mutex and restore the prior value.
+    mod sudo_path_fallback {
+        use super::super::sudo_user_home;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        fn with_sudo_user<T>(val: Option<&str>, f: impl FnOnce() -> T) -> T {
+            let _g = ENV_LOCK.lock().unwrap();
+            let prev = std::env::var("SUDO_USER").ok();
+            match val {
+                Some(v) => std::env::set_var("SUDO_USER", v),
+                None => std::env::remove_var("SUDO_USER"),
+            }
+            let out = f();
+            match prev {
+                Some(p) => std::env::set_var("SUDO_USER", p),
+                None => std::env::remove_var("SUDO_USER"),
+            }
+            out
+        }
+
+        #[test]
+        fn unset_sudo_user_resolves_nothing() {
+            with_sudo_user(None, || assert!(sudo_user_home().is_none()));
+        }
+
+        #[test]
+        fn empty_sudo_user_resolves_nothing() {
+            with_sudo_user(Some(""), || assert!(sudo_user_home().is_none()));
+        }
+
+        #[test]
+        fn root_sudo_user_resolves_nothing() {
+            with_sudo_user(Some("root"), || assert!(sudo_user_home().is_none()));
+        }
+
+        #[test]
+        fn nonexistent_sudo_user_resolves_nothing() {
+            with_sudo_user(Some("definitely-not-a-real-user-x9z"), || {
+                assert!(sudo_user_home().is_none())
+            });
+        }
     }
 }
