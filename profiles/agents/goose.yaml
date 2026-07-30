@@ -1,0 +1,158 @@
+# QuantmLayer bundled profile: goose CLI (`goose`)
+#
+# FIELD-VALIDATED (2026-07-30, Ubuntu 24.04 x86_64, kernel 6.17 GCP,
+# exec tier1 BPF-LSM available) against **goose CLI 1.45.0** (Agentic AI
+# Foundation / Linux Foundation; originally Block), installed via the official
+# download script (binary at ~/.local/bin/goose):
+#   * Derived with `ql learn` from a real `goose run --no-session` task
+#     (create + read + shell), then confirmed with `ql run --observe --strict`.
+#   * goose's default tools are in-process builtins (developer/write/shell),
+#     so the core surface is small and content-verifiable: goose itself plus
+#     bash + coreutils it shells out to.
+#   * Enforced live: the task completed inside the cell; egress brokered
+#     per-domain to the model provider.
+#
+# NOT validated here: content-verified exec (`exec.enforce`) — see EXEC below.
+#
+# Curated for the goose CLI. Embedded into the `ql` binary; selected with
+# `ql agent goose` or `ql run --agent goose -- goose run ...`.
+#
+# SCOPE — READ THIS, it matters for goose specifically:
+# This profile covers goose and its BUILT-IN (in-process) tools: the developer
+# extension's shell, the write tool, and the other bundled platform extensions.
+# That surface is stable and content-verifiable.
+#
+# It does NOT attempt to cover EXTERNAL MCP extensions launched as subprocesses
+# (e.g. `goose run --with-extension "npx ... @modelcontextprotocol/server-*"`).
+# Those resolve and fetch at runtime: a single npx-launched MCP server pulls in
+# a node/npx subprocess tree and a dozen-plus network endpoints (npm registry +
+# CDNs) just to install itself, and the exact surface changes per extension.
+# Baking that into a shipped default would mean granting `node`, broad
+# `node_modules/**` exec, and npm CDN egress to every goose user by default —
+# the opposite of least privilege. So if you run external MCP extensions:
+#   1. `ql learn` a run WITH your specific extensions enabled, and use that
+#      derived profile, OR
+#   2. keep this profile and add the extension's exec paths + domains explicitly
+#      (the broker will show you exactly what it reaches).
+# Containment still holds either way — the cell contains the npx subprocess tree
+# and its egress — but the POLICY for a dynamic extension must be learned per
+# extension, not shipped as a blanket default. This is a real limitation of
+# profile learning against runtime-resolved subprocesses, stated plainly.
+#
+# Design notes:
+# * INSTALL PATH: the official installer puts goose at ~/.local/bin/goose.
+#   Verify against your host with `ql learn`; a package-manager install may
+#   differ.
+# * CONFIG + SECRETS: goose keeps config at ~/.config/goose/config.yaml and the
+#   provider API key at ~/.config/goose/secrets.yaml (0600, its own file — a
+#   cleaner design than agents that inline the key into world-readable config).
+#   The agent needs secrets.yaml to function, so it is granted read; that means
+#   the EGRESS wall, not the mount wall, is what stops the key leaving. Keep
+#   default_deny and prune allow_domains to your provider.
+# * STATE: sessions DB at ~/.local/share/goose/**, logs at
+#   ~/.local/state/goose/logs/**.
+# * MODEL-AGNOSTIC: goose supports many providers via config. The allow_domains
+#   below are a starting set — DELETE the providers you don't use. A narrower
+#   egress list is a stronger wall.
+# * No wall-clock limit: interactive sessions are long-lived. For headless/CI
+#   use, consider setting wall_clock_secs.
+
+schema_version: 1
+agent_type: coding
+
+filesystem:
+  readwrite:
+    - "/home/*/.config/goose/**"          # config.yaml + secrets.yaml (see notes)
+    - "/home/*/.local/share/goose/**"     # sessions DB
+    - "/home/*/.local/state/goose/**"     # logs
+    - "/tmp/**"
+    - "/dev/null"
+    - "/dev/urandom"
+    - "/dev/tty"
+  readonly:
+    - "/etc/**"
+    - "/usr/bin/**"
+    - "/usr/lib/**"
+    - "/usr/share/**"
+    - "/lib/**"
+    - "/proc/self/**"
+    - "/sys/devices/**"
+    - "/sys/fs/**"
+    - "/home/*/.local/bin/**"             # the goose binary
+    # goose works in the current directory as its workspace; broad home read,
+    # with credential paths denied below. Narrow if your workflow allows.
+    - "/home/*/**"
+  denied:                                  # invisible to the agent, not merely unwritable
+    - "/home/*/.ssh/**"
+    - "/root/.ssh/**"
+    - "/home/*/.aws/**"
+    - "/root/.aws/**"
+    - "/home/*/.gnupg/**"
+    - "/root/.gnupg/**"
+    - "/home/*/.kube/**"
+    - "/root/.kube/**"
+    - "/home/*/.config/gcloud/**"
+    - "/etc/shadow"
+    - "/var/run/docker.sock"              # escape to host root
+
+network:
+  default_deny: true
+  block_private_ranges: true   # blocks 169.254.169.254 cloud-metadata SSRF
+  allow_domains:
+    # --- hosted model providers (PRUNE to the one you use) ---
+    - "api.anthropic.com"         # Anthropic  (observed in validation)
+    - "api.openai.com"            # OpenAI
+    - "generativelanguage.googleapis.com"  # Google Gemini
+    - "api.x.ai"                  # xAI
+    - "openrouter.ai"             # OpenRouter (multi-provider gateway)
+    # goose update check / telemetry is deliberately NOT allow-listed.
+
+capabilities:
+  retain: []
+
+syscalls:
+  default_action: allow
+  deny:
+    - ptrace
+    - mount
+    - umount2
+    - unshare
+    - pivot_root
+    - process_vm_readv
+    - process_vm_writev
+    - bpf
+    - kexec_load
+    - init_module
+    - finit_module
+    - delete_module
+  notify: []
+
+resources:
+  memory_max_bytes: 4294967296   # 4 GiB
+  cpu_max_percent: null
+  pids_max: 512                  # observed ~160 for the core; headroom for builtins
+  wall_clock_secs: null
+
+processes:
+  allow_exec:
+    - /bin/bash
+    - /bin/sh
+    - /usr/bin/bash
+    - /usr/bin/sh
+    - /usr/bin/cat
+    - /usr/bin/ls
+    - /usr/bin/env
+    - /usr/bin/python3
+    # the goose binary itself
+    - /home/*/.local/bin/goose
+
+# EXEC — content-verified execution is OFF in this bundled profile, on purpose.
+# allow_digests are SHA-256 hashes of binaries on ONE host; meaningless on
+# yours. To pin by content on your machine:
+#   ql learn --out goose.yaml -- goose run --no-session -t "<a real task>"
+#   # then set exec.enforce: true in the generated profile
+#   ql run --profile goose.yaml -- goose run --no-session -t "<same task>"
+# `ql run` prints a notice on any run where exec is not content-verified.
+exec:
+  enforce: false
+  allow_digests: []

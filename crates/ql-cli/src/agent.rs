@@ -80,6 +80,12 @@ pub const AGENTS: &[BundledAgent] = &[
         description: "OpenHands CLI (All Hands AI; pip/pipx/uv install, model-agnostic)",
         yaml: include_str!("../../../profiles/agents/openhands.yaml"),
     },
+    BundledAgent {
+        name: "goose",
+        binary: "goose",
+        description: "goose CLI (Agentic AI Foundation; MCP-native, model-agnostic)",
+        yaml: include_str!("../../../profiles/agents/goose.yaml"),
+    },
 ];
 
 /// Look up a bundled agent by name.
