@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "ql-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "ql-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix 0.27.1",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "ql-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ql-audit",
  "ql-profile",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "ql-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "ql-audit",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "ql-enforce"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix 0.27.1",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "ql-learn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix 0.27.1",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "ql-profile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "ql-risk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "ql-token"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-compact",
  "getrandom 0.2.17",
