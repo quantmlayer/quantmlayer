@@ -23,6 +23,7 @@ use std::time::Duration;
 /// Serve the broker on `listener` forever, applying `policy` to each request.
 /// Each connection is handled on its own thread.
 pub fn serve(listener: TcpListener, policy: Arc<BrokerPolicy>) -> io::Result<()> {
+    let mut last_fd_warn = std::time::Instant::now() - Duration::from_secs(60);
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -32,10 +33,30 @@ pub fn serve(listener: TcpListener, policy: Arc<BrokerPolicy>) -> io::Result<()>
                     let _ = handle_connection(stream, &policy);
                 });
             }
+            Err(e) if fd_exhaustion(&e) => {
+                // Hot-looping accept while out of fds burns CPU and floods
+                // stderr; back off briefly so in-flight tunnels can close and
+                // return fds, and warn at most once per second.
+                if last_fd_warn.elapsed() >= Duration::from_secs(1) {
+                    eprintln!(
+                        "ql-broker: out of file descriptors ({e}); backing off — \
+                         raise `ulimit -n` if this persists"
+                    );
+                    last_fd_warn = std::time::Instant::now();
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(e) => eprintln!("ql-broker: accept error: {e}"),
         }
     }
     Ok(())
+}
+
+/// Is this accept error fd exhaustion? EMFILE (24, per-process) or ENFILE
+/// (23, system-wide) on Linux. Raw numbers rather than libc constants — this
+/// crate is `#![forbid(unsafe_code)]` and deliberately carries no libc dep.
+fn fd_exhaustion(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(24) | Some(23))
 }
 
 /// Handle one proxied connection: parse the request, apply policy, and either
@@ -90,14 +111,20 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
     // A denied host never triggers a DNS lookup, and the decision is audited.
     let now = ql_audit::AuditLog::now_millis();
     if let Decision::Deny(reason) = policy.authorize_connect(&host, port, auth.as_deref(), now) {
+        policy.report_final(&host, port, &Decision::Deny(reason));
         log_decision(&host, port, "DENY (authorization)");
         return write_status(&mut client, 403, "Forbidden", reason);
     }
 
     // Resolve, then apply the private-range check against every resolved IP.
+    // The authorization allow above is provisional: the final decision — the
+    // one that is audited and streamed — is reported only after resolution
+    // and the resolved-IP policy have had their say.
     let resolved: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
         Ok(addrs) => addrs.collect(),
         Err(_) => {
+            let d = Decision::Deny("host did not resolve");
+            policy.report_final(&host, port, &d);
             log_decision(&host, port, "DENY (unresolved)");
             return write_status(&mut client, 502, "Bad Gateway", "could not resolve host");
         }
@@ -106,10 +133,12 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
 
     match policy.evaluate(&host, &ips) {
         Decision::Deny(reason) => {
+            policy.report_final(&host, port, &Decision::Deny(reason));
             log_decision(&host, port, "DENY (policy)");
             write_status(&mut client, 403, "Forbidden", reason)
         }
         Decision::Allow => {
+            policy.report_final(&host, port, &Decision::Allow);
             // The policy has already vetted every resolved IP (when
             // block_private_ranges is on, evaluate() guaranteed none are
             // blocked; when off, the operator opted into them). Connect to the

@@ -27,6 +27,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Deny reason for a canary (honeytoken) trip. Named so [`BrokerPolicy::report_final`]
+/// can recognize it and preserve the distinct `canary.triggered` audit event
+/// instead of adding a generic egress deny record.
+pub const CANARY_DENY_REASON: &str = "canary destination (exfiltration attempt blocked)";
+
 /// The outcome of evaluating a destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -217,14 +222,10 @@ impl BrokerPolicy {
         // ordinary `egress.connect` logging below.
         if self.is_canary(host) {
             self.record_canary(host, port);
-            let d = Decision::Deny("canary destination (exfiltration attempt blocked)");
-            if let Some(hook) = &self.decision_hook {
-                hook.call(host, port, &d);
-            }
-            return d;
+            return Decision::Deny(CANARY_DENY_REASON);
         }
 
-        let decision = if self.token_gated() {
+        if self.token_gated() {
             match auth {
                 None => Decision::Deny("missing authorization token"),
                 Some(blob) => match AuthzRequest::from_hex(blob) {
@@ -244,27 +245,41 @@ impl BrokerPolicy {
             Decision::Allow
         } else {
             Decision::Deny("host not in allow-list")
-        };
+        }
+    }
 
-        if let Some(sink) = &self.audit {
-            let (dec, detail) = match &decision {
-                Decision::Allow => (AuditDecision::Allow, String::new()),
-                Decision::Deny(r) => (AuditDecision::Deny, r.to_string()),
-            };
-            sink.record(AuditEvent {
-                ts_millis: AuditLog::now_millis(),
-                actor: "broker".into(),
-                action: "egress.connect".into(),
-                target: format!("{host}:{port}"),
-                decision: dec,
-                detail,
-                system: self.system.clone(),
-            });
+    /// Record the FINAL decision for one CONNECT: exactly one audit record and
+    /// one decision-hook fire per connection. The proxy calls this once, after
+    /// every check that can change the outcome has run — authorization, DNS
+    /// resolution, and the resolved-IP policy ([`Self::evaluate`], the
+    /// DNS-rebinding defense). Reporting from any earlier point can record an
+    /// allow for a connection a later check denies.
+    ///
+    /// A canary trip keeps its distinct `canary.triggered` audit event
+    /// (recorded when tripped) instead of gaining a generic egress record, but
+    /// still reaches the decision hook like every other final decision.
+    pub fn report_final(&self, host: &str, port: u16, decision: &Decision) {
+        let is_canary_trip = matches!(decision, Decision::Deny(r) if *r == CANARY_DENY_REASON);
+        if !is_canary_trip {
+            if let Some(sink) = &self.audit {
+                let (dec, detail) = match decision {
+                    Decision::Allow => (AuditDecision::Allow, String::new()),
+                    Decision::Deny(r) => (AuditDecision::Deny, r.to_string()),
+                };
+                sink.record(AuditEvent {
+                    ts_millis: AuditLog::now_millis(),
+                    actor: "broker".into(),
+                    action: "egress.connect".into(),
+                    target: format!("{host}:{port}"),
+                    decision: dec,
+                    detail,
+                    system: self.system.clone(),
+                });
+            }
         }
         if let Some(hook) = &self.decision_hook {
-            hook.call(host, port, &decision);
+            hook.call(host, port, decision);
         }
-        decision
     }
 
     /// Per-leaf anti-replay gate. The signed action commits to its leaf token,
@@ -491,18 +506,25 @@ mod tests {
                 sink.lock().unwrap().push((h.to_string(), p, d.clone()));
             }));
 
+        // authorize_connect alone reports NOTHING — it is a provisional check.
+        // (Regression: reporting from here once recorded an "allow" for
+        // connections a later resolved-IP check denied.)
         assert_eq!(
             policy.authorize_connect("pypi.org", 443, None, 0),
             Decision::Allow
         );
-        assert_eq!(
-            policy.authorize_connect("pastebin.com", 443, None, 0),
-            Decision::Deny("host not in allow-list")
-        );
-        assert_eq!(
-            policy.authorize_connect("canary.example", 443, None, 0),
-            Decision::Deny("canary destination (exfiltration attempt blocked)")
-        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        // The proxy contract: exactly one report_final per connection, at the
+        // true final decision — including an evaluate() (rebinding) denial
+        // AFTER a provisional authorization allow.
+        policy.report_final("pypi.org", 443, &Decision::Allow);
+        let d = policy.authorize_connect("pastebin.com", 443, None, 0);
+        assert_eq!(d, Decision::Deny("host not in allow-list"));
+        policy.report_final("pastebin.com", 443, &d);
+        let c = policy.authorize_connect("canary.example", 443, None, 0);
+        assert_eq!(c, Decision::Deny(CANARY_DENY_REASON));
+        policy.report_final("canary.example", 443, &c);
 
         let got = seen.lock().unwrap();
         assert_eq!(got.len(), 3);
@@ -834,8 +856,10 @@ mod token_gating_tests {
             .with_system(SystemIdentity::ai_system("coding-agent-prod", None));
 
         let blob = authz(&root, &agent, "pypi.org", "pypi.org");
-        let _ = p.authorize_connect("pypi.org", 443, Some(&blob), 0); // allow
-        let _ = p.authorize_connect("evil.com", 443, None, 0); // deny
+        let a = p.authorize_connect("pypi.org", 443, Some(&blob), 0); // allow
+        p.report_final("pypi.org", 443, &a);
+        let d = p.authorize_connect("evil.com", 443, None, 0); // deny
+        p.report_final("evil.com", 443, &d);
 
         let text = std::fs::read_to_string(&log).unwrap();
         let parsed = AuditLog::from_jsonl(&text).unwrap();

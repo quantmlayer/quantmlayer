@@ -137,6 +137,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
         );
     }
 
+    // Same fd-limit raise as brokered runs: package managers exhaust the
+    // default soft nofile limit; see rlimit.rs.
+    crate::rlimit::raise_nofile_soft_to_hard();
     if let Err(e) = serve(listener, policy) {
         eprintln!("ql broker: server error: {e}");
         return ExitCode::from(1);

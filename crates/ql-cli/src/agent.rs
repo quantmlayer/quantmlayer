@@ -218,7 +218,7 @@ fn invoking_user_bin_dirs() -> Vec<std::path::PathBuf> {
 /// Resolve the invoking (`SUDO_USER`) user's home directory from the passwd
 /// database. Returns `None` unless `SUDO_USER` is set to a non-root user whose
 /// home resolves. Pure lookup, no side effects.
-fn sudo_user_home() -> Option<std::path::PathBuf> {
+pub(crate) fn sudo_user_home() -> Option<std::path::PathBuf> {
     let user = std::env::var("SUDO_USER").ok()?;
     if user.is_empty() || user == "root" {
         return None;

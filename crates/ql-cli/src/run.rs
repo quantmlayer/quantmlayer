@@ -35,6 +35,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut workspace: Option<String> = None;
     let mut audit_path: Option<String> = None;
     let mut verdicts_path: Option<String> = None;
+    let mut prune_provider = false;
     let mut proposed_path: Option<String> = None;
     let mut issue_token_path: Option<String> = None;
     let mut system_id: Option<String> = None;
@@ -63,6 +64,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
             "--verdicts" => verdicts_path = it.next().cloned(),
+            "--prune-provider" => prune_provider = true,
             "--proposed" => proposed_path = it.next().cloned(),
             "--issue-token" => issue_token_path = it.next().cloned(),
             "--system-id" => system_id = it.next().cloned(),
@@ -175,6 +177,29 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
         Ok(None) => {}
         Err(code) => return code,
+    }
+
+    // --prune-provider: narrow the egress allow-list to the model provider
+    // the agent's own config names. Runs AFTER the signature gate (it is a
+    // runtime mutation, like --workspace) and can only ever remove domains —
+    // see prune.rs for why that makes an agent-writable config safe here.
+    if prune_provider {
+        let cfg = crate::prune::goose_config_path(crate::agent::sudo_user_home());
+        match cfg {
+            None => eprintln!("ql: --prune-provider: no home directory resolved; profile unchanged"),
+            Some(cfg) => match crate::prune::prune_provider_domains(&mut profile, &cfg) {
+                crate::prune::PruneOutcome::Pruned { kept, removed } => eprintln!(
+                    "ql: egress pruned to configured provider {kept} ({removed} provider domain(s) removed)"
+                ),
+                crate::prune::PruneOutcome::NoConfig => eprintln!(
+                    "ql: --prune-provider: no goose config found at {}; profile unchanged",
+                    cfg.display()
+                ),
+                crate::prune::PruneOutcome::UnknownProvider(name) => eprintln!(
+                    "ql: --prune-provider: provider `{name}` not in the built-in table; profile unchanged"
+                ),
+            },
+        }
     }
 
     // If a workspace is given, grant read-write to it.
@@ -629,6 +654,14 @@ fn run_brokered(
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
     let plan = VethPlan::for_seed(seed);
+
+    // Package managers open hundreds of parallel connections and each broker
+    // tunnel holds several fds; the default soft nofile limit exhausts under a
+    // real `npm install` (field-observed: EMFILE storms and spurious
+    // resolution failures). Raise soft to hard for this process before the
+    // broker starts. The broker itself is #![forbid(unsafe_code)], so the
+    // process-level rlimit call lives here with the process owner.
+    crate::rlimit::raise_nofile_soft_to_hard();
 
     // Start the broker on an ephemeral port (all interfaces, so it is reachable
     // at the veth host IP once that link comes up).
