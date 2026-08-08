@@ -127,6 +127,37 @@ first break in `error`.
 { "schema": "ql.audit.verify/v1", "file": "session.jsonl", "ok": true, "records": 120, "error": null }
 ```
 
+## `ql run ... --verdicts <path.jsonl>` — verdict stream `v1`
+
+A real-time, append-only JSONL stream of containment decisions: one complete
+JSON line per decision, flushed per line so `tail -f` never sees a torn
+record. Egress decisions stream live from the broker; exec-wall decisions are
+appended when the kernel/supervisor event queue is drained at end of run.
+
+This stream is deliberately **not** the hash-chained audit log: it trades
+tamper-evidence for real-time availability. Use `--audit` for the
+tamper-evident record; the two can be requested together.
+
+```json
+{"v":1,"ts_millis":1723118400123,"source":"egress","decision":"deny","target":"pastebin.com:443","rule":"host not in allow-list","hint":"add the domain to network.allow_domains in the profile if this is legitimate"}
+{"v":1,"ts_millis":1723118400456,"source":"egress","decision":"allow","target":"pypi.org:443","rule":"allowed","hint":""}
+{"v":1,"ts_millis":1723118401000,"source":"exec","decision":"deny","target":"9f2c…","rule":"binary not on the approved digest list","hint":"run `ql learn` on this host to measure the binary and add its digest"}
+```
+
+- `source` — `egress` (broker) or `exec` (content-verified exec wall, tier 1
+  or tier 2).
+- `decision` — `allow` or `deny`.
+- `target` — the destination `host:port` or the binary's content digest.
+  Recorded verbatim as data.
+- `rule` / `hint` — always chosen from a fixed table of compile-time
+  constants. Guidance text is never synthesized from agent-controlled input,
+  so a consumer may safely surface hints to an agent as observations.
+- Filesystem (mount-wall) and seccomp denials do not appear: those walls deny
+  in-kernel without a userspace event. Their effects are visible to the agent
+  as ENOENT/EPERM, not to this stream.
+
+Within `v:1`, fields are only added, never renamed or removed.
+
 ## `ql doctor --json`
 
 Pre-existing: host capability report (walls, exec tiers, kernel). Its layout

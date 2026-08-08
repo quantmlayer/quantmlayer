@@ -36,6 +36,41 @@ pub enum Decision {
     Deny(&'static str),
 }
 
+/// An optional observer invoked on every egress decision, in real time, in
+/// addition to (never instead of) the tamper-evident audit sink. This is the
+/// hook the `ql run --verdicts` stream attaches to. The hook receives the
+/// destination and the [`Decision`] — including the deny reason, which is a
+/// compile-time `&'static str` by construction, so nothing derived from agent
+/// input can flow through it. Wrapped in a newtype so [`BrokerPolicy`] keeps
+/// its `Debug`/`Clone` derives.
+pub struct DecisionHook(Arc<DecisionFn>);
+
+/// The callback shape a [`DecisionHook`] wraps: `(host, port, decision)`.
+type DecisionFn = dyn Fn(&str, u16, &Decision) + Send + Sync;
+
+impl DecisionHook {
+    /// Wrap a callback as a decision hook.
+    pub fn new(f: impl Fn(&str, u16, &Decision) + Send + Sync + 'static) -> Self {
+        DecisionHook(Arc::new(f))
+    }
+
+    fn call(&self, host: &str, port: u16, decision: &Decision) {
+        (self.0)(host, port, decision);
+    }
+}
+
+impl Clone for DecisionHook {
+    fn clone(&self) -> Self {
+        DecisionHook(Arc::clone(&self.0))
+    }
+}
+
+impl std::fmt::Debug for DecisionHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecisionHook")
+    }
+}
+
 /// A serialized, tamper-evident sink for egress decisions. Appends are
 /// serialized through a mutex so concurrent connections cannot corrupt the
 /// hash chain.
@@ -94,6 +129,10 @@ pub struct BrokerPolicy {
     canary_destinations: Vec<String>,
     /// Optional label for the planted canary, recorded in the trip's audit detail.
     canary_id: Option<String>,
+    /// Optional real-time observer of every egress decision (the `--verdicts`
+    /// stream). Fires alongside the audit sink, never instead of it, and never
+    /// influences the decision.
+    decision_hook: Option<DecisionHook>,
 }
 
 impl BrokerPolicy {
@@ -109,6 +148,7 @@ impl BrokerPolicy {
             nonce_store: Arc::new(NonceStore::new()),
             canary_destinations: Vec::new(),
             canary_id: None,
+            decision_hook: None,
         }
     }
 
@@ -123,6 +163,14 @@ impl BrokerPolicy {
     /// Record every egress decision to a tamper-evident audit log.
     pub fn with_audit(mut self, sink: Arc<AuditSink>) -> Self {
         self.audit = Some(sink);
+        self
+    }
+
+    /// Observe every egress decision in real time (the `--verdicts` stream).
+    /// The hook is a pure observer: it runs after the decision is made and
+    /// cannot change it.
+    pub fn with_decision_hook(mut self, hook: DecisionHook) -> Self {
+        self.decision_hook = Some(hook);
         self
     }
 
@@ -169,7 +217,11 @@ impl BrokerPolicy {
         // ordinary `egress.connect` logging below.
         if self.is_canary(host) {
             self.record_canary(host, port);
-            return Decision::Deny("canary destination (exfiltration attempt blocked)");
+            let d = Decision::Deny("canary destination (exfiltration attempt blocked)");
+            if let Some(hook) = &self.decision_hook {
+                hook.call(host, port, &d);
+            }
+            return d;
         }
 
         let decision = if self.token_gated() {
@@ -208,6 +260,9 @@ impl BrokerPolicy {
                 detail,
                 system: self.system.clone(),
             });
+        }
+        if let Some(hook) = &self.decision_hook {
+            hook.call(host, port, &decision);
         }
         decision
     }
@@ -409,11 +464,65 @@ mod tests {
             nonce_store: Arc::new(NonceStore::new()),
             canary_destinations: vec![],
             canary_id: None,
+            decision_hook: None,
         };
         assert!(p.host_allowed("pypi.org"));
         assert!(p.host_allowed("files.pypi.org"));
         assert!(!p.host_allowed("evil.com"));
         assert!(!p.host_allowed("notpypi.org")); // no false suffix match
+    }
+
+    /// The decision hook observes every authorize_connect outcome — allow and
+    /// deny, including the canary early-return — with the static rule string,
+    /// and observing never changes the decision itself.
+    #[test]
+    fn decision_hook_sees_every_decision_without_changing_it() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<(String, u16, Decision)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let np = NetPolicy {
+            default_deny: true,
+            allow_domains: vec!["pypi.org".into()],
+            block_private_ranges: true,
+        };
+        let policy = BrokerPolicy::from_net_policy(&np)
+            .with_canaries(vec!["canary.example".into()], None)
+            .with_decision_hook(DecisionHook::new(move |h, p, d| {
+                sink.lock().unwrap().push((h.to_string(), p, d.clone()));
+            }));
+
+        assert_eq!(
+            policy.authorize_connect("pypi.org", 443, None, 0),
+            Decision::Allow
+        );
+        assert_eq!(
+            policy.authorize_connect("pastebin.com", 443, None, 0),
+            Decision::Deny("host not in allow-list")
+        );
+        assert_eq!(
+            policy.authorize_connect("canary.example", 443, None, 0),
+            Decision::Deny("canary destination (exfiltration attempt blocked)")
+        );
+
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], ("pypi.org".into(), 443, Decision::Allow));
+        assert_eq!(
+            got[1],
+            (
+                "pastebin.com".into(),
+                443,
+                Decision::Deny("host not in allow-list")
+            )
+        );
+        assert_eq!(
+            got[2],
+            (
+                "canary.example".into(),
+                443,
+                Decision::Deny("canary destination (exfiltration attempt blocked)")
+            )
+        );
     }
 
     #[test]
@@ -428,6 +537,7 @@ mod tests {
             nonce_store: Arc::new(NonceStore::new()),
             canary_destinations: vec![],
             canary_id: None,
+            decision_hook: None,
         };
         // Allowed host, public IP → allow.
         assert_eq!(
@@ -532,6 +642,7 @@ mod token_gating_tests {
             nonce_store: Arc::new(NonceStore::new()),
             canary_destinations: vec![],
             canary_id: None,
+            decision_hook: None,
         }
     }
 

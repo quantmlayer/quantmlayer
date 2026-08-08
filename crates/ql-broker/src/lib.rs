@@ -33,5 +33,5 @@ mod nonce;
 mod policy;
 mod proxy;
 
-pub use policy::{is_blocked_ip, AuditSink, BrokerPolicy, Decision};
+pub use policy::{is_blocked_ip, AuditSink, BrokerPolicy, Decision, DecisionHook};
 pub use proxy::{handle_connection, serve};

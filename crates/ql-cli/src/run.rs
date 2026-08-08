@@ -34,6 +34,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut mcp = false;
     let mut workspace: Option<String> = None;
     let mut audit_path: Option<String> = None;
+    let mut verdicts_path: Option<String> = None;
     let mut proposed_path: Option<String> = None;
     let mut issue_token_path: Option<String> = None;
     let mut system_id: Option<String> = None;
@@ -61,6 +62,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--result-json" => result_json = it.next().cloned(),
             "--workspace" => workspace = it.next().cloned(),
             "--audit" => audit_path = it.next().cloned(),
+            "--verdicts" => verdicts_path = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
             "--issue-token" => issue_token_path = it.next().cloned(),
             "--system-id" => system_id = it.next().cloned(),
@@ -308,6 +310,24 @@ pub fn cmd(args: &[String]) -> ExitCode {
         write_exec_tier_record(audit, tier, system.as_ref());
     }
 
+    // Real-time verdicts stream (--verdicts). Created before the cell starts
+    // so a tail -f reader is attached from the first decision. Failure to
+    // create it refuses the run: the operator asked for the stream, so
+    // silently running without it would misreport what happened.
+    let verdicts = match verdicts_path.as_deref() {
+        None => None,
+        Some(p) => match crate::verdicts::VerdictWriter::create(p) {
+            Ok(w) => {
+                eprintln!("ql: streaming verdicts to {p}");
+                Some(std::sync::Arc::new(w))
+            }
+            Err(e) => {
+                eprintln!("ql run: cannot create verdicts file {p}: {e}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+
     let code = if brokered {
         run_brokered(
             profile,
@@ -317,6 +337,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             system.as_ref(),
             tier,
             result_json.as_deref(),
+            verdicts.clone(),
         )
     } else {
         run_default(
@@ -327,6 +348,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             system.as_ref(),
             tier,
             result_json.as_deref(),
+            verdicts.clone(),
         )
     };
     crate::registry::deregister(&id);
@@ -526,6 +548,7 @@ fn check_approved_for(
 }
 
 /// Standard run: full containment with default-deny network.
+#[allow(clippy::too_many_arguments)]
 fn run_default(
     profile: Profile,
     command: &[String],
@@ -534,6 +557,7 @@ fn run_default(
     system: Option<&SystemIdentity>,
     tier: ExecTier,
     result_json: Option<&str>,
+    verdicts: Option<std::sync::Arc<crate::verdicts::VerdictWriter>>,
 ) -> ExitCode {
     if verbose {
         eprintln!(
@@ -556,8 +580,8 @@ fn run_default(
         }
     };
     let result = cell.run(command);
-    write_exec_events(audit_path, system);
-    write_tier2_exec_events(audit_path, system);
+    write_exec_events(audit_path, system, verdicts.as_deref());
+    write_tier2_exec_events(audit_path, system, verdicts.as_deref());
     match result {
         Ok(code) => {
             if let Some(path) = result_json {
@@ -578,6 +602,7 @@ fn run_default(
 /// Brokered run: containment plus allow-listed egress through the broker. The
 /// agent's only network route is a veth uplink to the broker, which enforces
 /// the profile's domain allow-list and refuses private/link-local addresses.
+#[allow(clippy::too_many_arguments)]
 fn run_brokered(
     profile: Profile,
     command: &[String],
@@ -586,6 +611,7 @@ fn run_brokered(
     system: Option<&SystemIdentity>,
     tier: ExecTier,
     result_json: Option<&str>,
+    verdicts: Option<std::sync::Arc<crate::verdicts::VerdictWriter>>,
 ) -> ExitCode {
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
@@ -618,6 +644,19 @@ fn run_brokered(
         }
         eprintln!("ql: auditing brokered egress to {path}");
     }
+    // Attach the --verdicts stream as a pure observer of every egress
+    // decision. The rule strings the hook receives are compile-time constants
+    // (see ql_broker::Decision::Deny), which is what keeps the verdict hints
+    // free of agent-influenced text.
+    if let Some(vw) = verdicts.clone() {
+        policy =
+            policy.with_decision_hook(ql_broker::DecisionHook::new(move |host, port, decision| {
+                match decision {
+                    ql_broker::Decision::Allow => vw.egress(host, port, true, "allowed"),
+                    ql_broker::Decision::Deny(r) => vw.egress(host, port, false, r),
+                }
+            }));
+    }
     let policy = Arc::new(policy);
     std::thread::spawn(move || {
         let _ = serve(listener, policy);
@@ -649,8 +688,8 @@ fn run_brokered(
     };
 
     let result = cell.run(command);
-    write_exec_events(audit_path, system);
-    write_tier2_exec_events(audit_path, system);
+    write_exec_events(audit_path, system, verdicts.as_deref());
+    write_tier2_exec_events(audit_path, system, verdicts.as_deref());
     // Always tear the veth down, success or failure.
     veth::teardown(&plan);
 
@@ -677,12 +716,24 @@ fn run_brokered(
 /// onto the policy and egress records. No-op without the `lsm` feature, when no
 /// wall was active, or when no audit log is set.
 #[cfg(feature = "lsm")]
-fn write_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) {
+fn write_exec_events(
+    audit_path: Option<&str>,
+    system: Option<&SystemIdentity>,
+    verdicts: Option<&crate::verdicts::VerdictWriter>,
+) {
     use ql_audit::{AuditEvent, AuditLog, Decision};
 
+    // Drained exactly once; fanned out to the verdicts stream and the audit
+    // chain from the same vec (draining twice would lose events).
     let events = ql_enforce::drain_exec_events();
     if events.is_empty() {
         return;
+    }
+    if let Some(vw) = verdicts {
+        for ev in &events {
+            let target = ev.digest_hex.as_deref().unwrap_or("<unhashed>");
+            vw.exec(ev.ts_millis, target, ev.allowed);
+        }
     }
     let Some(path) = audit_path else {
         return;
@@ -735,7 +786,12 @@ fn write_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) 
 }
 
 #[cfg(not(feature = "lsm"))]
-fn write_exec_events(_audit_path: Option<&str>, _system: Option<&SystemIdentity>) {}
+fn write_exec_events(
+    _audit_path: Option<&str>,
+    _system: Option<&SystemIdentity>,
+    _verdicts: Option<&crate::verdicts::VerdictWriter>,
+) {
+}
 
 /// Convert one Tier-2 (seccomp-notify) exec record into an attributed audit
 /// event. The tier is carried in `detail` — the audit schema has no dedicated
@@ -799,12 +855,24 @@ fn tier2_kill_audit_event(
 /// ledger. Unlike the Tier-1 path this needs no `lsm` feature. No-op when no
 /// Tier-2 wall was active (the common case until tier selection routes to it)
 /// or when no audit log is set.
-fn write_tier2_exec_events(audit_path: Option<&str>, system: Option<&SystemIdentity>) {
+fn write_tier2_exec_events(
+    audit_path: Option<&str>,
+    system: Option<&SystemIdentity>,
+    verdicts: Option<&crate::verdicts::VerdictWriter>,
+) {
     use ql_audit::AuditLog;
 
+    // Drained exactly once; fanned out to the verdicts stream and the audit
+    // chain from the same vec (draining twice would lose events).
     let events = ql_enforce::drain_tier2_exec_events();
     if events.is_empty() {
         return;
+    }
+    if let Some(vw) = verdicts {
+        for rec in &events {
+            let target = rec.digest_hex.as_deref().unwrap_or("<unhashed>");
+            vw.exec(rec.ts_millis, target, rec.allowed);
+        }
     }
     let Some(path) = audit_path else {
         return;
