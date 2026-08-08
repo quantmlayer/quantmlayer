@@ -328,6 +328,11 @@ pub fn cmd(args: &[String]) -> ExitCode {
         },
     };
 
+    // End-of-run summary collector. Fed by the broker's decision hook and
+    // the exec-event drain; rendered after the cell exits. See summary.rs
+    // for what deliberately does and does not appear.
+    let summary = std::sync::Arc::new(crate::summary::RunSummary::default());
+
     let code = if brokered {
         run_brokered(
             profile,
@@ -338,6 +343,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             tier,
             result_json.as_deref(),
             verdicts.clone(),
+            summary.clone(),
         )
     } else {
         run_default(
@@ -349,8 +355,13 @@ pub fn cmd(args: &[String]) -> ExitCode {
             tier,
             result_json.as_deref(),
             verdicts.clone(),
+            summary.clone(),
         )
     };
+
+    if let Some(text) = summary.render(audit_path.as_deref()) {
+        eprintln!("{text}");
+    }
     crate::registry::deregister(&id);
     code
 }
@@ -558,6 +569,7 @@ fn run_default(
     tier: ExecTier,
     result_json: Option<&str>,
     verdicts: Option<std::sync::Arc<crate::verdicts::VerdictWriter>>,
+    summary: std::sync::Arc<crate::summary::RunSummary>,
 ) -> ExitCode {
     if verbose {
         eprintln!(
@@ -580,8 +592,8 @@ fn run_default(
         }
     };
     let result = cell.run(command);
-    write_exec_events(audit_path, system, verdicts.as_deref());
-    write_tier2_exec_events(audit_path, system, verdicts.as_deref());
+    write_exec_events(audit_path, system, verdicts.as_deref(), &summary);
+    write_tier2_exec_events(audit_path, system, verdicts.as_deref(), &summary);
     match result {
         Ok(code) => {
             if let Some(path) = result_json {
@@ -612,6 +624,7 @@ fn run_brokered(
     tier: ExecTier,
     result_json: Option<&str>,
     verdicts: Option<std::sync::Arc<crate::verdicts::VerdictWriter>>,
+    summary: std::sync::Arc<crate::summary::RunSummary>,
 ) -> ExitCode {
     // Plan a unique point-to-point subnet/link for this run.
     let seed = std::process::id() ^ (nanos() as u32);
@@ -644,16 +657,23 @@ fn run_brokered(
         }
         eprintln!("ql: auditing brokered egress to {path}");
     }
-    // Attach the --verdicts stream as a pure observer of every egress
-    // decision. The rule strings the hook receives are compile-time constants
-    // (see ql_broker::Decision::Deny), which is what keeps the verdict hints
-    // free of agent-influenced text.
-    if let Some(vw) = verdicts.clone() {
+    // One composed observer of every egress decision: the run summary always,
+    // plus the --verdicts stream when requested. The broker exposes a single
+    // hook slot, so composition happens here. The rule strings the hook
+    // receives are compile-time constants (see ql_broker::Decision::Deny),
+    // which is what keeps the verdict hints free of agent-influenced text.
+    {
+        let vw = verdicts.clone();
+        let sm = summary.clone();
         policy =
             policy.with_decision_hook(ql_broker::DecisionHook::new(move |host, port, decision| {
-                match decision {
-                    ql_broker::Decision::Allow => vw.egress(host, port, true, "allowed"),
-                    ql_broker::Decision::Deny(r) => vw.egress(host, port, false, r),
+                let (allowed, rule) = match decision {
+                    ql_broker::Decision::Allow => (true, "allowed"),
+                    ql_broker::Decision::Deny(r) => (false, *r),
+                };
+                sm.note_egress(host, port, allowed);
+                if let Some(vw) = &vw {
+                    vw.egress(host, port, allowed, rule);
                 }
             }));
     }
@@ -688,8 +708,8 @@ fn run_brokered(
     };
 
     let result = cell.run(command);
-    write_exec_events(audit_path, system, verdicts.as_deref());
-    write_tier2_exec_events(audit_path, system, verdicts.as_deref());
+    write_exec_events(audit_path, system, verdicts.as_deref(), &summary);
+    write_tier2_exec_events(audit_path, system, verdicts.as_deref(), &summary);
     // Always tear the veth down, success or failure.
     veth::teardown(&plan);
 
@@ -720,6 +740,7 @@ fn write_exec_events(
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
     verdicts: Option<&crate::verdicts::VerdictWriter>,
+    summary: &crate::summary::RunSummary,
 ) {
     use ql_audit::{AuditEvent, AuditLog, Decision};
 
@@ -729,9 +750,10 @@ fn write_exec_events(
     if events.is_empty() {
         return;
     }
-    if let Some(vw) = verdicts {
-        for ev in &events {
-            let target = ev.digest_hex.as_deref().unwrap_or("<unhashed>");
+    for ev in &events {
+        let target = ev.digest_hex.as_deref().unwrap_or("<unhashed>");
+        summary.note_exec(target, ev.allowed);
+        if let Some(vw) = verdicts {
             vw.exec(ev.ts_millis, target, ev.allowed);
         }
     }
@@ -790,6 +812,7 @@ fn write_exec_events(
     _audit_path: Option<&str>,
     _system: Option<&SystemIdentity>,
     _verdicts: Option<&crate::verdicts::VerdictWriter>,
+    _summary: &crate::summary::RunSummary,
 ) {
 }
 
@@ -859,6 +882,7 @@ fn write_tier2_exec_events(
     audit_path: Option<&str>,
     system: Option<&SystemIdentity>,
     verdicts: Option<&crate::verdicts::VerdictWriter>,
+    summary: &crate::summary::RunSummary,
 ) {
     use ql_audit::AuditLog;
 
@@ -868,9 +892,10 @@ fn write_tier2_exec_events(
     if events.is_empty() {
         return;
     }
-    if let Some(vw) = verdicts {
-        for rec in &events {
-            let target = rec.digest_hex.as_deref().unwrap_or("<unhashed>");
+    for rec in &events {
+        let target = rec.digest_hex.as_deref().unwrap_or("<unhashed>");
+        summary.note_exec(target, rec.allowed);
+        if let Some(vw) = verdicts {
             vw.exec(rec.ts_millis, target, rec.allowed);
         }
     }

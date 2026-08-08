@@ -29,6 +29,7 @@ mod profile;
 mod registry;
 mod result;
 mod run;
+mod summary;
 mod token;
 mod token_bind;
 mod token_issue;
