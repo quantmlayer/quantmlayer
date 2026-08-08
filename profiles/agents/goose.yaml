@@ -106,6 +106,23 @@ network:
     - "api.x.ai"                  # xAI
     - "openrouter.ai"             # OpenRouter (multi-provider gateway)
     # goose update check / telemetry is deliberately NOT allow-listed.
+    # --- package registries + source hosting (the generous-but-bounded
+    #     floor a real coding task needs; NOT prune candidates — pruning
+    #     these breaks the first `npm install` / `cargo build`) ---
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    - "registry.npmjs.org"
+    - "crates.io"
+    - "static.crates.io"
+    - "index.crates.io"
+    - "proxy.golang.org"
+    - "sum.golang.org"
+    # Source hosting (git clone, go get, npm's GitHub-hosted deps)
+    - "github.com"
+    - "api.github.com"
+    - "codeload.github.com"
+    - "raw.githubusercontent.com"
+    - "objects.githubusercontent.com"
 
 capabilities:
   retain: []

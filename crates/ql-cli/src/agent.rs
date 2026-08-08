@@ -313,6 +313,37 @@ mod tests {
         }
     }
 
+    /// Each bundled profile must allow the package registries and source
+    /// hosting a real coding task hits on its first `npm install` /
+    /// `cargo build` / `pip install` / `go mod download` / `git clone`.
+    /// v0.2.0 shipped goose without these and the first real project died
+    /// at the broker — this pins the floor so that bug class cannot recur.
+    #[test]
+    fn bundled_profiles_keep_the_registry_floor() {
+        for a in AGENTS {
+            let p = Profile::from_yaml(a.yaml).expect("parses");
+            for must_allow in [
+                "pypi.org",
+                "files.pythonhosted.org",
+                "registry.npmjs.org",
+                "crates.io",
+                "static.crates.io",
+                "index.crates.io",
+                "proxy.golang.org",
+                "sum.golang.org",
+                "github.com",
+                "codeload.github.com",
+                "objects.githubusercontent.com",
+            ] {
+                assert!(
+                    p.network.allow_domains.iter().any(|d| d == must_allow),
+                    "agents/{}.yaml must allow-list {must_allow}",
+                    a.name
+                );
+            }
+        }
+    }
+
     /// Names and lookups stay consistent.
     #[test]
     fn bundled_lookup_finds_every_agent() {

@@ -94,6 +94,8 @@ network:
     - "crates.io"
     - "static.crates.io"
     - "index.crates.io"
+    - "proxy.golang.org"
+    - "sum.golang.org"
     # --- source hosting ---
     - "github.com"
     - "api.github.com"
