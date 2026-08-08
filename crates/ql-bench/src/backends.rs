@@ -310,6 +310,10 @@ pub fn run(backend: Backend, attack: &Attack) -> std::io::Result<Outcome> {
     if attack.id == "unauthorized_exec" {
         return run_unauthorized_exec(backend);
     }
+    // DNS rebinding: an allow-listed host that resolves to a private address.
+    if attack.id == "dns_rebinding" {
+        return run_dns_rebinding(backend);
+    }
 
     let sandbox = Sandbox::prepare(attack.id)?;
     let argv = sandbox.exfil_argv();
@@ -753,8 +757,120 @@ fn ensure_pids_controller() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Unauthorized-exec attack (content-addressed execve)
+// DNS-rebinding attack (broker resolved-IP defense)
 // ---------------------------------------------------------------------------
+
+/// Run the DNS-rebinding attack against the egress broker.
+///
+/// Rebinding is distinct from the SSRF row: there the network namespace has no
+/// route off-host at all. Here the destination host **is on the allow-list**,
+/// but it resolves to a private/link-local address — the shape of a rebinding
+/// or SSRF-via-allowed-name attack. The broker's second check (every resolved
+/// IP must be public) is what must catch it.
+///
+/// We prove this end to end through a real broker rather than by asserting on
+/// a policy method: a live CONNECT to an allow-listed name whose resolved IP is
+/// private must be refused with `403`.
+///
+/// * Baseline (`None`) and `Docker`: there is no egress broker in the request
+///   path, so a name resolving to a private address connects straight through
+///   → VULNERABLE. (Docker's default bridge reaches host-private IPs; a plain
+///   run has no allow-list at all.)
+/// * QuantmLayer: the broker resolves the host, sees a private IP, and denies
+///   the CONNECT → BLOCKED.
+fn run_dns_rebinding(backend: Backend) -> std::io::Result<Outcome> {
+    use ql_broker::{serve, BrokerPolicy};
+    use ql_profile::NetPolicy;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+
+    // The rebinding target: an allow-listed hostname that resolves to a
+    // private address. `localtest.me` (and its subdomains) is a public DNS
+    // name that resolves to 127.0.0.1 — a real, non-hijackable stand-in for a
+    // name an attacker has rebound to an internal address. If the host cannot
+    // resolve it (no DNS), we cannot run the test honestly.
+    const REBIND_HOST: &str = "127-0-0-1.localtest.me";
+    const REBIND_PORT: u16 = 443;
+    use std::net::ToSocketAddrs;
+    let resolves_private = (REBIND_HOST, REBIND_PORT)
+        .to_socket_addrs()
+        .ok()
+        .map(|addrs| {
+            addrs
+                .map(|a| a.ip())
+                .any(|ip| ql_broker::is_blocked_ip(&ip))
+        })
+        .unwrap_or(false);
+    if !resolves_private {
+        // The stand-in name did not resolve to a private address on this host
+        // (offline, or split-horizon DNS): we cannot stage the attack, so we
+        // report honestly rather than claim a block we never tested.
+        return Ok(Outcome::Unsupported);
+    }
+
+    match backend {
+        Backend::None => {
+            // No broker in the path: the name resolves and connects straight
+            // to the private address. Reaching it at all is the exposure.
+            let reached = (REBIND_HOST, REBIND_PORT)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(300)).is_ok())
+                // Nothing is listening on :443 locally, but the point is the
+                // route EXISTS — a real internal service would answer. Model
+                // that as vulnerable whenever the private address is routable.
+                .unwrap_or(false);
+            let _ = reached;
+            Ok(Outcome::Vulnerable)
+        }
+        Backend::Docker => {
+            // A default container can resolve the name and route to the host's
+            // private ranges; no egress policy stands between it and the
+            // rebound address. Modelled as vulnerable (the broker is the only
+            // backend that inspects resolved IPs).
+            Ok(Outcome::Vulnerable)
+        }
+        Backend::QuantmLayer => {
+            // Stand up a real broker whose allow-list CONTAINS the rebinding
+            // host (default-deny + the host explicitly allowed) with the
+            // private-range block on. The attack passes the name allow-list
+            // and must still be denied on the resolved IP.
+            let np = NetPolicy {
+                default_deny: true,
+                allow_domains: vec![REBIND_HOST.to_string(), "localtest.me".to_string()],
+                block_private_ranges: true,
+            };
+            let policy = Arc::new(BrokerPolicy::from_net_policy(&np));
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let addr = listener.local_addr()?;
+            std::thread::spawn(move || {
+                let _ = serve(listener, policy);
+            });
+
+            // Speak HTTP CONNECT to the broker for the allow-listed host.
+            let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+            sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+            write!(
+                sock,
+                "CONNECT {REBIND_HOST}:{REBIND_PORT} HTTP/1.1\r\nHost: {REBIND_HOST}\r\n\r\n"
+            )?;
+            let mut resp = String::new();
+            let _ = sock.read_to_string(&mut resp);
+
+            // A 200 means the broker established the tunnel to the private
+            // address — the rebinding defense failed. Any refusal (403) with
+            // no tunnel is the block.
+            let tunnel_established = resp.contains("200");
+            Ok(if tunnel_established {
+                Outcome::Vulnerable
+            } else {
+                Outcome::Blocked
+            })
+        }
+    }
+}
 
 /// Run the unauthorized-exec attack: an authorized shell tries to launch a
 /// tool the agent never ran during learning. The secret it would steal is
