@@ -192,8 +192,12 @@ pub fn cmd(args: &[String]) -> ExitCode {
                     "ql: egress pruned to configured provider {kept} ({removed} provider domain(s) removed)"
                 ),
                 crate::prune::PruneOutcome::NoConfig => eprintln!(
-                    "ql: --prune-provider: no goose config found at {}; profile unchanged",
+                    "ql: --prune-provider: cannot read goose config at {}; profile unchanged",
                     cfg.display()
+                ),
+                crate::prune::PruneOutcome::NoProviderKey => eprintln!(
+                    "ql: --prune-provider: goose config has no provider key \
+                     (active_provider / GOOSE_PROVIDER); profile unchanged"
                 ),
                 crate::prune::PruneOutcome::UnknownProvider(name) => eprintln!(
                     "ql: --prune-provider: provider `{name}` not in the built-in table; profile unchanged"

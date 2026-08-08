@@ -54,8 +54,11 @@ pub enum PruneOutcome {
     /// Removed `removed` provider domains; `kept` is the configured
     /// provider's domain.
     Pruned { kept: &'static str, removed: usize },
-    /// No goose config was found at the resolved path.
+    /// No goose config could be read at the resolved path.
     NoConfig,
+    /// The config parsed but names no provider under any known key; the
+    /// profile is unchanged.
+    NoProviderKey,
     /// The config named a provider outside the compile-time table (e.g. a
     /// local or unsupported provider); the profile is unchanged.
     UnknownProvider(String),
@@ -69,7 +72,7 @@ pub fn prune_provider_domains(profile: &mut Profile, config_path: &Path) -> Prun
         return PruneOutcome::NoConfig;
     };
     let Some(provider) = read_goose_provider(&text) else {
-        return PruneOutcome::NoConfig;
+        return PruneOutcome::NoProviderKey;
     };
     let Some(keep) = provider_domain(&provider) else {
         return PruneOutcome::UnknownProvider(sanitize_name(&provider));
@@ -94,11 +97,19 @@ pub fn goose_config_path(sudo_home: Option<PathBuf>) -> Option<PathBuf> {
     Some(home.join(".config/goose/config.yaml"))
 }
 
-/// Extract `GOOSE_PROVIDER` from goose's config.yaml. Parsed as YAML via the
-/// workspace serde_yaml; only the one string key is read.
+/// Extract the configured provider from goose's config.yaml. Field-verified
+/// shapes, tried in order: `active_provider` (goose CLI 1.45+, observed on a
+/// live box) and `GOOSE_PROVIDER` (env-style key used by older configs and
+/// headless setups). Only top-level string keys are read; nothing else in
+/// the document is consulted.
 fn read_goose_provider(text: &str) -> Option<String> {
     let doc: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
-    doc.get("GOOSE_PROVIDER")?.as_str().map(|s| s.to_string())
+    for key in ["active_provider", "GOOSE_PROVIDER"] {
+        if let Some(v) = doc.get(key).and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// A provider name from an agent-writable file may be echoed in an operator
@@ -183,6 +194,39 @@ mod tests {
         let before = p.network.allow_domains.clone();
         let out = prune_provider_domains(&mut p, &cfg);
         assert_eq!(out, PruneOutcome::UnknownProvider("ollama".into()));
+        assert_eq!(p.network.allow_domains, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The field-observed goose 1.45 shape (`active_provider:`) is parsed.
+    #[test]
+    fn parses_active_provider_key_from_goose_145() {
+        let dir = tmpdir("active");
+        let cfg = write_config(
+            &dir,
+            "GOOSE_TELEMETRY_ENABLED: false\nextensions:\n  skills:\n    enabled: true\nactive_provider: anthropic\nproviders:\n",
+        );
+        let mut p = goose_profile();
+        let out = prune_provider_domains(&mut p, &cfg);
+        assert_eq!(
+            out,
+            PruneOutcome::Pruned {
+                kept: "api.anthropic.com",
+                removed: 4
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config with no provider key is distinguished from a missing config.
+    #[test]
+    fn config_without_provider_key_reports_no_provider_key() {
+        let dir = tmpdir("nokey");
+        let cfg = write_config(&dir, "GOOSE_TELEMETRY_ENABLED: false\n");
+        let mut p = goose_profile();
+        let before = p.network.allow_domains.clone();
+        let out = prune_provider_domains(&mut p, &cfg);
+        assert_eq!(out, PruneOutcome::NoProviderKey);
         assert_eq!(p.network.allow_domains, before);
         std::fs::remove_dir_all(&dir).ok();
     }
