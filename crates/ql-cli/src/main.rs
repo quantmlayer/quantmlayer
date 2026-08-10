@@ -30,6 +30,7 @@ mod policy;
 mod profile;
 mod prune;
 mod registry;
+mod replay;
 mod result;
 mod rlimit;
 mod run;
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Some("learn") => learn::cmd(&args[1..]),
         Some("validate") => validate::cmd(&args[1..]),
         Some("compile") => compile::cmd(&args[1..]),
+        Some("replay") => replay::cmd(&args[1..]),
         Some("doctor") => doctor::cmd(&args[1..]),
         Some("profile") => profile::cmd(&args[1..]),
         Some("export") => export::cmd(&args[1..]),
@@ -92,6 +94,7 @@ fn print_usage() {
          \x20 ql doctor   [--json]\n\
          \x20 ql profile  sign <p.yaml> --key <seed-hex> [--out <path>] | verify <p.yaml> [--signer <pubkey>]\n\
          \x20 ql compile  [<dir>] [--json] [--profile <in.yaml> --out <out.yaml>] [--replace]\n\
+         \x20 ql replay   <verdicts.jsonl> --profile <proposed.yaml> [--json]\n\
          \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
          \x20 ql audit    verify <log> [--json] | append <log> ... | export <log> --out <dir> | rotate <log> --archive-dir <dir> | retention <dir> | keygen\n\
          \x20 ql ps\n\

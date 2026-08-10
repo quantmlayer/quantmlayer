@@ -160,6 +160,41 @@ missing or changed fails closed with exit `2`, naming the file. Because
 `approved_for` is covered by the profile's signing bytes, a signed profile's
 pins cannot be altered without invalidating the signature.
 
+## `ql replay <verdicts.jsonl> --profile <p.yaml> --json` — `ql.replay/v1`
+
+Re-evaluates a recorded verdict stream against a proposed profile, offline.
+Exit `0` when no axis regressed, `3` when one did, `2` on usage errors.
+
+```json
+{
+  "schema": "ql.replay/v1",
+  "replayed": 3,
+  "skipped_lines": 0,
+  "axes": {
+    "egress": { "outcome": "pass", "observed": 3, "regressions": 0, "undetermined": 0, "reason": null },
+    "exec": { "outcome": "unknown", "observed": 0, "regressions": 0, "undetermined": 0, "reason": "..." }
+  },
+  "not_observable": ["filesystem", "seccomp"]
+}
+```
+
+- `outcome` is `pass`, `fail`, or **`unknown`** — never two states. `unknown`
+  means the stream lacks the events needed to judge that axis; it is absence
+  of evidence, not a pass, and does **not** set exit `3`.
+- `regressions` counts only events the recording run **allowed** that the
+  proposed profile would **deny**. An event denied before and still denied is
+  not a regression; counting it would make every replay of a real stream look
+  broken.
+- `undetermined` counts events whose outcome cannot be derived — chiefly hosts
+  the proposed profile newly admits, since the stream records `host:port` but
+  not resolved IPs, so the private-range check cannot be evaluated for them.
+- `not_observable` names walls no verdict stream can ever cover: filesystem
+  and seccomp deny in-kernel with no userspace event.
+
+`pass` means no *observed* operation would be denied — not that the workload is
+compatible. A run under a more permissive policy proceeds further and does
+things the stream never captured.
+
 ## `ql audit verify <log> --json` — `ql.audit.verify/v1`
 
 On stdout. Exit `0` with `"ok": true`, exit `3` with `"ok": false` and the
