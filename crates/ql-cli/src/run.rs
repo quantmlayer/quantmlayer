@@ -369,7 +369,16 @@ pub fn cmd(args: &[String]) -> ExitCode {
     // silently running without it would misreport what happened.
     let verdicts = match verdicts_path.as_deref() {
         None => None,
-        Some(p) => match crate::verdicts::VerdictWriter::create(p) {
+        Some(p) => match crate::verdicts::VerdictWriter::create(
+            p,
+            // Declared up front so an empty axis is never ambiguous later:
+            // egress verdicts exist only on brokered runs, and exec verdicts
+            // only when a content-verified tier is actually active.
+            crate::verdicts::LiveAxes {
+                egress: brokered,
+                exec: profile.exec.enforce && tier != ExecTier::None,
+            },
+        ) {
             Ok(w) => {
                 eprintln!(
                     "ql: streaming verdicts to {p} (test a policy change against it \
@@ -388,6 +397,9 @@ pub fn cmd(args: &[String]) -> ExitCode {
     // the exec-event drain; rendered after the cell exits. See summary.rs
     // for what deliberately does and does not appear.
     let summary = std::sync::Arc::new(crate::summary::RunSummary::default());
+    // Declared before the run so a wall that was live but idle still reports,
+    // rather than being indistinguishable from a wall that was never there.
+    summary.declare_live(brokered, profile.exec.enforce && tier != ExecTier::None);
 
     let code = if brokered {
         run_brokered(

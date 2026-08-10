@@ -37,6 +37,21 @@ use std::sync::Mutex;
 /// Current verdicts schema version.
 const SCHEMA_V: u32 = 1;
 
+/// Which walls were live for the run that produced a stream.
+///
+/// Recorded because an empty axis is otherwise ambiguous: a brokered run whose
+/// workload made no network calls produces exactly the same zero egress
+/// events as a run with no broker at all. Without this, a consumer cannot
+/// tell "no coverage" from "covered, and nothing happened" — and those imply
+/// opposite conclusions about whether the stream says anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAxes {
+    /// The egress broker was in the request path (`--broker`).
+    pub egress: bool,
+    /// A content-verified exec wall was active (`exec.enforce` with a tier).
+    pub exec: bool,
+}
+
 /// A serialized real-time verdict stream. Line-buffered: every event is
 /// written and flushed as one complete JSON line, so a `tail -f` reader never
 /// sees a torn record.
@@ -46,16 +61,40 @@ pub struct VerdictWriter {
 }
 
 impl VerdictWriter {
-    /// Create (truncate) the verdicts file at `path`.
-    pub fn create(path: &str) -> std::io::Result<VerdictWriter> {
+    /// Create (truncate) the verdicts file at `path` and write its header.
+    ///
+    /// The header is the first line and declares which walls were live, so a
+    /// consumer can distinguish an axis with no coverage from an axis that
+    /// was covered and saw nothing. Streams written before this existed have
+    /// no header; consumers must treat its absence as "unknown coverage"
+    /// rather than assuming either answer.
+    pub fn create(path: &str, live: LiveAxes) -> std::io::Result<VerdictWriter> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)?;
-        Ok(VerdictWriter {
+        let w = VerdictWriter {
             file: Mutex::new(file),
-        })
+        };
+        let mut axes: Vec<&str> = Vec::new();
+        if live.egress {
+            axes.push("egress");
+        }
+        if live.exec {
+            axes.push("exec");
+        }
+        let header = serde_json::json!({
+            "v": SCHEMA_V,
+            "type": "header",
+            "live_axes": axes,
+        });
+        {
+            let mut f = w.file.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(f, "{header}");
+            let _ = f.flush();
+        }
+        Ok(w)
     }
 
     /// Record one egress decision (fires in real time from the broker's
@@ -95,6 +134,7 @@ impl VerdictWriter {
     ) {
         let line = serde_json::json!({
             "v": SCHEMA_V,
+            "type": "decision",
             "ts_millis": ts_millis,
             "source": source,
             "decision": if allowed { "allow" } else { "deny" },
@@ -171,13 +211,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ql-verdicts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("v.jsonl");
-        let w = VerdictWriter::create(path.to_str().unwrap()).unwrap();
+        let w = VerdictWriter::create(
+            path.to_str().unwrap(),
+            LiveAxes {
+                egress: true,
+                exec: true,
+            },
+        )
+        .unwrap();
 
         w.egress("pypi.org", 443, true, RULE_ALLOWED);
         w.egress("pastebin.com", 443, false, "host not in allow-list");
         w.exec(42, "abc123", false);
 
-        let lines = read_lines(&path);
+        let all = read_lines(&path);
+        // The first line is the coverage header, then one line per decision.
+        assert_eq!(all[0]["type"], "header");
+        assert_eq!(all[0]["live_axes"][0], "egress");
+        let lines: Vec<_> = all.into_iter().skip(1).collect();
         assert_eq!(lines.len(), 3);
         for l in &lines {
             assert_eq!(l["v"], 1);

@@ -141,7 +141,11 @@ pub struct AxisReport {
 ///   denied for any other reason → Unknown.** Resolution may never have
 ///   happened, so the private-range check cannot be evaluated. This is the
 ///   "unblock something" case.
-pub fn replay_egress(events: &[RecordedVerdict], profile: &Profile) -> AxisReport {
+pub fn replay_egress(
+    events: &[RecordedVerdict],
+    profile: &Profile,
+    covered: Option<bool>,
+) -> AxisReport {
     let policy = BrokerPolicy::from_net_policy(&profile.network);
     let mut report = AxisReport {
         axis: "egress",
@@ -182,13 +186,33 @@ pub fn replay_egress(events: &[RecordedVerdict], profile: &Profile) -> AxisRepor
     }
 
     if report.observed == 0 {
-        report.unknown_reason = Some(
-            "no egress events in this stream — either the recording run was not \
-             brokered (verdicts are emitted only on `--broker` runs), or it was \
-             brokered and the workload made no network calls. The stream does not \
-             record which walls were live, so these cannot be told apart",
-        );
-        report.outcome = AxisOutcome::Unknown;
+        match covered {
+            // The broker was live and saw nothing: coverage was complete and
+            // the workload made no network calls. Vacuous, but genuinely a
+            // pass — there is no unobserved operation hiding here.
+            Some(true) => {
+                report.outcome = AxisOutcome::Pass;
+                report.unknown_reason =
+                    Some("the broker was live and the workload made no network calls at all");
+            }
+            // Declared not live: definitely no coverage.
+            Some(false) => {
+                report.outcome = AxisOutcome::Unknown;
+                report.unknown_reason = Some(
+                    "the recording run was not brokered, so no egress decision was \
+                     ever made — this stream says nothing about egress",
+                );
+            }
+            // No header: the stream predates coverage declarations.
+            None => {
+                report.outcome = AxisOutcome::Unknown;
+                report.unknown_reason = Some(
+                    "no egress events, and this stream has no header declaring which \
+                     walls were live — cannot tell an unbrokered run from a brokered \
+                     one whose workload made no network calls",
+                );
+            }
+        }
     } else if report.regressions > 0 {
         report.outcome = AxisOutcome::Fail;
     } else if report.undetermined > 0 {
@@ -251,7 +275,11 @@ fn host_admitted(policy: &BrokerPolicy, host: &str) -> bool {
 ///
 /// Exec is fully determinable when events exist: the stream records the
 /// content digest, and the proposed profile either lists it or does not.
-pub fn replay_exec(events: &[RecordedVerdict], profile: &Profile) -> AxisReport {
+pub fn replay_exec(
+    events: &[RecordedVerdict],
+    profile: &Profile,
+    covered: Option<bool>,
+) -> AxisReport {
     let mut report = AxisReport {
         axis: "exec",
         outcome: AxisOutcome::Unknown,
@@ -282,12 +310,25 @@ pub fn replay_exec(events: &[RecordedVerdict], profile: &Profile) -> AxisReport 
     }
 
     if report.observed == 0 {
-        report.unknown_reason = Some(
-            "no exec events in this stream — the recording run almost certainly had \
-             `exec.enforce: false` (the shipped default), in which case no exec wall \
-             ran and nothing was measured",
-        );
         report.outcome = AxisOutcome::Unknown;
+        report.unknown_reason = Some(match covered {
+            // A live exec wall always sees at least the command's own exec, so
+            // zero events with the wall declared live means the stream is
+            // truncated or was never written to.
+            Some(true) => {
+                "the exec wall was declared live but no exec events were recorded — \
+                 the stream is likely truncated"
+            }
+            Some(false) => {
+                "the recording run had no content-verified exec wall \
+                 (`exec.enforce: false`, the shipped default), so nothing was measured"
+            }
+            None => {
+                "no exec events, and this stream has no header declaring which walls \
+                 were live — the recording run most likely had `exec.enforce: false`, \
+                 the shipped default"
+            }
+        });
     } else if report.regressions > 0 {
         report.outcome = AxisOutcome::Fail;
     } else {
@@ -307,15 +348,33 @@ fn digest_allowed(profile: &Profile, digest: &str) -> bool {
     profile.exec.allow_digests.iter().any(|d| d.hex() == bare)
 }
 
+/// Which axes the stream's header declares were live. `None` means the stream
+/// has no header (written before headers existed), in which case coverage is
+/// genuinely unknown and must not be guessed either way.
+pub type Coverage = Option<(bool, bool)>;
+
 /// Parse a `--verdicts` JSONL stream. Malformed lines are skipped and counted
 /// rather than aborting: a truncated final line is normal when a stream is
 /// read while a run is still writing.
-pub fn parse_stream(text: &str) -> (Vec<RecordedVerdict>, usize) {
+///
+/// Returns the decisions, the skipped-line count, and the header's coverage
+/// declaration if present.
+pub fn parse_stream(text: &str) -> (Vec<RecordedVerdict>, usize, Coverage) {
     let mut out = Vec::new();
     let mut skipped = 0usize;
+    let mut coverage: Coverage = None;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => {
+                if v.get("type").and_then(|t| t.as_str()) == Some("header") {
+                    let axes = v.get("live_axes").and_then(|a| a.as_array());
+                    let has = |name: &str| {
+                        axes.map(|a| a.iter().any(|x| x.as_str() == Some(name)))
+                            .unwrap_or(false)
+                    };
+                    coverage = Some((has("egress"), has("exec")));
+                    continue;
+                }
                 let (Some(source), Some(decision), Some(target)) = (
                     v.get("source").and_then(|x| x.as_str()),
                     v.get("decision").and_then(|x| x.as_str()),
@@ -338,7 +397,7 @@ pub fn parse_stream(text: &str) -> (Vec<RecordedVerdict>, usize) {
             Err(_) => skipped += 1,
         }
     }
-    (out, skipped)
+    (out, skipped, coverage)
 }
 
 /// Run `ql replay`.
@@ -389,8 +448,11 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    let (events, skipped) = parse_stream(&text);
-    if events.is_empty() {
+    let (events, skipped, coverage) = parse_stream(&text);
+    // A stream with a header but no decisions is meaningful, not empty: it
+    // records that a wall was live and observed nothing. Only reject when
+    // there is neither a header nor a decision to read.
+    if events.is_empty() && coverage.is_none() {
         eprintln!(
             "ql replay: {stream_path} contains no readable verdicts \
              (is it a --verdicts stream?)"
@@ -398,8 +460,8 @@ pub fn cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let egress = replay_egress(&events, &profile);
-    let exec = replay_exec(&events, &profile);
+    let egress = replay_egress(&events, &profile, coverage.map(|c| c.0));
+    let exec = replay_exec(&events, &profile, coverage.map(|c| c.1));
 
     if json {
         print!("{}", render_json(&egress, &exec, events.len(), skipped));
@@ -536,7 +598,7 @@ mod tests {
             ev("egress", true, "crates.io:443", "allowed"),
             ev("egress", true, "pypi.org:443", "allowed"),
         ];
-        let r = replay_egress(&events, &profile_with(&["crates.io"], true));
+        let r = replay_egress(&events, &profile_with(&["crates.io"], true), None);
         assert_eq!(r.outcome, AxisOutcome::Fail);
         assert_eq!(r.regressions, 1);
         assert_eq!(r.regressed_targets, vec!["pypi.org:443"]);
@@ -546,7 +608,11 @@ mod tests {
     #[test]
     fn superset_profile_passes_the_egress_axis() {
         let events = vec![ev("egress", true, "crates.io:443", "allowed")];
-        let r = replay_egress(&events, &profile_with(&["crates.io", "pypi.org"], true));
+        let r = replay_egress(
+            &events,
+            &profile_with(&["crates.io", "pypi.org"], true),
+            None,
+        );
         assert_eq!(r.outcome, AxisOutcome::Pass);
         assert_eq!(r.regressions, 0);
     }
@@ -558,12 +624,12 @@ mod tests {
         let events = vec![ev("egress", true, "crates.io:443", "allowed")];
         let p = profile_with(&["crates.io"], true);
 
-        let exec = replay_exec(&events, &p);
+        let exec = replay_exec(&events, &p, None);
         assert_eq!(exec.outcome, AxisOutcome::Unknown);
         assert_eq!(exec.observed, 0);
         assert!(exec.unknown_reason.unwrap().contains("exec.enforce"));
 
-        let egress = replay_egress(&[ev("exec", true, "abc", "allowed")], &p);
+        let egress = replay_egress(&[ev("exec", true, "abc", "allowed")], &p, None);
         assert_eq!(egress.outcome, AxisOutcome::Unknown);
         assert!(egress.unknown_reason.unwrap().contains("broker"));
     }
@@ -579,7 +645,7 @@ mod tests {
             "internal.example:443",
             "host not in allow-list",
         )];
-        let r = replay_egress(&events, &profile_with(&["internal.example"], true));
+        let r = replay_egress(&events, &profile_with(&["internal.example"], true), None);
         assert_eq!(r.outcome, AxisOutcome::Unknown);
         assert_eq!(r.undetermined, 1);
         assert_eq!(r.regressions, 0);
@@ -598,14 +664,14 @@ mod tests {
             "localtest.me:443",
             "resolves to a private/link-local address",
         )];
-        let r = replay_egress(&events, &profile_with(&["localtest.me"], true));
+        let r = replay_egress(&events, &profile_with(&["localtest.me"], true), None);
         assert_eq!(r.outcome, AxisOutcome::Pass);
         assert_eq!(r.regressions, 0);
         assert_eq!(r.still_denied, 1);
 
         // Dropping the private-range block newly admits it — reported as such,
         // and the bounded-PASS caveat applies: the run stopped there.
-        let r2 = replay_egress(&events, &profile_with(&["localtest.me"], false));
+        let r2 = replay_egress(&events, &profile_with(&["localtest.me"], false), None);
         assert_eq!(r2.outcome, AxisOutcome::Pass);
         assert_eq!(r2.newly_allowed, 1);
     }
@@ -623,7 +689,7 @@ mod tests {
                 "host not in allow-list",
             ),
         ];
-        let r = replay_egress(&events, &profile_with(&["crates.io"], true));
+        let r = replay_egress(&events, &profile_with(&["crates.io"], true), None);
         assert_eq!(r.outcome, AxisOutcome::Fail);
         assert_eq!(r.regressions, 1);
         assert_eq!(r.still_denied, 1);
@@ -645,7 +711,7 @@ mod tests {
             ev("exec", true, &good, "allowed"),
             ev("exec", true, &bad, "allowed"),
         ];
-        let r = replay_exec(&events, &p);
+        let r = replay_exec(&events, &p, None);
         assert_eq!(r.outcome, AxisOutcome::Fail);
         assert_eq!(r.regressions, 1);
         assert_eq!(r.regressed_targets, vec![bad]);
@@ -658,7 +724,7 @@ mod tests {
         let mut p = profile_with(&["crates.io"], true);
         p.exec.enforce = false;
         let events = vec![ev("exec", true, &"a".repeat(64), "allowed")];
-        let r = replay_exec(&events, &p);
+        let r = replay_exec(&events, &p, None);
         assert_eq!(r.outcome, AxisOutcome::Pass);
         assert_eq!(r.regressions, 0);
     }
@@ -671,7 +737,7 @@ mod tests {
                     not json\n\
                     {\"v\":1,\"source\":\"egress\"}\n\
                     {\"v\":1,\"source\":\"exec\",\"decision\":\"deny\",\"target\":\"d\",\"rule\":\"x\"}\n";
-        let (events, skipped) = parse_stream(text);
+        let (events, skipped, _cov) = parse_stream(text);
         assert_eq!(events.len(), 2);
         assert_eq!(skipped, 2);
         assert_eq!(events[1].source, "exec");

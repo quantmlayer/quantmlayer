@@ -47,9 +47,28 @@ pub struct RunSummary {
     egress_seen: AtomicU64,
     /// Whether any exec decision was observed.
     exec_seen: AtomicU64,
+    /// Whether the egress broker was in the request path at all, independent
+    /// of whether it made any decision. Without this, a brokered run whose
+    /// workload made no network calls is indistinguishable from an unbrokered
+    /// one, and the summary stays silent about a wall that was doing its job.
+    egress_live: AtomicU64,
+    /// Whether a content-verified exec wall was active for this run.
+    exec_live: AtomicU64,
 }
 
 impl RunSummary {
+    /// Declare which walls are live for this run, before anything happens.
+    /// Reporting "0 allowed, 0 denied" for a live wall is a fact; staying
+    /// silent implies no coverage, which would be a different claim.
+    pub fn declare_live(&self, egress: bool, exec: bool) {
+        if egress {
+            self.egress_live.store(1, Ordering::Relaxed);
+        }
+        if exec {
+            self.exec_live.store(1, Ordering::Relaxed);
+        }
+    }
+
     /// Record one broker egress decision.
     pub fn note_egress(&self, host: &str, port: u16, allowed: bool) {
         self.egress_seen.store(1, Ordering::Relaxed);
@@ -93,8 +112,10 @@ impl RunSummary {
     /// Render the summary, or `None` when no reporting wall was live (in
     /// which case printing anything would imply coverage that didn't exist).
     pub fn render(&self, audit_path: Option<&str>) -> Option<String> {
-        let egress_live = self.egress_seen.load(Ordering::Relaxed) == 1;
-        let exec_live = self.exec_seen.load(Ordering::Relaxed) == 1;
+        let egress_live = self.egress_seen.load(Ordering::Relaxed) == 1
+            || self.egress_live.load(Ordering::Relaxed) == 1;
+        let exec_live = self.exec_seen.load(Ordering::Relaxed) == 1
+            || self.exec_live.load(Ordering::Relaxed) == 1;
         if !egress_live && !exec_live {
             return None;
         }
@@ -218,6 +239,21 @@ mod tests {
     fn silent_when_no_reporting_wall_was_live() {
         let s = RunSummary::default();
         assert!(s.render(Some("/tmp/run.jsonl")).is_none());
+    }
+
+    /// A live wall that observed nothing still reports — "the broker ran and
+    /// the workload made no network calls" is a fact worth stating, and
+    /// silence would imply the wall was absent.
+    #[test]
+    fn live_but_idle_wall_still_reports_zeroes() {
+        let s = RunSummary::default();
+        s.declare_live(true, false);
+        let out = s.render(None).expect("a live wall must report");
+        assert!(out.contains("egress 0 allowed, 0 denied"), "{out}");
+        assert!(
+            !out.contains("exec"),
+            "an absent wall must stay absent: {out}"
+        );
     }
 
     /// Distinct denied targets beyond the cap fold into "+N more", and
