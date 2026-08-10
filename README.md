@@ -17,7 +17,7 @@
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.96](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
-![tests](https://img.shields.io/badge/tests-186%20passing-brightgreen.svg)
+![tests](https://img.shields.io/badge/tests-225%20passing-brightgreen.svg)
 ![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider%20%C2%B7%20cline%20%C2%B7%20cursor%20%C2%B7%20opencode%20%C2%B7%20openhands%20%C2%B7%20goose-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.
@@ -79,6 +79,17 @@ ql mcp wrap .mcp.json --in-place --gateway --gate delete_file
 ql learn --out agent.yaml -- ./my-agent build
 ql run   --profile agent.yaml -- ./my-agent build
 
+# DERIVE EGRESS FROM YOUR LOCKFILES — instead of hand-maintaining an
+# allow-list, compile one from what the project already declares. Reads
+# Cargo.lock / package-lock.json / requirements.txt / go.sum and emits the
+# registry domains that dependency set needs, bound to each lockfile's
+# content hash. Deterministic: same lockfiles, same envelope. Domains come
+# from a fixed per-ecosystem table, so lockfile CONTENTS can never introduce
+# a host. `ql run` refuses to start if a pinned lockfile changed:
+ql compile .                                       # what would it grant?
+ql compile . --profile agent.yaml --out pinned.yaml
+ql run --profile pinned.yaml -- ./my-agent build
+
 # ON-RAMP — dry-run without enforcing. `--observe` traces the agent and
 # reports what enforce mode WOULD have denied, writing a would-deny report to
 # a NOT-ENFORCING audit log, so you can see a profile is right before it
@@ -93,6 +104,19 @@ ql run --profile profiles/coding.yaml -- my-agent --task "fix the failing test"
 # broker, which allows the profile's domains (e.g. pypi.org) and refuses
 # everything else, including the cloud-metadata endpoint:
 ql run --broker --profile profiles/coding.yaml -- my-agent --task "..."
+
+# SEE WHAT THE WALLS DID — containment is invisible when it works. `--verdicts`
+# streams one JSON line per decision as it happens (tail -f it in another
+# shell); every enforced run also prints an end-of-run summary naming what was
+# denied. Egress and exec only: the mount and seccomp walls deny in-kernel with
+# no userspace event, so they are absent rather than reported as zero:
+ql run --broker --verdicts v.jsonl --profile profiles/coding.yaml -- my-agent
+#   ql: run summary - egress 1242 allowed, 3 denied
+#   ql: denied: nodejs.org:443 x2, registry.npmmirror.com:443
+
+# Narrow egress to the model provider the agent is actually configured to use
+# (reads goose's own config; can only ever REMOVE domains, never add):
+ql agent goose --broker --prune-provider
 
 # Preflight: which containment walls does THIS host actually give you, and which
 # exec-enforcement tier (kernel BPF-LSM vs userspace seccomp-notify)? Read-only —
@@ -146,10 +170,14 @@ Every row below is measured by a reproducible benchmark (`make benchmark`) — n
 | Cross-process memory read / ptrace | seccomp | vulnerable | vulnerable | blocked |
 | Cloud-metadata SSRF | network | vulnerable | vulnerable | blocked |
 | Run an unauthorized tool (content-addressed exec) | exec | vulnerable | vulnerable | blocked |
+| DNS rebinding to a private address (allow-listed host) | broker | vulnerable | vulnerable | blocked |
+| Interpreter loads mutable code (script read at open time) | exec (open-time measurement) | pending | pending | pending |
+
+The rebinding row is a different wall from metadata SSRF: there the network namespace has no route off-host at all; here the destination **is** on the allow-list and is refused because it *resolves* to a private address. The interpreter row is reported pending rather than scored — [`benchmark/RESULTS.md`](benchmark/RESULTS.md) explains why the exec wall does not cover it.
 
 A default container blocks the two filesystem attacks (separate container filesystem) but is exposed to the fork bomb, cross-process `ptrace`, and metadata SSRF — each of which needs a flag the operator must know to add (`--pids-limit`, a tightened seccomp profile, `--network none`). The last row is the sharpest: **content-addressed execution has no container flag to add.** A default container runs any binary it ships; QuantmLayer hashes every binary at `execve` and admits only those on the learned allow-list, so a tool the agent never used — a freshly dropped payload, a `curl` pulled in by a prompt injection — cannot start, denied by the kernel on content. QuantmLayer derives and applies all of these restrictions automatically, from the agent's observed behavior, on the real host filesystem with no separate image.
 
-The exec row needs more than the others to reproduce: a kernel with BPF-LSM + IMA (check with [`scripts/ql-kernel-probe.sh`](scripts/ql-kernel-probe.sh)), an `lsm`-feature build, and root to load the BPF program — `cargo build --release -p ql-bench --features lsm && sudo ./target/release/ql-bench`. A default (toolchain-free) `make benchmark` runs the other five rows and honestly reports the exec row's QuantmLayer cell as `unsupported` rather than a fake block.
+The exec row needs more than the others to reproduce: a kernel with BPF-LSM + IMA (check with [`scripts/ql-kernel-probe.sh`](scripts/ql-kernel-probe.sh)), an `lsm`-feature build, and root to load the BPF program — `cargo build --release -p ql-bench --features lsm && sudo ./target/release/ql-bench`. A default (toolchain-free) `make benchmark` runs every other runnable row — including DNS rebinding, which needs no BPF — and honestly reports the exec row's QuantmLayer cell as `unsupported` rather than a fake block.
 
 ### What it costs
 
