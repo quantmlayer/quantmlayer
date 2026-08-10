@@ -371,7 +371,10 @@ pub fn cmd(args: &[String]) -> ExitCode {
         None => None,
         Some(p) => match crate::verdicts::VerdictWriter::create(p) {
             Ok(w) => {
-                eprintln!("ql: streaming verdicts to {p}");
+                eprintln!(
+                    "ql: streaming verdicts to {p} (test a policy change against it \
+                     later: ql replay {p} --profile <proposed.yaml>)"
+                );
                 Some(std::sync::Arc::new(w))
             }
             Err(e) => {

@@ -118,6 +118,23 @@ ql run --broker --verdicts v.jsonl --profile profiles/coding.yaml -- my-agent
 # (reads goose's own config; can only ever REMOVE domains, never add):
 ql agent goose --broker --prune-provider
 
+# TEST A POLICY CHANGE WITHOUT RERUNNING THE AGENT — replay a recorded
+# verdicts stream against a proposed profile. Offline and deterministic: no
+# model call, no waiting, and no chance the agent does something different
+# this time. Each axis reports PASS, FAIL, or UNKNOWN — UNKNOWN means the
+# stream lacked the events to judge that axis, and is never treated as a pass.
+# FAIL fires only on REGRESSIONS: something the recorded run was allowed to do
+# that the proposed profile would deny. Exits 3 on a regression, for CI:
+ql replay v.jsonl --profile tightened.yaml
+#   egress   FAIL     3 observed · 1 regression(s)
+#   REGRESSION: api.anthropic.com:443 was allowed, would now be denied
+
+# Write a bundled profile out to edit or compile against, then run it while
+# keeping agent resolution (sudo-aware PATH lookup, cwd as workspace):
+ql agent export goose --out goose.yaml
+ql compile . --profile goose.yaml --out pinned.yaml
+ql agent goose --profile pinned.yaml
+
 # Preflight: which containment walls does THIS host actually give you, and which
 # exec-enforcement tier (kernel BPF-LSM vs userspace seccomp-notify)? Read-only —
 # reads /proc and /sys, loads nothing. Add --json for a machine-readable matrix:

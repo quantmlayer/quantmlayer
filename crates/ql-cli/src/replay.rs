@@ -183,8 +183,10 @@ pub fn replay_egress(events: &[RecordedVerdict], profile: &Profile) -> AxisRepor
 
     if report.observed == 0 {
         report.unknown_reason = Some(
-            "no egress events in this stream — the recording run was not brokered \
-             (the decision hook attaches only on `--broker` runs)",
+            "no egress events in this stream — either the recording run was not \
+             brokered (verdicts are emitted only on `--broker` runs), or it was \
+             brokered and the workload made no network calls. The stream does not \
+             record which walls were live, so these cannot be told apart",
         );
         report.outcome = AxisOutcome::Unknown;
     } else if report.regressions > 0 {
