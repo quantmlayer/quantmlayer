@@ -244,7 +244,7 @@ fn report_skipped(env: &Envelope) {
 fn print_usage() {
     eprintln!(
         "usage: ql compile [<dir>] [--json] [--profile <in.yaml> --out <out.yaml>] \
-         [--keep-existing]\n\
+         [--replace]\n\
          \n\
          Derives an egress envelope from a project's dependency lockfiles: the registry\n\
          domains that dependency set legitimately needs, bound to the lockfiles' content\n\
