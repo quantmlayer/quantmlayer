@@ -160,6 +160,12 @@ fn launch(name: &str, rest: &[String]) -> ExitCode {
         }
     };
 
+    // Advisory only: if the workspace has a lockfile, mention that `ql compile`
+    // can derive egress from it. Purely a notice — it never changes policy, and
+    // it is suppressed when the caller already passed their own profile, since
+    // that profile may well be a compiled one.
+    maybe_hint_compile(&cwd);
+
     let mut run_args: Vec<String> = vec!["--agent".into(), agent.name.into()];
     if !opts.iter().any(|a| a == "--workspace") {
         run_args.push("--workspace".into());
@@ -171,6 +177,39 @@ fn launch(name: &str, rest: &[String]) -> ExitCode {
     run_args.extend(extra.iter().cloned());
 
     crate::run::cmd(&run_args)
+}
+
+/// Print a one-line hint when the workspace root holds a recognized lockfile
+/// and the caller is using a bundled profile.
+///
+/// Discoverability without surprise: authority is granted deliberately, never
+/// as a side effect of a file existing in a directory. This mentions the tool
+/// and stops — it does not compile, apply, or widen anything.
+///
+/// Note: `ql agent` cannot take `--profile` (it is mutually exclusive with
+/// `--agent`), so there is no "already using a compiled profile" case to
+/// suppress here. Running a compiled envelope today means
+/// `ql run --profile <compiled.yaml> -- <agent>`.
+fn maybe_hint_compile(cwd: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| ql_compile::ecosystem_for_filename(n).is_some())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    names.sort();
+    let them = if names.len() == 1 { "it" } else { "them" };
+    eprintln!(
+        "ql: {} present — `ql compile .` derives egress domains from {them} \
+         (see `ql compile --help`)",
+        names.join(", ")
+    );
 }
 
 /// Resolve a binary name against `PATH`. Returns the absolute path, so the

@@ -17,7 +17,7 @@
 //! See `ql-compile`'s crate docs for why lockfile *content* can never
 //! introduce a domain.
 
-use ql_compile::{compile, CompileError, Envelope, LockfileVcs};
+use ql_compile::{compile, compile_one, CompileError, Envelope, LockfileVcs};
 use ql_profile::Profile;
 use std::path::Path;
 use std::process::ExitCode;
@@ -29,6 +29,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut profile_in: Option<String> = None;
     let mut out: Option<String> = None;
     let mut replace = false;
+    let mut lockfile: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -37,6 +38,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--profile" => profile_in = it.next().cloned(),
             "--out" => out = it.next().cloned(),
             "--replace" => replace = true,
+            "--lockfile" => lockfile = it.next().cloned(),
             "-h" | "--help" => {
                 print_usage();
                 return ExitCode::from(0);
@@ -59,13 +61,22 @@ pub fn cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let envelope = match compile(Path::new(&root)) {
+    // `--lockfile` pins the envelope to exactly one file: nothing else is
+    // scanned, so nothing else can widen it.
+    let envelope = match match lockfile.as_deref() {
+        Some(rel) => compile_one(Path::new(&root), Path::new(rel)),
+        None => compile(Path::new(&root)),
+    } {
         Ok(e) => e,
         Err(CompileError::NoLockfiles) => {
             eprintln!(
                 "ql compile: no recognized lockfile under `{root}`. Looked for Cargo.lock, \
                  package-lock.json, requirements.txt, go.sum and friends."
             );
+            return ExitCode::from(2);
+        }
+        Err(e @ CompileError::UnrecognizedLockfile(_)) => {
+            eprintln!("ql compile: {e}");
             return ExitCode::from(2);
         }
         Err(e) => {
@@ -244,7 +255,7 @@ fn report_skipped(env: &Envelope) {
 fn print_usage() {
     eprintln!(
         "usage: ql compile [<dir>] [--json] [--profile <in.yaml> --out <out.yaml>] \
-         [--replace]\n\
+         [--replace] [--lockfile <path>]\n\
          \n\
          Derives an egress envelope from a project's dependency lockfiles: the registry\n\
          domains that dependency set legitimately needs, bound to the lockfiles' content\n\
@@ -254,7 +265,8 @@ fn print_usage() {
            --json             emit the envelope as JSON (ql.compile.envelope/v1)\n\
            --profile <in>     profile to apply the envelope to (requires --out)\n\
            --out <out>        where to write the compiled profile\n\
-           --replace          replace allow_domains instead of merging into them\n"
+           --replace          replace allow_domains instead of merging into them\n\
+           --lockfile <path>  compile from exactly this lockfile (relative to <dir>)\n"
     );
 }
 

@@ -245,6 +245,8 @@ pub enum CompileError {
     NoLockfiles,
     /// A lockfile was found but could not be read.
     Io(std::io::Error),
+    /// `--lockfile` named a file that is not a recognized lockfile.
+    UnrecognizedLockfile(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -256,6 +258,11 @@ impl std::fmt::Display for CompileError {
                  requirements.txt, go.sum and friends)"
             ),
             CompileError::Io(e) => write!(f, "reading lockfile: {e}"),
+            CompileError::UnrecognizedLockfile(n) => write!(
+                f,
+                "`{n}` is not a recognized lockfile (Cargo.lock, package-lock.json, \
+                 requirements.txt, go.sum and friends)"
+            ),
         }
     }
 }
@@ -286,6 +293,29 @@ const SKIP_DIRS: &[&str] = &[
     "build",
     ".tox",
 ];
+
+/// Compile an envelope from ONE named lockfile, relative to `root`.
+///
+/// For a repo whose root union is too broad — or where only one sub-project
+/// is being contained — this pins the envelope to exactly the lockfile the
+/// caller names. Nothing else is scanned, so nothing else can widen it.
+pub fn compile_one(root: &Path, rel: &Path) -> Result<Envelope, CompileError> {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let Some(ecosystem) = ecosystem_for_filename(&name) else {
+        return Err(CompileError::UnrecognizedLockfile(name));
+    };
+    let bytes = std::fs::read(root.join(rel))?;
+    let found = vec![LockfileRef {
+        path: rel.to_path_buf(),
+        ecosystem,
+        sha256: hex(&Sha256::digest(&bytes)),
+        vcs: vcs_state(root, rel),
+    }];
+    Ok(assemble(found, Vec::new()))
+}
 
 /// Compile an envelope from every recognized lockfile under `root`.
 ///
@@ -335,12 +365,13 @@ pub fn compile(root: &Path) -> Result<Envelope, CompileError> {
     for l in &mut found {
         l.vcs = vcs_state(root, &l.path);
     }
-    let unverified_vcs: Vec<(PathBuf, LockfileVcs)> = found
-        .iter()
-        .filter(|l| l.vcs != LockfileVcs::Clean)
-        .map(|l| (l.path.clone(), l.vcs))
-        .collect();
+    Ok(assemble(found, skipped))
+}
 
+/// Build the envelope from a chosen set of lockfiles. Shared by [`compile`]
+/// and [`compile_one`] so both produce byte-identical output for the same
+/// selection.
+fn assemble(found: Vec<LockfileRef>, skipped: Vec<LockfileRef>) -> Envelope {
     // Domains: the union of each detected ecosystem's fixed table, plus source
     // hosting. Sorted and de-duplicated, so the output is canonical.
     let mut domains: BTreeSet<String> = BTreeSet::new();
@@ -352,15 +383,19 @@ pub fn compile(root: &Path) -> Result<Envelope, CompileError> {
     for d in SOURCE_HOSTING {
         domains.insert((*d).to_string());
     }
-
+    let unverified_vcs: Vec<(PathBuf, LockfileVcs)> = found
+        .iter()
+        .filter(|l| l.vcs != LockfileVcs::Clean)
+        .map(|l| (l.path.clone(), l.vcs))
+        .collect();
     let envelope_hash = hash_envelope(&found);
-    Ok(Envelope {
+    Envelope {
         lockfiles: found,
         skipped,
         domains: domains.into_iter().collect(),
         envelope_hash,
         unverified_vcs,
-    })
+    }
 }
 
 /// Best-effort VCS state for one lockfile. Shelling out to git is deliberate:
@@ -775,6 +810,54 @@ mod tests {
         let env = compile(&d).unwrap();
         assert_eq!(env.unverified_vcs.len(), 1);
         assert_eq!(env.unverified_vcs[0].1, LockfileVcs::Unknown);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `--lockfile` pins the envelope to exactly one file: a repo whose root
+    /// union would be broader compiles to only that ecosystem's domains.
+    #[test]
+    fn compile_one_pins_to_a_single_lockfile() {
+        let d = tmpdir("one");
+        write(&d, "Cargo.lock", "x\n");
+        write(&d, "package-lock.json", "{}\n");
+        write(&d, "go.sum", "y\n");
+
+        let all = compile(&d).unwrap();
+        assert_eq!(all.ecosystems().len(), 3);
+
+        let one = compile_one(&d, Path::new("package-lock.json")).unwrap();
+        assert_eq!(one.ecosystems(), vec![Ecosystem::Npm]);
+        assert!(one.domains.iter().any(|x| x == "registry.npmjs.org"));
+        assert!(!one.domains.iter().any(|x| x == "crates.io"));
+        assert!(!one.domains.iter().any(|x| x == "proxy.golang.org"));
+        // A narrower selection is a different envelope.
+        assert_ne!(one.envelope_hash, all.envelope_hash);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Both entry points produce byte-identical output for the same
+    /// selection — `compile_one` is not a second implementation.
+    #[test]
+    fn compile_one_agrees_with_compile_on_the_same_selection() {
+        let d = tmpdir("agree");
+        write(&d, "Cargo.lock", "x\n");
+        let all = compile(&d).unwrap();
+        let one = compile_one(&d, Path::new("Cargo.lock")).unwrap();
+        assert_eq!(one.envelope_hash, all.envelope_hash);
+        assert_eq!(one.domains, all.domains);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A file that is not a recognized lockfile is refused by name rather
+    /// than silently producing an empty envelope.
+    #[test]
+    fn compile_one_refuses_an_unrecognized_file() {
+        let d = tmpdir("unrec");
+        write(&d, "notes.txt", "hello\n");
+        match compile_one(&d, Path::new("notes.txt")) {
+            Err(CompileError::UnrecognizedLockfile(n)) => assert_eq!(n, "notes.txt"),
+            other => panic!("expected UnrecognizedLockfile, got {other:?}"),
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 
