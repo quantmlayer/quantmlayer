@@ -171,6 +171,28 @@ fn print_summary(path: &str, p: &Profile) {
         "  exec allow   : {} entry(ies)",
         p.processes.allow_exec.len()
     );
+    // Provenance of a compiled profile. Surfaced here because `ql validate` is
+    // where someone reviewing a profile they did not write looks first, and
+    // "was this derived from a committed tree?" is not answerable from the
+    // domain list.
+    if let Some(approved) = &p.approved_for {
+        if !approved.lockfiles.is_empty() {
+            println!("  compiled from: {} lockfile(s)", approved.lockfiles.len());
+            for l in &approved.lockfiles {
+                let note = match l.vcs {
+                    ql_profile::LockfileVcs::Clean => "committed",
+                    ql_profile::LockfileVcs::Dirty => "UNCOMMITTED at compile time",
+                    ql_profile::LockfileVcs::Unknown => "VCS state unknown at compile time",
+                };
+                println!(
+                    "      {} ({}, {})",
+                    l.path,
+                    &l.sha256[..16.min(l.sha256.len())],
+                    note
+                );
+            }
+        }
+    }
 }
 
 /// Render an optional numeric limit as a string ("unset" when absent).

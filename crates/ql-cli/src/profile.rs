@@ -80,9 +80,19 @@ fn sign(args: &[String]) -> ExitCode {
     // bytes to sign, so the signature covers it. Flags are authoritative over
     // any approved_for already in the file.
     if approve_commit.is_some() || approve_image.is_some() {
+        // Lockfile pins are set by `ql compile`, not by these flags. Carry
+        // them across: dropping them here would silently strip a compiled
+        // profile's start-up verification during signing — the opposite of
+        // what signing is for.
+        let lockfiles = profile
+            .approved_for
+            .as_ref()
+            .map(|a| a.lockfiles.clone())
+            .unwrap_or_default();
         profile.approved_for = Some(ApprovedFor {
             commit: approve_commit,
             image_digest: approve_image,
+            lockfiles,
         });
     }
     // Sign the canonical bytes (profile minus any existing signature), so
@@ -249,6 +259,7 @@ mod tests {
             approved_for: Some(ApprovedFor {
                 commit: Some("aaa".to_string()),
                 image_digest: None,
+                lockfiles: Vec::new(),
             }),
             ..Default::default()
         };
@@ -256,6 +267,7 @@ mod tests {
         b.approved_for = Some(ApprovedFor {
             commit: Some("bbb".to_string()),
             image_digest: None,
+            lockfiles: Vec::new(),
         });
         assert_ne!(a.signing_bytes().unwrap(), b.signing_bytes().unwrap());
     }

@@ -11,6 +11,7 @@ rust-version.workspace = true
 # consistent with the rest of the workspace.
 [dependencies]
 ql-profile = { workspace = true }
+ql-compile = { workspace = true }
 ql-enforce = { workspace = true }
 ql-broker = { workspace = true }
 ql-learn = { workspace = true }

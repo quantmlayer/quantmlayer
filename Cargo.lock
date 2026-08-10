@@ -467,6 +467,7 @@ dependencies = [
  "libc",
  "ql-audit",
  "ql-broker",
+ "ql-compile",
  "ql-enforce",
  "ql-learn",
  "ql-profile",
@@ -475,6 +476,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+]
+
+[[package]]
+name = "ql-compile"
+version = "0.2.0"
+dependencies = [
+ "ql-profile",
+ "sha2",
 ]
 
 [[package]]

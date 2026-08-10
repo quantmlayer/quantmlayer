@@ -1,0 +1,13 @@
+[package]
+name = "ql-compile"
+description = "Deterministic lockfile-derived egress envelopes for QuantmLayer profiles: read a project's dependency lockfile, emit the registry domains that dependency set legitimately needs, bound to the lockfile's content hash. No LLM, no kernel changes — same lockfile in, same envelope out."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ql-profile = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]

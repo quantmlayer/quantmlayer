@@ -206,6 +206,30 @@ pub fn cmd(args: &[String]) -> ExitCode {
         }
     }
 
+    // Lockfile pins (written by `ql compile`) are verified before the cell
+    // starts. A profile compiled from one dependency set must not be used
+    // against a different one: the envelope describes the registries THOSE
+    // lockfiles need. Fail closed, and always name the file and the fix — a
+    // bare "denied" here would be unactionable.
+    {
+        let root = workspace
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let mismatches = ql_compile::verify_pins(&profile, &root);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("ql run: {m}");
+            }
+            eprintln!(
+                "ql run: this profile was compiled from those lockfiles — re-run \
+                 `ql compile` to recompile the envelope, or use a profile without \
+                 lockfile pins."
+            );
+            return ExitCode::from(2);
+        }
+    }
+
     // If a workspace is given, grant read-write to it.
     if let Some(ws) = workspace {
         profile.filesystem.readwrite.push(format!("{ws}/**"));
@@ -1237,6 +1261,7 @@ mod tests {
             approved_for: Some(ql_profile::ApprovedFor {
                 commit: commit.map(str::to_string),
                 image_digest: image.map(str::to_string),
+                lockfiles: Vec::new(),
             }),
             ..Default::default()
         }

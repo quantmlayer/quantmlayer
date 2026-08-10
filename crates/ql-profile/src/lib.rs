@@ -117,6 +117,63 @@ pub struct ApprovedFor {
     /// The container image digest this policy was approved for, if pinned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
+    /// Dependency lockfiles this policy was compiled from (see `ql compile`),
+    /// each pinned to its content hash. A cell refuses to start when a pinned
+    /// lockfile is missing or has changed: the egress envelope describes the
+    /// dependency set in *those* lockfiles, so a different lockfile means the
+    /// policy no longer describes the project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lockfiles: Vec<LockfilePin>,
+}
+
+/// Version-control state of a lockfile at the moment a policy was compiled
+/// from it.
+///
+/// Recorded because the provenance question a reviewer asks about a compiled
+/// profile — "was this derived from something committed?" — cannot be answered
+/// from the domain list alone, and a warning printed at compile time is gone
+/// by the time anyone audits the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LockfileVcs {
+    /// Tracked by git with no uncommitted changes: the policy was compiled
+    /// from a committed state.
+    Clean,
+    /// Tracked and modified, or untracked inside a git repository: compiled
+    /// from a working tree, not a committed state.
+    Dirty,
+    /// Not in a git repository, or git was unavailable — state not determined.
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for LockfileVcs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LockfileVcs::Clean => "clean",
+            LockfileVcs::Dirty => "dirty",
+            LockfileVcs::Unknown => "unknown",
+        })
+    }
+}
+
+/// A dependency lockfile pinned to its content hash, recorded by `ql compile`.
+///
+/// Because [`ApprovedFor`] is covered by [`Profile::signing_bytes`], a signed
+/// profile's lockfile pins cannot be altered without invalidating the
+/// signature — including the recorded VCS state, so a profile cannot be made
+/// to look like it came from a clean tree after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockfilePin {
+    /// Path to the lockfile, relative to the project root the profile is used
+    /// from.
+    pub path: String,
+    /// Lowercase-hex SHA-256 of the lockfile's exact bytes at compile time.
+    pub sha256: String,
+    /// Whether this lockfile was committed when the policy was compiled from
+    /// it. Durable provenance for whoever reads or audits the profile later.
+    #[serde(default)]
+    pub vcs: LockfileVcs,
 }
 
 /// A detached signature attached to a [`Profile`] by an authorizing party.

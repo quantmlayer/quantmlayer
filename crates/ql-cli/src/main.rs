@@ -6,6 +6,7 @@
 //! * `ql run --profile <p.yaml> [--workspace <dir>] [--verbose] -- <cmd...>`
 //!   Run a command inside a containment cell built from the profile.
 //! * `ql validate --profile <p.yaml>`
+//! * `ql compile [<dir>]` — lockfile-derived egress envelope
 //!   Load a profile, validate it, and print which walls it will apply.
 //! * `ql broker --profile <p.yaml> [--listen 127.0.0.1:8080]`
 //!   Run the egress broker (allow-list HTTP CONNECT proxy).
@@ -16,6 +17,7 @@
 mod agent;
 mod audit;
 mod broker;
+mod compile;
 mod doctor;
 mod exec_tier;
 mod export;
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
         Some("mcp") => mcp::cmd(&args[1..]),
         Some("learn") => learn::cmd(&args[1..]),
         Some("validate") => validate::cmd(&args[1..]),
+        Some("compile") => compile::cmd(&args[1..]),
         Some("doctor") => doctor::cmd(&args[1..]),
         Some("profile") => profile::cmd(&args[1..]),
         Some("export") => export::cmd(&args[1..]),
@@ -88,6 +91,7 @@ fn print_usage() {
          \x20 ql validate (--profile <p.yaml> | --agent <name> | --mcp) [--json]\n\
          \x20 ql doctor   [--json]\n\
          \x20 ql profile  sign <p.yaml> --key <seed-hex> [--out <path>] | verify <p.yaml> [--signer <pubkey>]\n\
+         \x20 ql compile  [<dir>] [--json] [--profile <in.yaml> --out <out.yaml>] [--replace]\n\
          \x20 ql export   --profile <p.yaml> [--format seccomp|docker] [--out <file>]\n\
          \x20 ql audit    verify <log> [--json] | append <log> ... | export <log> --out <dir> | rotate <log> --archive-dir <dir> | retention <dir> | keygen\n\
          \x20 ql ps\n\

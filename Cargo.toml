@@ -6,6 +6,7 @@ members = [
     "crates/ql-bench",
     "crates/ql-broker",
     "crates/ql-cli",
+    "crates/ql-compile",
     "crates/ql-learn",
     "crates/ql-audit",
     "crates/ql-token",
@@ -38,3 +39,4 @@ ql-learn = { path = "crates/ql-learn" }
 ql-audit = { path = "crates/ql-audit" }
 ql-token = { path = "crates/ql-token" }
 ql-risk = { path = "crates/ql-risk" }
+ql-compile = { path = "crates/ql-compile" }

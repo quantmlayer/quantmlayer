@@ -118,6 +118,48 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql compile [<dir>] --json` — `ql.compile.envelope/v1`
+
+On stdout. Derives an egress envelope from the project's dependency lockfiles:
+the registry domains that dependency set legitimately needs, bound to each
+lockfile's content hash. Exit `0` on success, `2` when no recognized lockfile
+is found (nothing was compiled).
+
+```json
+{
+  "schema": "ql.compile.envelope/v1",
+  "envelope_hash": "ac79fd488c56aa2d…",
+  "lockfiles": [
+    { "path": "package-lock.json", "ecosystem": "npm", "sha256": "ca3d163b…" }
+  ],
+  "domains": ["github.com", "registry.npmjs.org"]
+}
+```
+
+- `envelope_hash` covers every contributing lockfile's path, ecosystem, and
+  content hash. Two compiles agree iff they saw the same lockfiles with the
+  same bytes — an agent that edits a lockfile mid-task changes this hash.
+- `ecosystem` is one of `cargo`, `npm`, `pypi`, `go`.
+- `domains` is sorted and de-duplicated, and is drawn **only** from a fixed
+  per-ecosystem table compiled into `ql-compile`. Lockfile *contents* never
+  become domains, so an attacker who controls a lockfile can cause ecosystem
+  registries to appear but never an arbitrary host.
+
+Deterministic: the same lockfiles always produce a byte-identical envelope.
+
+Applying an envelope to a profile (`--profile`/`--out`) **merges** into the
+existing `allow_domains` by default and records each contributing lockfile in
+`approved_for.lockfiles` as a `{path, sha256, vcs}` pin, where `vcs` is
+`clean`, `dirty`, or `unknown` — durable provenance for whoever audits the
+profile later, since a compile-time warning is gone by then. `ql validate`
+prints it. `--replace` narrows to
+exactly the compiled domains instead, naming what it dropped.
+
+`ql run` verifies those pins before the cell starts: a pinned lockfile that is
+missing or changed fails closed with exit `2`, naming the file. Because
+`approved_for` is covered by the profile's signing bytes, a signed profile's
+pins cannot be altered without invalidating the signature.
+
 ## `ql audit verify <log> --json` — `ql.audit.verify/v1`
 
 On stdout. Exit `0` with `"ok": true`, exit `3` with `"ok": false` and the
