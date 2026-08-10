@@ -104,7 +104,66 @@ pub fn cmd(args: &[String]) -> ExitCode {
             list();
             ExitCode::SUCCESS
         }
+        Some("export") => export(&args[1..]),
         Some(name) => launch(name, &args[1..]),
+    }
+}
+
+/// `ql agent export <name> [--out <file>]` — write a bundled profile to disk.
+///
+/// Bundled profiles live inside the binary, which makes them unmodifiable and
+/// unforgettable — but also means they cannot be fed to tools that take a
+/// profile *file*, chiefly `ql compile`. This writes one out so the compile
+/// workflow has a starting point:
+///
+/// ```text
+/// ql agent export goose --out goose.yaml
+/// ql compile . --profile goose.yaml --out pinned.yaml
+/// ql agent goose --profile pinned.yaml
+/// ```
+///
+/// The written YAML is the bundled profile verbatim. Editing it is the point;
+/// what a cell then enforces comes from the file, not from the binary.
+fn export(args: &[String]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut out: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().cloned(),
+            other if other.starts_with('-') => {
+                eprintln!("ql agent export: unknown option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => name = Some(other),
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("usage: ql agent export <name> [--out <file.yaml>]");
+        return ExitCode::from(2);
+    };
+    let Some(agent) = bundled(name) else {
+        eprintln!("ql agent export: unknown agent `{name}` (see `ql agent list`)");
+        return ExitCode::from(2);
+    };
+    match out {
+        // No --out: to stdout, so it can be piped.
+        None => {
+            print!("{}", agent.yaml);
+            ExitCode::SUCCESS
+        }
+        Some(path) => {
+            if let Err(e) = std::fs::write(&path, agent.yaml) {
+                eprintln!("ql agent export: cannot write {path}: {e}");
+                return ExitCode::from(1);
+            }
+            eprintln!(
+                "ql agent export: wrote {path} (profile for `{}`)",
+                agent.name
+            );
+            eprintln!("ql agent export: next: ql compile . --profile {path} --out pinned.yaml");
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -164,9 +223,20 @@ fn launch(name: &str, rest: &[String]) -> ExitCode {
     // can derive egress from it. Purely a notice — it never changes policy, and
     // it is suppressed when the caller already passed their own profile, since
     // that profile may well be a compiled one.
-    maybe_hint_compile(&cwd);
+    let byo_profile = opts.iter().any(|a| a == "--profile");
+    maybe_hint_compile(&cwd, byo_profile);
 
-    let mut run_args: Vec<String> = vec!["--agent".into(), agent.name.into()];
+    // `--agent` supplies two separable things: the profile SOURCE, and the
+    // agent conveniences (sudo-aware binary resolution, workspace defaulting).
+    // Only the first conflicts with `--profile`. When the caller brings their
+    // own profile — typically one produced by `ql compile` — forward that as
+    // the source and keep the conveniences, so a compiled envelope is usable
+    // with `ql agent` instead of forcing a bare `ql run`.
+    let mut run_args: Vec<String> = if byo_profile {
+        Vec::new()
+    } else {
+        vec!["--agent".into(), agent.name.into()]
+    };
     if !opts.iter().any(|a| a == "--workspace") {
         run_args.push("--workspace".into());
         run_args.push(cwd.to_string_lossy().into_owned());
@@ -186,11 +256,13 @@ fn launch(name: &str, rest: &[String]) -> ExitCode {
 /// as a side effect of a file existing in a directory. This mentions the tool
 /// and stops — it does not compile, apply, or widen anything.
 ///
-/// Note: `ql agent` cannot take `--profile` (it is mutually exclusive with
-/// `--agent`), so there is no "already using a compiled profile" case to
-/// suppress here. Running a compiled envelope today means
-/// `ql run --profile <compiled.yaml> -- <agent>`.
-fn maybe_hint_compile(cwd: &std::path::Path) {
+/// Suppressed when the caller brought their own `--profile`: that profile may
+/// well BE the compiled envelope, and telling someone to run a tool they just
+/// ran is noise.
+fn maybe_hint_compile(cwd: &std::path::Path, byo_profile: bool) {
+    if byo_profile {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(cwd) else {
         return;
     };
@@ -349,6 +421,20 @@ mod tests {
                 "agents/{}.yaml: private ranges must be blocked",
                 a.name
             );
+        }
+    }
+
+    /// Every bundled profile can be written out and parsed back — this is the
+    /// entry point to the `ql compile` workflow, so a profile that exports to
+    /// something unloadable would dead-end it.
+    #[test]
+    fn every_bundled_profile_exports_to_loadable_yaml() {
+        for a in AGENTS {
+            let p = Profile::from_yaml(a.yaml)
+                .unwrap_or_else(|e| panic!("agents/{}.yaml must parse: {e}", a.name));
+            let round = Profile::from_yaml(&p.to_yaml().expect("serializes"))
+                .unwrap_or_else(|e| panic!("agents/{}.yaml must round-trip: {e}", a.name));
+            assert_eq!(round.network.allow_domains, p.network.allow_domains);
         }
     }
 
