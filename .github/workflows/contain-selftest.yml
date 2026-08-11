@@ -33,7 +33,24 @@ jobs:
           set -euo pipefail
           cargo build --release -p ql-cli
           sudo install -m755 target/release/ql /usr/local/bin/ql
+          # install.sh also loads an AppArmor profile, and building from source
+          # skips it. On Ubuntu 24.04 — which ubuntu-latest is — an unconfined
+          # binary may create a user namespace but is denied capabilities
+          # inside it, so the mount wall fails with EACCES and ql refuses to
+          # run the workload uncontained. Same steps install.sh performs.
+          if command -v apparmor_parser >/dev/null && [ -d /sys/kernel/security/apparmor ]; then
+            sudo install -d /etc/apparmor.d
+            sudo install -m644 packaging/apparmor/usr.local.bin.ql /etc/apparmor.d/usr.local.bin.ql
+            sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.ql
+            echo "AppArmor profile loaded"
+          fi
           ql --version
+
+      # A cell that cannot be built makes every later assertion vacuous, so
+      # surface the substrate before running the workload.
+      - name: Report enforcement substrate
+        shell: bash
+        run: sudo ql doctor || true
 
       - name: Contain a workload that touches an allowed and a denied host
         uses: ./.github/actions/contain
