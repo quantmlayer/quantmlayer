@@ -17,6 +17,7 @@
 mod agent;
 mod audit;
 mod broker;
+mod ci;
 mod compile;
 mod doctor;
 mod exec_tier;
@@ -88,7 +89,7 @@ fn print_usage() {
          USAGE:\n\
          \x20 ql agent    list | export <name> [--out <p.yaml>] | <name> [run options] [-- <extra agent args>]   (claude, codex, goose, ...)\n\
          \x20 ql mcp      list <config.json> | wrap <config.json> (--in-place|--out <path>) [--profile <p.yaml>] [--broker] [--audit <log.jsonl>] | unwrap <config.json> (--in-place|--out <path>)\n\
-         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--observe [--strict]] [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--result-json <out.json>] [--verdicts <out.jsonl>] [--prune-provider] [--verbose] [--broker] -- <cmd...>\n\
+         \x20 ql run      --profile <p.yaml> | --agent <name> | --mcp [--observe [--strict]] [--workspace <dir>] [--audit <log.jsonl>] [--proposed <p.yaml>] [--issue-token <out.json>] [--system-id <id> [--model-version <v>]] [--require-signed] [--trust-signer <pubkey>]... [--expect-commit <hash>] [--expect-image <digest>] [--result-json <out.json>] [--verdicts <out.jsonl>] [--prune-provider] [--ci] [--verbose] [--broker] -- <cmd...>\n\
          \x20 ql learn    [--out <p.yaml>] [--json] [--verbose] -- <cmd...>\n\
          \x20 ql validate (--profile <p.yaml> | --agent <name> | --mcp) [--json]\n\
          \x20 ql doctor   [--json]\n\

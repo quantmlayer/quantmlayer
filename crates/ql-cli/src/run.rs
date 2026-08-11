@@ -36,6 +36,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut audit_path: Option<String> = None;
     let mut verdicts_path: Option<String> = None;
     let mut prune_provider = false;
+    let mut ci_mode = false;
     let mut proposed_path: Option<String> = None;
     let mut issue_token_path: Option<String> = None;
     let mut system_id: Option<String> = None;
@@ -65,6 +66,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--audit" => audit_path = it.next().cloned(),
             "--verdicts" => verdicts_path = it.next().cloned(),
             "--prune-provider" => prune_provider = true,
+            "--ci" => ci_mode = true,
             "--proposed" => proposed_path = it.next().cloned(),
             "--issue-token" => issue_token_path = it.next().cloned(),
             "--system-id" => system_id = it.next().cloned(),
@@ -363,6 +365,18 @@ pub fn cmd(args: &[String]) -> ExitCode {
         write_exec_tier_record(audit, tier, system.as_ref());
     }
 
+    // --ci is an alias, not a mode: it fills in machine-readable artifact paths
+    // the caller did not give, so a workflow can reference them without passing
+    // matching flags in two places. Explicit flags always win.
+    if ci_mode {
+        if verdicts_path.is_none() {
+            verdicts_path = Some(crate::ci::DEFAULT_VERDICTS.to_string());
+        }
+        if result_json.is_none() {
+            result_json = Some(crate::ci::DEFAULT_RESULT_JSON.to_string());
+        }
+    }
+
     // Real-time verdicts stream (--verdicts). Created before the cell starts
     // so a tail -f reader is attached from the first decision. Failure to
     // create it refuses the run: the operator asked for the stream, so
@@ -429,6 +443,17 @@ pub fn cmd(args: &[String]) -> ExitCode {
 
     if let Some(text) = summary.render(audit_path.as_deref()) {
         eprintln!("{text}");
+    }
+    if ci_mode {
+        crate::ci::report(
+            &summary,
+            verdicts_path
+                .as_deref()
+                .unwrap_or(crate::ci::DEFAULT_VERDICTS),
+            result_json
+                .as_deref()
+                .unwrap_or(crate::ci::DEFAULT_RESULT_JSON),
+        );
     }
     crate::registry::deregister(&id);
     code

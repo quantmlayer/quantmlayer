@@ -118,6 +118,26 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql run --ci`
+
+An alias, not a mode: it fills in machine-readable artifact paths the caller
+did not give (`ql-verdicts.jsonl`, `ql-result.json` — explicit flags win),
+emits denials as GitHub `::notice` annotations, and appends a table to
+`$GITHUB_STEP_SUMMARY` when the runner provides one. It adds no enforcement
+and changes no policy.
+
+**`--ci` does not fail a build on denials.** A denial is what the agent
+attempted, not a failure — a real run can be denied several destinations,
+route around them, and pass its tests. Exit semantics are unchanged: `ql run`
+still returns the contained command's code, containment failures still exit
+1/2, and gating on a policy change is `ql replay`'s job (exit 3 on a
+regression) in its own step.
+
+Denied targets are agent-chosen strings, so they are scrubbed before being
+written into an annotation: control characters are removed by the run summary
+on the way in, and `::` runs are collapsed on the way out, so a contained
+agent cannot forge or terminate a workflow command.
+
 ## `ql compile [<dir>] --json` — `ql.compile.envelope/v1`
 
 On stdout. Derives an egress envelope from the project's dependency lockfiles:

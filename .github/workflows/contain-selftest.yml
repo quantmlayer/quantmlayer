@@ -1,0 +1,84 @@
+name: contain-selftest
+
+# Dogfoods the composite Action in this repo before it is split out for the
+# marketplace. It runs a real (small) workload inside a cell and asserts the
+# artifacts the Action promises actually appear.
+#
+# Note what this does NOT assert: that enforcement reached tier 1. GitHub's
+# hosted runners do not expose BPF-LSM, so the exec wall falls back. The
+# `ql doctor` step prints the tier so a reader can see which walls were live
+# rather than assuming. Tier-1 verification happens on a real box.
+
+on:
+  push:
+    paths:
+      - '.github/actions/contain/**'
+      - '.github/workflows/contain-selftest.yml'
+      - 'crates/ql-cli/src/ci.rs'
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Contain a workload that touches an allowed and a denied host
+        uses: ./.github/actions/contain
+        id: run
+        with:
+          agent: claude
+          run: |
+            curl -s --max-time 20 https://crates.io -o /dev/null || true
+            curl -s --max-time 10 https://pastebin.com -o /dev/null || true
+            echo workload-finished
+
+      - name: Assert the promised artifacts exist and are well-formed
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ steps.run.outputs.verdicts }}"
+          r="${{ steps.run.outputs.result }}"
+          test -f "$v" || { echo "::error::no verdict stream at $v"; exit 1; }
+          test -f "$r" || { echo "::error::no result document at $r"; exit 1; }
+
+          # First line must be the coverage header, so a consumer can tell an
+          # axis with no coverage from one that was covered and saw nothing.
+          head -1 "$v" | jq -e '.type == "header"' > /dev/null \
+            || { echo "::error::verdict stream is missing its coverage header"; exit 1; }
+
+          # Every remaining line must be a complete JSON decision record.
+          tail -n +2 "$v" | while read -r line; do
+            printf '%s' "$line" | jq -e '.type == "decision" and .source and .decision' > /dev/null \
+              || { echo "::error::malformed verdict line: $line"; exit 1; }
+          done
+
+          jq -e '.schema == "ql.run.result/v1"' "$r" > /dev/null \
+            || { echo "::error::unexpected result schema"; exit 1; }
+
+          echo "verdict stream and result document are well-formed"
+
+      - name: Replay the run against a tightened profile (should regress)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build the tightened profile with shipped commands rather than by
+          # editing YAML: exported profiles keep their source comments, so
+          # text-munging them is fragile. Compiling an npm-only envelope over
+          # the claude profile drops crates.io, which the run above used — so
+          # replay must see exactly one regression.
+          ql agent export claude --out claude.yaml
+          mkdir -p npm-only && echo '{}' > npm-only/package-lock.json
+          ql compile npm-only --profile claude.yaml --out tightened.yaml --replace
+
+          set +e
+          ql replay "${{ steps.run.outputs.verdicts }}" --profile tightened.yaml
+          code=$?
+          set -e
+          # 3 = regression found (expected). 0 would mean the run made no
+          # allowed egress calls, which would make this assertion vacuous.
+          if [ "$code" -ne 3 ]; then
+            echo "::error::expected exit 3 from ql replay, got $code"
+            exit 1
+          fi
+          echo "replay correctly reported a regression"

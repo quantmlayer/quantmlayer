@@ -1,0 +1,98 @@
+name: 'Contain an AI coding agent'
+description: >-
+  Run a command inside a QuantmLayer cell: least-privilege filesystem, brokered
+  egress, and content-verified exec, enforced by the kernel. Reports what the
+  walls did as job annotations and a step summary.
+author: 'QuantmLayer'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  run:
+    description: 'The command to run inside the cell.'
+    required: true
+  agent:
+    description: >-
+      Bundled agent profile to contain with (claude, codex, goose, ...).
+      Mutually exclusive with `profile`.
+    required: false
+    default: ''
+  profile:
+    description: >-
+      Path to a profile file, e.g. one produced by `ql compile`. Mutually
+      exclusive with `agent`.
+    required: false
+    default: ''
+  version:
+    description: 'QuantmLayer release to install. Defaults to the latest.'
+    required: false
+    default: ''
+  broker:
+    description: 'Route egress through the brokering proxy.'
+    required: false
+    default: 'true'
+  workspace:
+    description: 'Directory granted read-write. Defaults to the workspace.'
+    required: false
+    default: ${{ github.workspace }}
+
+outputs:
+  verdicts:
+    description: 'Path to the JSONL verdict stream (one line per decision).'
+    value: ${{ steps.contain.outputs.verdicts }}
+  result:
+    description: 'Path to the run result document (ql.run.result/v1).'
+    value: ${{ steps.contain.outputs.result }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install QuantmLayer
+      shell: bash
+      env:
+        QL_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        curl -fsSL https://raw.githubusercontent.com/quantmlayer/quantmlayer/main/scripts/install.sh | sh
+        ql --version
+
+    # Enforcement depends on what the runner's kernel exposes. Printing doctor
+    # output means a job that silently fell back to a weaker tier is visible in
+    # the log rather than mistaken for full containment.
+    - name: Report enforcement tier
+      shell: bash
+      run: sudo ql doctor || true
+
+    - name: Contain
+      id: contain
+      shell: bash
+      env:
+        QL_AGENT: ${{ inputs.agent }}
+        QL_PROFILE: ${{ inputs.profile }}
+        QL_BROKER: ${{ inputs.broker }}
+        QL_WORKSPACE: ${{ inputs.workspace }}
+        QL_RUN: ${{ inputs.run }}
+      run: |
+        set -euo pipefail
+        if [ -n "$QL_AGENT" ] && [ -n "$QL_PROFILE" ]; then
+          echo "::error::specify either 'agent' or 'profile', not both"
+          exit 2
+        fi
+        if [ -z "$QL_AGENT" ] && [ -z "$QL_PROFILE" ]; then
+          echo "::error::one of 'agent' or 'profile' is required"
+          exit 2
+        fi
+
+        args=(run --ci --workspace "$QL_WORKSPACE")
+        [ -n "$QL_PROFILE" ] && args+=(--profile "$QL_PROFILE")
+        [ -n "$QL_AGENT" ] && args+=(--agent "$QL_AGENT")
+        [ "$QL_BROKER" = "true" ] && args+=(--broker)
+
+        echo "verdicts=ql-verdicts.jsonl" >> "$GITHUB_OUTPUT"
+        echo "result=ql-result.json" >> "$GITHUB_OUTPUT"
+
+        # ql run exits with the contained command's code, so the step fails
+        # exactly when the workload fails — denials do not fail the build.
+        # Use a separate `ql replay` step to gate on policy regressions.
+        sudo -E ql "${args[@]}" -- bash -c "$QL_RUN"

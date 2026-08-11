@@ -109,6 +109,36 @@ impl RunSummary {
         }
     }
 
+    /// Denied targets with their counts, plus the number of distinct targets
+    /// beyond the named cap. Exposed for the `--ci` reporter; already
+    /// sanitized by [`sanitize`] on the way in.
+    pub fn denied_targets(&self) -> (Vec<(String, u64)>, u64) {
+        let named = self
+            .denied_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (named.clone(), self.denied_overflow.load(Ordering::Relaxed))
+    }
+
+    /// `(egress_allowed, egress_denied, exec_allowed, exec_denied)` and
+    /// whether each axis was live.
+    pub fn counts(&self) -> ((u64, u64, bool), (u64, u64, bool)) {
+        (
+            (
+                self.egress_allowed.load(Ordering::Relaxed),
+                self.egress_denied.load(Ordering::Relaxed),
+                self.egress_seen.load(Ordering::Relaxed) == 1
+                    || self.egress_live.load(Ordering::Relaxed) == 1,
+            ),
+            (
+                self.exec_allowed.load(Ordering::Relaxed),
+                self.exec_denied.load(Ordering::Relaxed),
+                self.exec_seen.load(Ordering::Relaxed) == 1
+                    || self.exec_live.load(Ordering::Relaxed) == 1,
+            ),
+        )
+    }
+
     /// Render the summary, or `None` when no reporting wall was live (in
     /// which case printing anything would imply coverage that didn't exist).
     pub fn render(&self, audit_path: Option<&str>) -> Option<String> {
