@@ -23,11 +23,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Build from THIS commit rather than installing a release. A self-test
+      # that installed the latest release could only ever exercise released
+      # behaviour — it would pass while the commit under test was broken, and
+      # fail on any feature not yet cut into a release.
+      - name: Build ql from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p ql-cli
+          sudo install -m755 target/release/ql /usr/local/bin/ql
+          ql --version
+
       - name: Contain a workload that touches an allowed and a denied host
         uses: ./.github/actions/contain
         id: run
         with:
-          agent: claude
+          install: 'false'
+          profile: profiles/coding.yaml
           run: |
             curl -s --max-time 20 https://crates.io -o /dev/null || true
             curl -s --max-time 10 https://pastebin.com -o /dev/null || true
@@ -63,13 +76,12 @@ jobs:
         run: |
           set -euo pipefail
           # Build the tightened profile with shipped commands rather than by
-          # editing YAML: exported profiles keep their source comments, so
-          # text-munging them is fragile. Compiling an npm-only envelope over
-          # the claude profile drops crates.io, which the run above used — so
-          # replay must see exactly one regression.
-          ql agent export claude --out claude.yaml
+          # editing YAML: profiles keep their source comments, so text-munging
+          # them is fragile. Compiling an npm-only envelope over the coding
+          # profile drops crates.io, which the run above used — so replay must
+          # see exactly one regression.
           mkdir -p npm-only && echo '{}' > npm-only/package-lock.json
-          ql compile npm-only --profile claude.yaml --out tightened.yaml --replace
+          ql compile npm-only --profile profiles/coding.yaml --out tightened.yaml --replace
 
           set +e
           ql replay "${{ steps.run.outputs.verdicts }}" --profile tightened.yaml

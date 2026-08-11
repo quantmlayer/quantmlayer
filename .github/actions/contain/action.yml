@@ -15,7 +15,9 @@ inputs:
   agent:
     description: >-
       Bundled agent profile to contain with (claude, codex, goose, ...).
-      Mutually exclusive with `profile`.
+      The agent's own binary must already be installed in the job — this
+      selects a profile, it does not install the agent. Mutually exclusive
+      with `profile`.
     required: false
     default: ''
   profile:
@@ -28,6 +30,13 @@ inputs:
     description: 'QuantmLayer release to install. Defaults to the latest.'
     required: false
     default: ''
+  install:
+    description: >-
+      Install QuantmLayer from a release. Set to 'false' when the job has
+      already put a `ql` binary on PATH — for example one built from source,
+      which is the only way to exercise unreleased behaviour.
+    required: false
+    default: 'true'
   broker:
     description: 'Route egress through the brokering proxy.'
     required: false
@@ -49,12 +58,26 @@ runs:
   using: 'composite'
   steps:
     - name: Install QuantmLayer
+      if: inputs.install == 'true'
       shell: bash
       env:
         QL_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
         curl -fsSL https://raw.githubusercontent.com/quantmlayer/quantmlayer/main/scripts/install.sh | sh
+        ql --version
+
+    # With install disabled the job is responsible for providing `ql`; fail
+    # here with a clear message rather than deep inside the contained run.
+    - name: Verify QuantmLayer is present
+      if: inputs.install != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v ql >/dev/null || {
+          echo "::error::install is 'false' but no 'ql' binary is on PATH"
+          exit 2
+        }
         ql --version
 
     # Enforcement depends on what the runner's kernel exposes. Printing doctor
