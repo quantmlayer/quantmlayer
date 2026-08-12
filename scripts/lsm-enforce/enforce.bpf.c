@@ -70,7 +70,13 @@ struct {
 // Per-exec audit event streamed to userspace for the tamper-evident log. Field
 // order is largest-first so the Rust `#[repr(C)]` mirror has the same layout
 // without padding surprises: ktime 0..8, digest 8..40, comm 40..56, pid 56..60,
-// allowed 60, hashed 61; the tail pads to an 8-byte boundary (size = 64).
+// allowed 60, hashed 61, then two bytes that were already tail padding, then
+// ppid 64..68 padding to 72.
+//
+// `ppid` exists so audit records can be grouped by the process that caused
+// them: four isolated denials read very differently from four denials all
+// under one `npm install`. Grouping only — the parent link is a fact the
+// kernel already knows, unlike causality, which would have to be inferred.
 struct exec_event {
     __u64 ktime; // ns since boot (bpf_ktime_get_ns); userspace maps it to wall time
     __u8 digest[SHA256_LEN];
@@ -78,6 +84,8 @@ struct exec_event {
     __u32 pid;
     __u8 allowed; // 1 = allowed, 0 = denied
     __u8 hashed;  // 1 = content hashed, 0 = hash unavailable (the deny reason)
+    __u8 _pad[2]; // explicit, so the ppid offset is not a padding accident
+    __u32 ppid;   // real parent's tgid at exec time; 0 if unavailable
 };
 
 // Single stream of exec decisions for userspace to record. 64 KiB; if userspace
@@ -225,6 +233,14 @@ int BPF_PROG(enforce_exec, struct linux_binprm *bprm, int ret)
         if (hashed)
             __builtin_memcpy(e->digest, digest, SHA256_LEN);
         e->pid = bpf_get_current_pid_tgid() >> 32;
+        // real_parent, not parent: parent can be a tracer (ptrace reparents),
+        // which would misattribute a debugged process to its debugger.
+        // BPF_CORE_READ is a no-op on failure, leaving ppid 0 = unavailable.
+        {
+            struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+            if (task)
+                e->ppid = BPF_CORE_READ(task, real_parent, tgid);
+        }
         e->allowed = allow;
         e->hashed = hashed;
         bpf_get_current_comm(e->comm, sizeof(e->comm));

@@ -75,6 +75,12 @@ pub struct ExecRecord {
     pub comm: String,
     /// Whether the exec was allowed (digest on the approved list).
     pub allowed: bool,
+    /// The real parent's tgid at exec time, or `None` when the kernel could
+    /// not supply it. Present so audit records can be grouped by the process
+    /// that caused them — four isolated denials read very differently from
+    /// four denials under one `npm install`. This is a parent link the kernel
+    /// already knows, not inferred causality.
+    pub ppid: Option<u32>,
 }
 
 /// Committed argv of one cell exec, captured post-commit by the
@@ -96,8 +102,14 @@ pub struct ArgvRecord {
 }
 
 /// Wire size of `struct exec_event` in enforce.bpf.c: u64 ktime + digest[32] +
-/// comm[16] + u32 pid + 2 flag bytes, tail-padded to an 8-byte boundary.
-const EVENT_SIZE: usize = 64;
+/// comm[16] + u32 pid + 2 flag bytes + 2 explicit pad + u32 ppid, tail-padded
+/// to an 8-byte boundary.
+const EVENT_SIZE: usize = 72;
+
+/// Byte offset of `ppid` within `struct exec_event`. Named because the two
+/// bytes before it were previously tail padding, so the offset is deliberate
+/// rather than incidental.
+const PPID_OFFSET: usize = 64;
 
 /// SHA-256 digest length, mirroring `SHA256_LEN` in enforce.bpf.c.
 const SHA256_LEN: usize = 32;
@@ -162,6 +174,12 @@ fn parse_event(data: &[u8], mono_now_ns: u64, wall_now_ms: u64) -> Option<ExecRe
     let comm = String::from_utf8_lossy(&comm_raw[..end]).into_owned();
     let pid = u32::from_ne_bytes(data[56..60].try_into().ok()?);
     let allowed = data[60] != 0;
+    // 0 means the kernel could not read real_parent; report that as unknown
+    // rather than as pid 0, which is a real (if unusual) tgid.
+    let ppid = match u32::from_ne_bytes(data[PPID_OFFSET..PPID_OFFSET + 4].try_into().ok()?) {
+        0 => None,
+        v => Some(v),
+    };
     // The event happened `mono_now_ns - ktime_ns` ago; subtract that from now.
     let ago_ms = mono_now_ns.saturating_sub(ktime_ns) / 1_000_000;
     let ts_millis = wall_now_ms.saturating_sub(ago_ms);
@@ -171,6 +189,7 @@ fn parse_event(data: &[u8], mono_now_ns: u64, wall_now_ms: u64) -> Option<ExecRe
         pid,
         comm,
         allowed,
+        ppid,
     })
 }
 
@@ -350,5 +369,42 @@ impl ExecEnforcer {
         Ok(Rc::try_unwrap(collected)
             .expect("ring buffer dropped, so this is the sole Rc")
             .into_inner())
+    }
+}
+
+#[cfg(test)]
+mod ppid_wire_tests {
+    use super::*;
+
+    /// The wire layout must match enforce.bpf.c exactly. `ppid` sits at 64,
+    /// in what used to be tail padding, so the struct stays a multiple of 8.
+    #[test]
+    fn event_layout_matches_the_bpf_struct() {
+        // ktime 0..8, digest 8..40, comm 40..56, pid 56..60, flags 60..62,
+        // explicit pad 62..64, ppid 64..68, tail pad to 72.
+        assert_eq!(PPID_OFFSET, 64);
+        assert_eq!(EVENT_SIZE, 72);
+        assert_eq!(EVENT_SIZE % 8, 0, "must stay 8-byte aligned");
+        assert!(PPID_OFFSET + 4 <= EVENT_SIZE);
+    }
+
+    /// A zero ppid means the kernel could not read `real_parent`, and must be
+    /// reported as unknown rather than as pid 0 — which is a real tgid, so
+    /// conflating them would attribute events to the wrong process.
+    #[test]
+    fn zero_ppid_parses_as_unknown_not_as_pid_zero() {
+        let mut buf = [0u8; EVENT_SIZE];
+        buf[0..8].copy_from_slice(&1u64.to_ne_bytes()); // ktime
+        buf[56..60].copy_from_slice(&4242u32.to_ne_bytes()); // pid
+        buf[60] = 1; // allowed
+        buf[61] = 1; // hashed
+        // ppid left zero.
+        let rec = parse_event(&buf, u64::MAX, u64::MAX).expect("parses");
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.ppid, None);
+
+        buf[PPID_OFFSET..PPID_OFFSET + 4].copy_from_slice(&99u32.to_ne_bytes());
+        let rec = parse_event(&buf, u64::MAX, u64::MAX).expect("parses");
+        assert_eq!(rec.ppid, Some(99));
     }
 }

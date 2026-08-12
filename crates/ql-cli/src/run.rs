@@ -958,7 +958,14 @@ fn write_exec_events(
             action: action.to_string(),
             target: ev.digest_hex.unwrap_or_else(|| "<unhashed>".to_string()),
             decision,
-            detail: format!("pid {} ({})", ev.pid, ev.comm),
+            // ppid rides in `detail` rather than as a new AuditEvent field:
+            // the event struct is part of the chain hash, so adding a field
+            // would change how every existing log verifies. Omitted entirely
+            // when unavailable, so records without it read exactly as before.
+            detail: match ev.ppid {
+                Some(ppid) => format!("pid {} ppid {} ({})", ev.pid, ppid, ev.comm),
+                None => format!("pid {} ({})", ev.pid, ev.comm),
+            },
             system: system.cloned(),
         };
         if log.append(event).is_err() {
@@ -1274,6 +1281,7 @@ mod tests {
             allowed: true,
             digest_hex: Some("ab".repeat(32)),
             pid: 7,
+            ppid: None,
             path: "/bin/echo".to_string(),
             argv: vec!["/bin/echo".to_string(), "hi".to_string()],
             committed_argv: vec![],
@@ -1293,6 +1301,7 @@ mod tests {
             allowed: false,
             digest_hex: None,
             pid: 8,
+            ppid: None,
             path: "/bin/ls".to_string(),
             argv: vec!["/bin/ls".to_string()],
             committed_argv: vec![],
@@ -1311,6 +1320,7 @@ mod tests {
             allowed: true,
             digest_hex: Some("cd".repeat(32)),
             pid: 42,
+            ppid: None,
             path: "/usr/bin/git".to_string(),
             argv: vec!["git".to_string(), "push".to_string()],
             committed_argv: vec!["git".to_string(), "push".to_string()],

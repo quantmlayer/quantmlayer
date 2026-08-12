@@ -769,6 +769,14 @@ pub struct Tier2ExecRecord {
     pub digest_hex: Option<String>,
     /// Pid of the execing process, in the supervisor's pid namespace.
     pub pid: u32,
+    /// Parent tgid, for grouping audit records by originating process.
+    ///
+    /// Always `None` under Tier 2: seccomp user-notification delivers the
+    /// execing pid but not its parent, and reading `/proc/<pid>/stat` after
+    /// the fact races the process exiting — a wrong parent is worse than an
+    /// absent one, because grouping would silently misattribute. Tier 1 reads
+    /// `real_parent` in-kernel at the moment of exec and populates this.
+    pub ppid: Option<u32>,
     /// The path the child passed to `execve`.
     pub path: String,
     /// The argv the child passed to `execve` (bounded, observation only — never
@@ -806,6 +814,7 @@ fn record_tier2_exec(e: &ExecEvent, killed_reason: Option<String>) {
         allowed: matches!(e.decision, Decision::Allow),
         digest_hex: e.digest.map(|d| d.to_string()),
         pid: e.pid,
+        ppid: None,
         path: e.path.to_string(),
         argv: e.argv.to_vec(),
         committed_argv: e.committed_argv.to_vec(),
