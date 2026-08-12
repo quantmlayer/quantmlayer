@@ -39,6 +39,7 @@ mod run;
 mod summary;
 mod token;
 mod token_bind;
+mod token_delegate;
 mod token_issue;
 mod validate;
 mod verdicts;

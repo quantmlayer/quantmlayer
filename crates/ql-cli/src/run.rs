@@ -542,6 +542,23 @@ fn now_ms() -> u64 {
 /// unreadable/invalid chain file, a bad trust-root key, or any chain-verification
 /// error (bad signature, broadened link, expired, untrusted root) refuses the run
 /// — the un-narrowed profile is never used as a fallback.
+/// Read a token chain from either a bare JSON array or a credential bundle
+/// (`{"chain": [...]}` or the single-link `{"token": {...}}`).
+fn parse_chain_input(text: &str) -> Result<Vec<ql_token::Token>, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if v.is_array() {
+        return serde_json::from_value(v).map_err(|e| e.to_string());
+    }
+    if let Some(c) = v.get("chain") {
+        return serde_json::from_value(c.clone()).map_err(|e| e.to_string());
+    }
+    if let Some(t) = v.get("token") {
+        let tok = serde_json::from_value(t.clone()).map_err(|e| e.to_string())?;
+        return Ok(vec![tok]);
+    }
+    Err("expected a token array, or a bundle with `chain` or `token`".to_string())
+}
+
 fn bind_from_token_chain(
     profile: &mut Profile,
     chain_path: &str,
@@ -557,7 +574,11 @@ fn bind_from_token_chain(
         eprintln!("ql run: cannot read token chain {chain_path}: {e}");
         ExitCode::from(2)
     })?;
-    let chain: Vec<Token> = serde_json::from_str(&text).map_err(|e| {
+    // Accept either a bare array of tokens or a credential bundle written by
+    // `ql run --issue-token` / `ql token delegate`. Requiring the operator to
+    // hand-extract `.chain` from the file the tool just wrote was a seam with
+    // no purpose — the bundle already carries exactly this array.
+    let chain: Vec<Token> = parse_chain_input(&text).map_err(|e| {
         eprintln!("ql run: invalid token chain {chain_path}: {e}");
         ExitCode::from(2)
     })?;

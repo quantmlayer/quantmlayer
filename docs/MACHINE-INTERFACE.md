@@ -118,6 +118,37 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql token delegate` — cascading attenuation
+
+Hands a sub-agent a strictly narrower slice of an existing credential:
+
+```
+ql token delegate --from parent.json --out child.json --only-domains crates.io
+ql run --profile p.yaml --token-chain child.json --trust-root <hex> -- <cmd>
+```
+
+Each link can only narrow, checked cryptographically at every step and again
+by the verifier at point of use — so an orchestrating agent can spawn helpers
+whose blast radius is smaller than its own, rather than equal to it.
+
+- **Narrowing intersects.** Naming a domain the parent never held yields
+  nothing rather than an error, so a compromised agent asking for more simply
+  gets less. Observed live: a 4-link chain requesting `evil.example` ends with
+  zero domains.
+- **A child cannot outlive its parent** — an over-long expiry is clamped when
+  issued, not left to fail later at use.
+- **Delegating needs the parent's signing key.** A stolen chain without its
+  seed is inert.
+- **An unverifiable parent chain is refused up front**, rather than minting a
+  credential that could never be used.
+- `--token-chain` accepts a bundle (`{"chain": [...]}` or `{"token": {...}}`)
+  or a bare token array.
+
+**A token is not containment.** It governs what the broker admits from a
+client presenting it; the cell's walls are what stop a process from acting. A
+sub-agent with a narrow token in a wide cell is as dangerous as its cell —
+narrow the cell too (`--phase`, `ql compile`).
+
 ## `ql audit export` — `process-tree.md`
 
 Export bundles now include `process-tree.md`: the same exec records as
