@@ -4,13 +4,16 @@
 Two things in the README are copies of data that lives somewhere else: the
 test-count badge (from `cargo test`) and the attack matrix (from
 `benchmark/RESULTS.md`, which `ql-bench` writes). Hand-copied data rots
-silently — the badge went stale twice in two releases (186 -> 225 -> 239),
-and the matrix was six rows while RESULTS.md had eight.
+silently — the badge went stale three releases running, and the matrix was
+six rows while RESULTS.md had eight.
 
-This script regenerates both between markers. `--check` verifies without
-writing, so CI can fail on drift the way `cargo fmt --check` does; that is
-the part that actually prevents recurrence, since nobody remembers to run a
-sync script by hand.
+`--check` verifies without writing so CI can fail on drift, but it checks
+**only the attack matrix**. The matrix is a copy of a committed file, so
+every machine derives the same answer. The test count is not: it depends on
+which targets compile and what cargo has cached, so it legitimately differs
+between a dev box and a CI runner. Gating on it produced a failure the
+developer could not reproduce locally — a gate that cries wolf gets
+disabled, so this one only fires on drift anyone can confirm.
 
 Usage:
     scripts/sync-docs.py            # rewrite the generated regions
@@ -76,14 +79,19 @@ def attack_matrix() -> str:
     return "\n".join([header, sep, *body])
 
 
-def render(text: str) -> str:
-    """Return `text` with every generated region refreshed."""
-    n = count_tests()
-    text = BADGE_RE.sub(
-        f"![tests](https://img.shields.io/badge/tests-{n}%20passing-brightgreen.svg)",
-        text,
-        count=1,
-    )
+def render(text: str, *, badge: bool) -> str:
+    """Return `text` with the generated regions refreshed.
+
+    `badge` is off under `--check`: see the module docstring for why the test
+    count is generated but not gated.
+    """
+    if badge:
+        n = count_tests()
+        text = BADGE_RE.sub(
+            f"![tests](https://img.shields.io/badge/tests-{n}%20passing-brightgreen.svg)",
+            text,
+            count=1,
+        )
     if TABLE_BEGIN in text and TABLE_END in text:
         start = text.index(TABLE_BEGIN) + len(TABLE_BEGIN)
         end = text.index(TABLE_END)
@@ -94,15 +102,19 @@ def render(text: str) -> str:
 def main() -> int:
     check = "--check" in sys.argv
     current = README.read_text()
-    updated = render(current)
+    updated = render(current, badge=not check)
 
     if current == updated:
-        print("sync-docs: README is up to date")
+        print(
+            "sync-docs: attack matrix is current"
+            if check
+            else "sync-docs: README is up to date"
+        )
         return 0
     if check:
         print(
-            "sync-docs: README is out of date — run `make sync-docs` and commit "
-            "the result.",
+            "sync-docs: the README's attack matrix does not match "
+            "benchmark/RESULTS.md — run `make sync-docs` and commit the result.",
             file=sys.stderr,
         )
         return 1
