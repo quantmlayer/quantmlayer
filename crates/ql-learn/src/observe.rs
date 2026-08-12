@@ -65,6 +65,10 @@ pub struct Finding {
     /// Observation order, used to attribute connects to the image that was
     /// running. `None` for aggregated filesystem findings.
     pub seq: Option<u64>,
+    /// True when this exec returned an error — a PATH-search candidate that
+    /// never ran. Reporting it as an exec that happened invites "why did curl
+    /// run eight times".
+    pub failed: bool,
 }
 
 /// The complete observe report: per-dimension counts, the would-deny findings,
@@ -127,6 +131,7 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                 ppid: ev.ppid,
                 ts_millis: Some(ev.ts_millis),
                 seq: Some(ev.seq),
+                failed: ev.failed,
             });
         }
     } else {
@@ -144,6 +149,7 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                 ppid: None,
                 ts_millis: None,
                 seq: None,
+                failed: false,
             });
             report.exec_total += 1;
         }
@@ -164,6 +170,7 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                     ppid: None,
                     ts_millis: None,
                     seq: None,
+                    failed: false,
                 });
             }
             // NotEnforced paths are not listed as findings — the wall makes no

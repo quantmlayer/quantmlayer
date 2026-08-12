@@ -222,10 +222,15 @@ that `verify.py` checks, and this file carries no hash of its own.
   under its tgid rather than left to the ancestor fallback — which would have
   credited it to whatever spawned the process, one image too high.
 
+  A PATH search calls `execve` once per directory and most of those fail with
+  `ENOENT`. Those render as `PATH miss` with no verdict — a program that was
+  never there did not run, so predicting whether it would have been allowed
+  says nothing. The distinction comes from the syscall exit stop: a successful
+  `execve` never returns, so any exec reaching that stop failed.
+
   Caveats worth knowing: counts are connect **attempts** — a `connect`
   interrupted by a signal is restarted and recorded again; observe records
-  exec *attempts*, so a PATH search shows the misses too, since decoding at
-  syscall entry cannot see the outcome; and the parent is read from `/proc` at
+  the parent is read from `/proc` at
   the syscall stop, so a process re-parented after its parent exited reports
   its new parent.
 

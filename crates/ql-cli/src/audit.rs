@@ -226,13 +226,13 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         // Attributed egress: observe mode records the pid at the connect
         // syscall itself, so these attach exactly rather than by correlation.
         if r.event.action == "observe.connect" {
-            if let Some((pid, ppid, seq, _)) = crate::proctree::parse_detail(&r.event.detail) {
+            if let Some(d) = crate::proctree::parse_detail(&r.event.detail) {
                 connects.push(crate::proctree::ConnectNode {
-                    pid,
-                    ppid,
+                    pid: d.pid,
+                    ppid: d.ppid,
                     endpoint: r.event.target.clone(),
                     ts_millis: r.event.ts_millis,
-                    order: seq.unwrap_or(r.event.ts_millis),
+                    order: d.seq.unwrap_or(r.event.ts_millis),
                 });
             } else {
                 unparsed_connects += 1;
@@ -245,11 +245,12 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
             continue;
         }
         match crate::proctree::parse_detail(&r.event.detail) {
-            Some((pid, ppid, seq, comm)) => nodes.push(crate::proctree::ExecNode {
-                order: seq.unwrap_or(r.event.ts_millis),
-                pid,
-                ppid,
-                comm,
+            Some(d) => nodes.push(crate::proctree::ExecNode {
+                order: d.seq.unwrap_or(r.event.ts_millis),
+                failed: d.failed,
+                pid: d.pid,
+                ppid: d.ppid,
+                comm: d.comm,
                 target: r.event.target.clone(),
                 // Observe records an allow as `Info`, not `Allow` — testing
                 // for `Allow` rendered every passing observe exec as a denial.

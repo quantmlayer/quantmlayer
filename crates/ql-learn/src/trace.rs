@@ -45,6 +45,9 @@ const O_CREAT: u64 = 0o100;
 struct Regs {
     nr: i64,
     args: [u64; 6],
+    /// Syscall return value. Only meaningful at an *exit* stop; at entry it
+    /// still holds the syscall number on x86-64.
+    ret: i64,
 }
 
 /// Trace `command` (argv form) to completion, returning what it did.
@@ -134,6 +137,16 @@ fn supervise(root: Pid) -> Result<Observation> {
                     if let Some(regs) = read_regs(pid) {
                         decode_entry(pid, &regs, &mut obs);
                     }
+                } else if let Some(regs) = read_regs(pid) {
+                    // Exit stop. A successful `execve` never returns — the
+                    // image is replaced — so an exec that reaches here failed,
+                    // and its program never ran. This is what separates the
+                    // one real exec from the PATH-search candidates around it.
+                    let is_exec = regs.nr == libc::SYS_execve || regs.nr == libc::SYS_execveat;
+                    if is_exec && regs.ret < 0 {
+                        let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+                        obs.mark_last_exec_failed(owner);
+                    }
                 }
                 *entry = !*entry;
                 let _ = ptrace::syscall(pid, None);
@@ -222,6 +235,7 @@ fn read_regs(pid: Pid) -> Option<Regs> {
     Some(Regs {
         nr: r.orig_rax as i64,
         args: [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9],
+        ret: r.rax as i64,
     })
 }
 
@@ -266,6 +280,8 @@ fn read_regs(pid: Pid) -> Option<Regs> {
             regs.regs[4],
             regs.regs[5],
         ],
+        // aarch64 returns in x0, which also holds arg0 at entry.
+        ret: regs.regs[0] as i64,
     })
 }
 

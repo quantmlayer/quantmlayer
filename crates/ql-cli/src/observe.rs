@@ -184,12 +184,15 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
                 // connect to the image that was running: several execs share a
                 // millisecond, so timestamps alone tie and pick wrongly.
                 let seq = f.seq.map(|s| format!(" seq {s}")).unwrap_or_default();
+                // A candidate the kernel refused: recorded so the tree can say
+                // the program was looked for, not that it ran.
+                let miss = if f.failed { " miss" } else { "" };
                 match (f.pid, f.ppid) {
                     (Some(pid), Some(ppid)) => {
-                        format!("pid {pid} ppid {ppid}{seq} ({name}) NOT ENFORCING (observe mode)")
+                        format!("pid {pid} ppid {ppid}{seq}{miss} ({name}) NOT ENFORCING (observe mode)")
                     }
                     (Some(pid), None) => {
-                        format!("pid {pid}{seq} ({name}) NOT ENFORCING (observe mode)")
+                        format!("pid {pid}{seq}{miss} ({name}) NOT ENFORCING (observe mode)")
                     }
                     _ => "NOT ENFORCING (observe mode)".to_string(),
                 }

@@ -64,6 +64,14 @@ pub struct ExecEvent {
     /// Observation order. See [`Observation::next_seq`] — this, not
     /// `ts_millis`, is what orders events, because a millisecond holds several.
     pub seq: u64,
+    /// True when the `execve` returned an error, so this program never ran.
+    ///
+    /// A PATH search calls `execve` once per directory and most of those fail
+    /// with `ENOENT`. Decoding at syscall entry cannot know that, so every
+    /// candidate was previously reported as an exec that happened — eight
+    /// lines for one `curl`, seven of them programs that were never there.
+    /// The exit stop carries the return value, which is where this comes from.
+    pub failed: bool,
 }
 
 /// Everything the tracer learned from one (or more) processes in a run.
@@ -139,8 +147,24 @@ impl Observation {
                 observed_by: "ptrace",
                 ts_millis,
                 seq: self.next_seq,
+                failed: false,
             });
             self.next_seq += 1;
+        }
+    }
+
+    /// Mark the most recent exec recorded for `pid` as failed.
+    ///
+    /// Called from the syscall *exit* stop, where the return value is known. A
+    /// successful `execve` never returns, so only failures reach this.
+    pub fn mark_last_exec_failed(&mut self, pid: u32) {
+        if let Some(ev) = self
+            .exec_events
+            .iter_mut()
+            .rev()
+            .find(|e| e.pid == pid && !e.failed)
+        {
+            ev.failed = true;
         }
     }
 

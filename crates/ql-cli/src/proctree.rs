@@ -48,6 +48,8 @@ pub struct ExecNode {
     pub target: String,
     /// Whether the exec was allowed (or, in observe mode, would have been).
     pub allowed: bool,
+    /// True when this exec returned an error — the program never ran.
+    pub failed: bool,
     /// False for observe-mode records. An observe "would-deny" is a
     /// prediction, not a denial that happened: nothing was stopped. Labelling
     /// it the same as an enforced denial would tell a reader the process was
@@ -66,13 +68,27 @@ pub struct ExecNode {
 ///
 /// Strict by design: an unrecognized shape returns `None` so the caller can
 /// report the record as ungrouped instead of attaching it to a guess.
-/// Returns `(pid, ppid, seq, comm)`.
+/// The fields carried in an exec or connect record's `detail` string.
 ///
 /// `seq` is the observation sequence when the record carries one. Ordering
 /// uses it rather than the timestamp: several `execve` calls share a
 /// millisecond during a PATH search, so timestamps tie and attribution picks
 /// whichever record came first — observed naming a binary that never ran.
-pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, Option<u64>, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    /// The process that performed the action.
+    pub pid: u32,
+    /// Its parent, when the record carries one.
+    pub ppid: Option<u32>,
+    /// Observation order, when the record carries one.
+    pub seq: Option<u64>,
+    /// True when the `execve` failed — a PATH-search candidate.
+    pub failed: bool,
+    /// The task comm, or the binary's basename in observe mode.
+    pub comm: String,
+}
+
+pub fn parse_detail(detail: &str) -> Option<Detail> {
     let rest = detail.strip_prefix("pid ")?;
     let (pid_str, rest) = rest.split_once(' ')?;
     let pid: u32 = pid_str.parse().ok()?;
@@ -92,13 +108,23 @@ pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, Option<u64>, Stri
         }
         None => (None, rest),
     };
+    let (failed, rest) = match rest.strip_prefix("miss ") {
+        Some(tail) => (true, tail),
+        None => (false, rest),
+    };
 
     // Trailing text after the comm is allowed: observe records append their
     // NOT-ENFORCING marker there. Take up to the first ')' rather than
     // requiring the string to end at it.
     let inner = rest.strip_prefix('(')?;
     let (comm, _tail) = inner.split_once(')')?;
-    Some((pid, ppid, seq, comm.to_string()))
+    Some(Detail {
+        pid,
+        ppid,
+        seq,
+        failed,
+        comm: comm.to_string(),
+    })
 }
 
 /// One egress connect attributed to a process.
@@ -317,18 +343,39 @@ fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<&'a str, usize> {
     t
 }
 
-fn label(n: &ExecNode) -> String {
-    let verdict = match (n.enforced, n.allowed) {
-        (true, true) => "allow",
-        (true, false) => "DENY ",
-        (false, true) => "would-allow",
-        (false, false) => "WOULD-DENY",
-    };
-    let digest = if n.target.len() >= 16 {
-        &n.target[..16]
+/// Shorten a target for display, keeping the identifying end.
+fn shorten(target: &str, width: usize) -> String {
+    if target.chars().count() <= width {
+        return target.to_string();
+    }
+    if target.starts_with('/') {
+        // Keep the tail: `…local/bin/curl` beats `/home/mmhasan/.l`.
+        let tail: String = target
+            .chars()
+            .skip(target.chars().count() - (width - 1))
+            .collect();
+        format!("…{tail}")
     } else {
-        &n.target
+        target.chars().take(width).collect()
+    }
+}
+
+fn label(n: &ExecNode) -> String {
+    // A candidate the kernel refused never ran, so no verdict about it is
+    // meaningful — saying "would-allow" of a program that was not there
+    // invites the reader to think it executed.
+    let verdict = match (n.failed, n.enforced, n.allowed) {
+        (true, _, _) => "PATH miss ",
+        (false, true, true) => "allow",
+        (false, true, false) => "DENY ",
+        (false, false, true) => "would-allow",
+        (false, false, false) => "WOULD-DENY",
     };
+    // Paths truncate from the LEFT: the tail identifies the program, and
+    // cutting `/home/u/.local/bin/curl` to `/home/u/.local/` says nothing.
+    // Digests truncate from the right, where the leading bytes identify them.
+    let shown = shorten(&n.target, 22);
+    let digest = shown.as_str();
     format!("{verdict} pid {:<7} {:<16} {digest}", n.pid, n.comm)
 }
 
@@ -344,6 +391,7 @@ mod tests {
             target: "a".repeat(64),
             allowed,
             enforced: true,
+            failed: false,
             ts_millis: ts,
             order: ts,
         }
@@ -393,11 +441,23 @@ mod tests {
     fn parses_both_detail_forms_and_rejects_anything_else() {
         assert_eq!(
             parse_detail("pid 4242 ppid 100 (npm)"),
-            Some((4242, Some(100), None, "npm".to_string()))
+            Some(Detail {
+                pid: 4242,
+                ppid: Some(100),
+                seq: None,
+                failed: false,
+                comm: "npm".into()
+            })
         );
         assert_eq!(
             parse_detail("pid 7 (sh)"),
-            Some((7, None, None, "sh".to_string()))
+            Some(Detail {
+                pid: 7,
+                ppid: None,
+                seq: None,
+                failed: false,
+                comm: "sh".into()
+            })
         );
         // Strict: no guessing at malformed input.
         assert_eq!(parse_detail("pid abc ppid 1 (x)"), None);
@@ -407,12 +467,24 @@ mod tests {
         // read them, or observe runs group nothing.
         assert_eq!(
             parse_detail("pid 42 ppid 7 (observe) NOT ENFORCING (observe mode)"),
-            Some((42, Some(7), None, "observe".to_string()))
+            Some(Detail {
+                pid: 42,
+                ppid: Some(7),
+                seq: None,
+                failed: false,
+                comm: "observe".into()
+            })
         );
         // With an observation sequence, which is what orders attribution.
         assert_eq!(
             parse_detail("pid 42 ppid 7 seq 13 (curl) NOT ENFORCING (observe mode)"),
-            Some((42, Some(7), Some(13), "curl".to_string()))
+            Some(Detail {
+                pid: 42,
+                ppid: Some(7),
+                seq: Some(13),
+                failed: false,
+                comm: "curl".into()
+            })
         );
     }
 
@@ -678,6 +750,37 @@ mod tests {
         let py_at = t.lines.iter().position(|l| l.contains("python")).unwrap();
         assert_eq!(ep_at, curl_at + 1, "must follow curl: {:?}", t.lines);
         assert!(ep_at < py_at, "credited to the later image: {:?}", t.lines);
+    }
+
+    /// A PATH-search candidate never ran, so it carries no verdict — saying
+    /// "would-allow" of a program that was not there reads as though it
+    /// executed. Observed live: one `curl` produced eight exec records, seven
+    /// of them ENOENT.
+    #[test]
+    fn a_path_miss_is_not_reported_as_a_verdict() {
+        let mut miss = n(80, None, "curl", true, 1);
+        miss.failed = true;
+        miss.enforced = false;
+        let real = n(80, None, "curl", true, 2);
+
+        let t = build_with_connects(&[miss, real], &[], 0);
+        assert!(t.lines[0].contains("PATH miss"), "{:?}", t.lines);
+        assert!(!t.lines[0].contains("would-allow"), "{:?}", t.lines);
+        assert!(t.lines[1].contains("allow"), "{:?}", t.lines);
+    }
+
+    /// Paths keep their identifying tail; digests keep their head.
+    #[test]
+    fn long_targets_shorten_from_the_end_that_matters() {
+        let long_path = "/home/someone/.npm-global/bin/curl";
+        let shown = shorten(long_path, 22);
+        assert!(shown.ends_with("bin/curl"), "{shown}");
+        assert!(shown.starts_with('…'), "{shown}");
+
+        let digest = "a".repeat(64);
+        assert_eq!(shorten(&digest, 16), "a".repeat(16));
+        // Short targets are untouched.
+        assert_eq!(shorten("/usr/bin/curl", 22), "/usr/bin/curl");
     }
 
     /// Unparsed records are counted, never silently dropped.
