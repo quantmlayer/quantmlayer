@@ -92,6 +92,26 @@ ql run --profile pinned.yaml -- ./my-agent build
 # taking the union of every lockfile in the tree:
 ql compile . --lockfile frontend/package-lock.json --profile agent.yaml --out pinned.yaml
 
+# NARROW EACH STEP TO ITS OWN WIDTH — one profile has to cover the session at
+# its widest point, so the agent runs at maximum authority the whole time.
+# Phases fix that: dependency install needs the registries but not your model
+# endpoint; build and test need neither — and that is where freshly downloaded
+# code first executes. A phase can only ever REMOVE authority: its lists are
+# intersected with the base, never added to it.
+#   phases:
+#     install: { only_domains: ["crates.io", "static.crates.io"] }
+#     build:   { no_egress: true, output_path: "/work/target" }
+ql run --profile agent.yaml --phase install -- cargo fetch
+ql run --profile agent.yaml --phase build   -- cargo test
+
+# STATE THE GUARANTEE YOU NEED, not the platform you run on. A host that
+# cannot deliver is named and refused rather than quietly giving you something
+# weaker (`degradation: allow` opts into the substitute instead):
+#   requirements:
+#     exec_identity: content_hash    # the binary's own bytes are hashed
+#     secret_visibility: absent      # ENOENT, not EACCES — nothing to probe
+#     degradation: refuse
+
 # ON-RAMP — dry-run without enforcing. `--observe` traces the agent and
 # reports what enforce mode WOULD have denied, writing a would-deny report to
 # a NOT-ENFORCING audit log, so you can see a profile is right before it
