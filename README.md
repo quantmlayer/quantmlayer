@@ -157,6 +157,19 @@ ql agent export goose --out goose.yaml
 ql compile . --profile goose.yaml --out pinned.yaml
 ql agent goose --profile pinned.yaml
 
+# HAND A SUB-AGENT LESS THAN YOU HOLD — an orchestrator that spawns helpers
+# otherwise gives each one everything it has, making a single helper's blast
+# radius equal to the whole task's. Delegation narrows, and the narrowing is
+# cryptographic: each link is verified back to a trusted root at the point of
+# use. Narrowing INTERSECTS, so asking for authority nobody upstream held
+# yields nothing rather than an error — a compromised sub-agent can only ever
+# lose authority going down the tree:
+ql run --profile agent.yaml --issue-token parent.json -- ./orchestrator
+ql token delegate --from parent.json --out child.json --only-domains crates.io
+ql run --profile agent.yaml --token-chain child.json --trust-root <hex> -- ./helper
+# A token governs what the broker ADMITS, not what a process can do: a
+# sub-agent with a narrow token in a wide cell is as dangerous as its cell.
+
 # Preflight: which containment walls does THIS host actually give you, and which
 # exec-enforcement tier (kernel BPF-LSM vs userspace seccomp-notify)? Read-only —
 # reads /proc and /sys, loads nothing. Add --json for a machine-readable matrix:
@@ -178,6 +191,18 @@ ql export --profile agent.yaml --format docker  --out run.sh
 ql audit append run.log --actor broker --action egress.connect \
   --target 169.254.169.254:80 --decision deny --detail "cloud metadata blocked"
 ql audit verify run.log
+
+# FEED YOUR EXISTING STACK — export the same records as OTLP logs for a
+# collector you already run. An exporter, not a backend: no dashboard, no
+# storage, no query layer. Application-layer tracing shows what an agent SAID
+# it did; these records are what the kernel saw it do. Denials export as WARN,
+# not ERROR — they are the system working, and a stream of ERRORs for correct
+# behaviour gets muted, taking the one that mattered with it. An exported copy
+# is not tamper-evident, so each record carries its sequence and chain hash
+# back to the log that is:
+ql audit export run.log --format otlp --out otlp.json --host $(hostname)
+curl -X POST -H 'Content-Type: application/json' \
+     --data-binary @otlp.json http://localhost:4318/v1/logs
 
 # Kill switch: list running cells, then revoke one instantly and completely —
 # the agent and every process it spawned — recording the revocation in the log:
