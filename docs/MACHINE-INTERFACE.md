@@ -118,6 +118,32 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql audit export` — `process-tree.md`
+
+Export bundles now include `process-tree.md`: the same exec records as
+`records.jsonl`, grouped by the parent the kernel recorded at exec time.
+
+```
+  allow pid 34348   sh               aaaaaaaaaaaaaaaa
+    allow pid 34349   dash             bbbbbbbbbbbbbbbb
+      DENY  pid 34350   curl             cccccccccccccccc
+```
+
+It is a **view**, never evidence: the bundle's evidence is the hash-chained log
+that `verify.py` checks, and this file carries no hash of its own.
+
+- Grouping shows what ran under what. It does not claim causality — parentage
+  and ordering are facts the kernel supplies; "this exec caused that
+  connection" would have to be inferred.
+- A record whose parent is absent appears at top level (the cell's first exec
+  is parented to `ql`, outside the cell; `--since`/`--until` can cut a chain).
+- Denials are leaves: a refused exec never became anyone's parent.
+- **Tier-2 logs group nothing** and say so. seccomp user-notification delivers
+  the execing pid but not its parent, so those records list flat rather than
+  rendering a depth-one tree that would imply parentage was observed.
+- Records whose `detail` does not match `pid N ppid N (comm)` are counted as
+  unplaced rather than attached to a guessed parent.
+
 ## `ql run --phase <name>` and `requirements`
 
 Two additive profile fields, both absent by default — a profile without them

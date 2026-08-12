@@ -202,6 +202,79 @@ fn append(args: &[String]) -> ExitCode {
 /// self-contained evidence bundle (records + manifest + a standalone verifier)
 /// for a contiguous, time-bounded segment of the chain. The bundle is verifiable
 /// by anyone with only the Python standard library — no QuantmLayer needed.
+/// Render the exec records in `window` as a process tree.
+///
+/// A view over the bundle's records, for a reader trying to understand what
+/// happened: four isolated denials read very differently from four denials
+/// under one `npm install`. It groups by the parent the kernel recorded at
+/// exec time — it does not claim causality, which would have to be inferred.
+fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
+    let mut nodes = Vec::new();
+    let mut unparsed = 0usize;
+    for r in window {
+        if !r.event.action.starts_with("exec.") {
+            continue;
+        }
+        match crate::proctree::parse_detail(&r.event.detail) {
+            Some((pid, ppid, comm)) => nodes.push(crate::proctree::ExecNode {
+                pid,
+                ppid,
+                comm,
+                target: r.event.target.clone(),
+                allowed: matches!(r.event.decision, ql_audit::Decision::Allow),
+                ts_millis: r.event.ts_millis,
+            }),
+            None => unparsed += 1,
+        }
+    }
+
+    let tree = crate::proctree::build(&nodes, unparsed);
+    let mut md = String::from(
+        "# Process tree\n\nExec decisions from `records.jsonl`, grouped by the parent the \
+         kernel recorded at exec time. This is a *view* of those records, not evidence in \
+         itself — the bundle's evidence is the hash-chained log, which `verify.py` checks.\n\n\
+         Grouping shows what ran under what. It does not claim causality: ordering and \
+         parentage are facts the kernel supplies, whereas \"this exec caused that connection\" \
+         would have to be inferred.\n\n",
+    );
+
+    if nodes.is_empty() {
+        md.push_str("No exec records in this window.\n");
+        return md;
+    }
+    if !tree.any_parent_data {
+        md.push_str(
+            "**No parent data in this log.** The recording run used the Tier-2 \
+             (seccomp user-notification) exec wall, which delivers the execing pid but not \
+             its parent, so these are listed flat rather than nested. A Tier-1 (BPF-LSM) \
+             run records `real_parent` in-kernel and nests.\n\n",
+        );
+    }
+
+    md.push_str("```\n");
+    for line in &tree.lines {
+        md.push_str(line);
+        md.push('\n');
+    }
+    md.push_str("```\n");
+
+    md.push_str(
+        "\nA record whose parent is absent from this window appears at top level: the \
+         cell's first exec is parented to `ql` itself, which runs outside the cell, and a \
+         `--since`/`--until` filter can cut a chain. Denials appear as leaves because a \
+         refused exec never became anyone's parent.\n",
+    );
+    if tree.unparsed > 0 {
+        md.push_str(&format!(
+            "\n{} exec record(s) could not be placed: their detail field did not match the \
+             expected `pid N ppid N (comm)` form, so their parent is unknown. They are \
+             counted here rather than attached to a guessed parent.\n",
+            tree.unparsed
+        ));
+    }
+    md
+}
+
 fn export(args: &[String]) -> ExitCode {
     let mut log_path: Option<&str> = None;
     let mut out_dir: Option<&str> = None;
@@ -337,11 +410,18 @@ fn export(args: &[String]) -> ExitCode {
         eprintln!("ql audit export: cannot create {out}: {e}");
         return ExitCode::from(2);
     }
+    // The process tree renders the same exec records grouped by what ran under
+    // what. It is a view of records.jsonl, never a substitute: the bundle's
+    // evidence is the verifiable chain, and this file carries no hash of its
+    // own precisely so nobody mistakes it for the record.
+    let tree_md = render_process_tree(window);
+
     for (name, content) in [
         ("records.jsonl", body.as_str()),
         ("manifest.json", manifest.as_str()),
         ("verify.py", VERIFY_PY),
         ("VERIFY.md", VERIFY_MD),
+        ("process-tree.md", tree_md.as_str()),
     ] {
         let p = std::path::Path::new(out).join(name);
         if let Err(e) = std::fs::write(&p, content) {

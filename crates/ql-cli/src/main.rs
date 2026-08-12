@@ -28,6 +28,7 @@ mod mcp;
 mod mcp_gateway;
 mod observe;
 mod policy;
+mod proctree;
 mod profile;
 mod prune;
 mod registry;
