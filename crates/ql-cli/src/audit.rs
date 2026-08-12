@@ -212,7 +212,13 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
     let mut nodes = Vec::new();
     let mut unparsed = 0usize;
     for r in window {
-        if !r.event.action.starts_with("exec.") {
+        // Only per-process decisions, not the wall's configuration records.
+        // `exec.enforce` ("N digest(s) approved") and `exec.digest` describe
+        // how the wall was set up; they have no pid because they are not a
+        // process. Matching on the `exec.` prefix counted them as records that
+        // "could not be placed", reporting a failure where nothing failed —
+        // and a spurious warning on every run trains people to ignore it.
+        if !matches!(r.event.action.as_str(), "exec.run" | "exec.deny") {
             continue;
         }
         match crate::proctree::parse_detail(&r.event.detail) {

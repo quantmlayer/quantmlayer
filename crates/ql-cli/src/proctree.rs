@@ -260,6 +260,20 @@ mod tests {
         assert_eq!(t.lines.len(), 3);
     }
 
+    /// Only per-process decisions belong in the tree. The exec wall also
+    /// writes configuration records (`exec.enforce`, `exec.digest`) that
+    /// describe how it was set up and have no pid; counting those as
+    /// unplaceable reported a failure on every run where nothing had failed.
+    #[test]
+    fn only_per_process_actions_are_tree_candidates() {
+        for action in ["exec.run", "exec.deny"] {
+            assert!(matches!(action, "exec.run" | "exec.deny"), "{action}");
+        }
+        for action in ["exec.enforce", "exec.digest", "egress.connect"] {
+            assert!(!matches!(action, "exec.run" | "exec.deny"), "{action}");
+        }
+    }
+
     /// Unparsed records are counted, never silently dropped.
     #[test]
     fn unparsed_records_are_surfaced() {
