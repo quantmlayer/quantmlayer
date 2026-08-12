@@ -264,13 +264,30 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
     }
 
     let present: BTreeSet<u32> = nodes.iter().map(|n| n.pid).collect();
-    let mut children: BTreeMap<u32, Vec<&ExecNode>> = BTreeMap::new();
+    // Keyed on (pid, order), the same identity connects use. Keying on pid
+    // alone attached a child to *every* exec record of its parent: a shell
+    // that walked a PATH search rendered its one child once per candidate,
+    // including under records for programs that never ran.
+    let mut children: BTreeMap<(u32, u64), Vec<&ExecNode>> = BTreeMap::new();
     let mut roots: Vec<&ExecNode> = Vec::new();
     for n in nodes {
-        match n.ppid {
-            Some(p) if present.contains(&p) && p != n.pid => children.entry(p).or_default().push(n),
-            // Parent outside this set (the cell's first exec, or a chain cut by
-            // filtering), or a self-parent, which would loop.
+        // The parent record that was live when this child appeared: the latest
+        // successful exec of that pid at or before it. A failed candidate
+        // never ran, so it cannot have spawned anything.
+        let parent_key = n
+            .ppid
+            .filter(|p| present.contains(p) && *p != n.pid)
+            .and_then(|p| {
+                nodes
+                    .iter()
+                    .filter(|c| c.pid == p && !c.failed && c.order <= n.order)
+                    .max_by_key(|c| c.order)
+                    .map(|c| (c.pid, c.order))
+            });
+        match parent_key {
+            Some(key) => children.entry(key).or_default().push(n),
+            // Parent outside this set (the cell's first exec, or a chain cut
+            // by filtering), or a self-parent, which would loop.
             _ => roots.push(n),
         }
     }
@@ -298,7 +315,7 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
 #[allow(clippy::too_many_arguments)]
 fn walk(
     node: &ExecNode,
-    children: &BTreeMap<u32, Vec<&ExecNode>>,
+    children: &BTreeMap<(u32, u64), Vec<&ExecNode>>,
     connects: &BTreeMap<(u32, u64), Vec<&ConnectNode>>,
     depth: usize,
     seen: &mut BTreeSet<(u32, u64)>,
@@ -326,7 +343,7 @@ fn walk(
             out.push(format!("{indent}  -> {endpoint}{times}"));
         }
     }
-    if let Some(kids) = children.get(&node.pid) {
+    if let Some(kids) = children.get(&(node.pid, node.order)) {
         for k in kids {
             walk(k, children, connects, depth + 1, seen, out);
         }
@@ -772,6 +789,34 @@ mod tests {
         assert!(t.lines[0].contains("PATH miss"), "{:?}", t.lines);
         assert!(!t.lines[0].contains("would-allow"), "{:?}", t.lines);
         assert!(t.lines[1].contains("allow"), "{:?}", t.lines);
+    }
+
+    /// A child attaches to the parent record that was live when it appeared,
+    /// not to every record sharing the parent's pid. Found running goose: a
+    /// shell walked a PATH search, and its single `head` child rendered five
+    /// times — once under each candidate, including three that never ran.
+    #[test]
+    fn a_child_attaches_to_one_parent_record() {
+        let mut miss = n(100, None, "bash", true, 1);
+        miss.failed = true;
+        let real = n(100, None, "bash", true, 2);
+        let child = n(101, Some(100), "head", true, 3);
+
+        let t = build_with_connects(&[miss, real, child], &[], 0);
+        let head_lines = t.lines.iter().filter(|l| l.contains("head")).count();
+        assert_eq!(
+            head_lines, 1,
+            "child rendered more than once: {:?}",
+            t.lines
+        );
+        // And under the record that actually ran, not the miss.
+        let miss_at = t
+            .lines
+            .iter()
+            .position(|l| l.contains("PATH miss"))
+            .unwrap();
+        let head_at = t.lines.iter().position(|l| l.contains("head")).unwrap();
+        assert!(head_at > miss_at + 1, "attached to the miss: {:?}", t.lines);
     }
 
     /// A failed candidate cannot own a connection: it never ran. The case is
