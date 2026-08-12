@@ -155,8 +155,15 @@ impl Observation {
 
     /// Mark the most recent exec recorded for `pid` as failed.
     ///
-    /// Called from the syscall *exit* stop, where the return value is known. A
-    /// successful `execve` never returns, so only failures reach this.
+    /// Called from the syscall *exit* stop, where the return value is known;
+    /// the caller checks for a negative return before calling.
+    ///
+    /// Pairing assumption: "most recent unfailed exec for this pid" is correct
+    /// because a process is a single flow of control between a syscall's entry
+    /// and exit stops. The one way it breaks is an entry whose path could not
+    /// be read (no event recorded), whose exit would then mark the pid's
+    /// previous, successful exec as failed. Rare enough to accept, but a known
+    /// edge rather than a surprise.
     pub fn mark_last_exec_failed(&mut self, pid: u32) {
         if let Some(ev) = self
             .exec_events

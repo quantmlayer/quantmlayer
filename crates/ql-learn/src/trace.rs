@@ -138,10 +138,12 @@ fn supervise(root: Pid) -> Result<Observation> {
                         decode_entry(pid, &regs, &mut obs);
                     }
                 } else if let Some(regs) = read_regs(pid) {
-                    // Exit stop. A successful `execve` never returns — the
-                    // image is replaced — so an exec that reaches here failed,
-                    // and its program never ran. This is what separates the
-                    // one real exec from the PATH-search candidates around it.
+                    // Exit stop. Both outcomes reach here — a successful
+                    // `execve` also delivers one, with a return value of 0 —
+                    // so it is the return value, not arrival, that separates
+                    // them. A negative value means the program never ran,
+                    // which is what distinguishes the one real exec from the
+                    // PATH-search candidates around it.
                     let is_exec = regs.nr == libc::SYS_execve || regs.nr == libc::SYS_execveat;
                     if is_exec && regs.ret < 0 {
                         let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);

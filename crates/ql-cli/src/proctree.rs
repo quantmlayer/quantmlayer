@@ -218,7 +218,11 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         let chosen = owner.and_then(|pid| {
             nodes
                 .iter()
-                .filter(|n| n.pid == pid && n.order <= c.order)
+                // `!n.failed` matters: a PATH-search candidate never ran, so
+                // it cannot have opened a socket. Without it, a shell whose
+                // `exec` failed and which then connected in place would have
+                // its egress credited to a program that was never there.
+                .filter(|n| n.pid == pid && !n.failed && n.order <= c.order)
                 .max_by_key(|n| n.order)
                 .map(|n| (n.pid, n.order))
         });
@@ -376,7 +380,8 @@ fn label(n: &ExecNode) -> String {
     // Digests truncate from the right, where the leading bytes identify them.
     let shown = shorten(&n.target, 22);
     let digest = shown.as_str();
-    format!("{verdict} pid {:<7} {:<16} {digest}", n.pid, n.comm)
+    // Padded so the pid column lines up across verdicts of differing widths.
+    format!("{verdict:<11} pid {:<7} {:<16} {digest}", n.pid, n.comm)
 }
 
 #[cfg(test)]
@@ -426,13 +431,13 @@ mod tests {
         assert!(t.any_parent_data);
         assert_eq!(t.lines.len(), 2);
         // 34347 is `ql` itself, outside the cell, so 34348 is a root...
-        assert!(t.lines[0].starts_with("  allow pid 34348"), "{:?}", t.lines);
+        // (the verdict column is padded, so match on indent + content rather
+        // than an exact prefix).
+        assert!(t.lines[0].starts_with("  allow"), "{:?}", t.lines);
+        assert!(t.lines[0].contains("pid 34348"), "{:?}", t.lines);
         // ...and 34349 nests one level under it.
-        assert!(
-            t.lines[1].starts_with("    allow pid 34349"),
-            "{:?}",
-            t.lines
-        );
+        assert!(t.lines[1].starts_with("    allow"), "{:?}", t.lines);
+        assert!(t.lines[1].contains("pid 34349"), "{:?}", t.lines);
     }
 
     /// Detail strings round-trip, including the no-ppid form written before
@@ -767,6 +772,37 @@ mod tests {
         assert!(t.lines[0].contains("PATH miss"), "{:?}", t.lines);
         assert!(!t.lines[0].contains("would-allow"), "{:?}", t.lines);
         assert!(t.lines[1].contains("allow"), "{:?}", t.lines);
+    }
+
+    /// A failed candidate cannot own a connection: it never ran. The case is
+    /// `sh -c 'exec nosuchcmd || curl …'` — every candidate fails, the shell
+    /// continues in place, and the connect belongs to the shell. Attaching it
+    /// to the miss would credit egress to a program that was never there.
+    #[test]
+    fn a_failed_exec_cannot_own_a_connection() {
+        let shell = n(90, None, "sh", true, 1);
+        let mut miss = n(90, None, "nosuchcmd", true, 2);
+        miss.failed = true;
+
+        // Connect happens after the failed candidate.
+        let mut c = cn(90, None, "1.2.3.4:443", 3);
+        c.order = 3;
+
+        let t = build_with_connects(&[shell, miss], &[c], 0);
+        let sh_at = t.lines.iter().position(|l| l.contains("sh ")).unwrap();
+        let ep_at = t.lines.iter().position(|l| l.contains("->")).unwrap();
+        assert_eq!(ep_at, sh_at + 1, "must belong to the shell: {:?}", t.lines);
+        // The miss line must not carry it.
+        let miss_at = t
+            .lines
+            .iter()
+            .position(|l| l.contains("PATH miss"))
+            .unwrap();
+        assert!(
+            ep_at < miss_at,
+            "credited to a program never run: {:?}",
+            t.lines
+        );
     }
 
     /// Paths keep their identifying tail; digests keep their head.
