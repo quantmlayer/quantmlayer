@@ -209,6 +209,21 @@ that `verify.py` checks, and this file carries no hash of its own.
   matches no exec record is listed as **unattributed** rather than attached to
   a neighbouring process.
 
+  Attribution picks the image that was **running when the connect happened**,
+  not merely the pid: one pid holds several exec records (a PATH search emits
+  one `execve` per directory tried, and shell `exec` replaces the image in
+  place), and ordering is by observation sequence rather than timestamp
+  because those records share a millisecond. A process that forked and never
+  exec'd is running its parent's image, so its connects attribute to the
+  nearest ancestor that has one.
+
+  Caveats worth knowing: counts are connect **attempts** — a `connect`
+  interrupted by a signal is restarted and recorded again; observe records
+  exec *attempts*, so a PATH search shows the misses too, since decoding at
+  syscall entry cannot see the outcome; and the parent is read from `/proc` at
+  the syscall stop, so a process re-parented after its parent exited reports
+  its new parent.
+
   Enforce mode has no equivalent yet: the broker sits across a veth in another
   network namespace and sees a TCP connection, not a process (see B9).
 - **Observe-mode runs are included, and labelled as predictions.** An observe

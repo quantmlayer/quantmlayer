@@ -155,7 +155,11 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             Verdict::WouldDeny => (Decision::Deny, format!("observe.{}.would_deny", f.kind)),
         };
         let event = AuditEvent {
-            ts_millis: AuditLog::now_millis(),
+            // The syscall-stop time when we have it. Write time would stamp
+            // every record in the run within a millisecond of every other,
+            // destroying the ordering the process tree needs to tell which
+            // image was running when a connect happened.
+            ts_millis: f.ts_millis.unwrap_or_else(AuditLog::now_millis),
             actor: "observe".to_string(),
             action,
             target: f.target.clone(),
@@ -176,12 +180,16 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
                     .next()
                     .filter(|s| !s.is_empty())
                     .unwrap_or("exec");
+                // `seq` is observation order, which is what attributes a
+                // connect to the image that was running: several execs share a
+                // millisecond, so timestamps alone tie and pick wrongly.
+                let seq = f.seq.map(|s| format!(" seq {s}")).unwrap_or_default();
                 match (f.pid, f.ppid) {
                     (Some(pid), Some(ppid)) => {
-                        format!("pid {pid} ppid {ppid} ({name}) NOT ENFORCING (observe mode)")
+                        format!("pid {pid} ppid {ppid}{seq} ({name}) NOT ENFORCING (observe mode)")
                     }
                     (Some(pid), None) => {
-                        format!("pid {pid} ({name}) NOT ENFORCING (observe mode)")
+                        format!("pid {pid}{seq} ({name}) NOT ENFORCING (observe mode)")
                     }
                     _ => "NOT ENFORCING (observe mode)".to_string(),
                 }
@@ -201,7 +209,7 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
     // gone by the time `connect` is called.
     for ev in &report.attributed_connects {
         let event = AuditEvent {
-            ts_millis: AuditLog::now_millis(),
+            ts_millis: ev.ts_millis,
             actor: "observe".to_string(),
             action: "observe.connect".to_string(),
             target: format!("{}:{}", ev.ip, ev.port),

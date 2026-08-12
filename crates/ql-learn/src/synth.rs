@@ -263,7 +263,7 @@ mod tests {
             o.record_open(PathBuf::from(w), true);
         }
         for e in execs {
-            o.record_exec(e.to_string(), 1000, Some(999));
+            o.record_exec(e.to_string(), 1000, Some(999), 1);
         }
         for (nr, name) in syscalls {
             o.record_syscall(*nr, name);

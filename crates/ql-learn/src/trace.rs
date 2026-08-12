@@ -104,7 +104,7 @@ fn supervise(root: Pid) -> Result<Observation> {
         if let Some(p) = exe.to_str() {
             // The root's parent is `ql` itself, outside the traced set, so it
             // is left unknown and renders as a tree root.
-            obs.record_exec(p.to_string(), root.as_raw() as u32, None);
+            obs.record_exec(p.to_string(), root.as_raw() as u32, None, now_ms());
         }
     }
 
@@ -160,6 +160,14 @@ fn supervise(root: Pid) -> Result<Observation> {
 
     obs.process_count = (seen.len() as u32).max(1);
     Ok(obs)
+}
+
+/// Wall-clock milliseconds now, stamped at the syscall stop.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The parent of `pid`, read from `/proc/<pid>/stat` at the syscall stop.
@@ -255,11 +263,11 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
         }
     } else if nr == libc::SYS_execve {
         if let Some(p) = read_cstr(pid, regs.args[0]) {
-            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid));
+            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid), now_ms());
         }
     } else if nr == libc::SYS_execveat {
         if let Some(p) = read_cstr(pid, regs.args[1]) {
-            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid));
+            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid), now_ms());
         }
     } else if nr == libc::SYS_connect {
         if let Some((ip, port)) = read_sockaddr(pid, regs.args[1], regs.args[2]) {
@@ -267,7 +275,7 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
             // read the peer's memory. Carrying it into the record is what
             // makes per-process egress lineage exact in observe mode, with no
             // correlation join anywhere.
-            obs.record_connect(ip, port, pid.as_raw() as u32, ppid_of(pid));
+            obs.record_connect(ip, port, pid.as_raw() as u32, ppid_of(pid), now_ms());
         }
     } else {
         // x86-64 additionally has the legacy open(2)/creat(2); aarch64 routes

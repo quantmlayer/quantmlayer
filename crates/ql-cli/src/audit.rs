@@ -212,6 +212,7 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
     let mut nodes = Vec::new();
     let mut connects = Vec::new();
     let mut unparsed = 0usize;
+    let mut unparsed_connects = 0usize;
     for r in window {
         // Only per-process decisions, not the wall's configuration records.
         // `exec.enforce` ("N digest(s) approved") and `exec.digest` describe
@@ -225,13 +226,16 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         // Attributed egress: observe mode records the pid at the connect
         // syscall itself, so these attach exactly rather than by correlation.
         if r.event.action == "observe.connect" {
-            if let Some((pid, _ppid, _)) = crate::proctree::parse_detail(&r.event.detail) {
+            if let Some((pid, ppid, seq, _)) = crate::proctree::parse_detail(&r.event.detail) {
                 connects.push(crate::proctree::ConnectNode {
                     pid,
+                    ppid,
                     endpoint: r.event.target.clone(),
+                    ts_millis: r.event.ts_millis,
+                    order: seq.unwrap_or(r.event.ts_millis),
                 });
             } else {
-                unparsed += 1;
+                unparsed_connects += 1;
             }
             continue;
         }
@@ -241,7 +245,8 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
             continue;
         }
         match crate::proctree::parse_detail(&r.event.detail) {
-            Some((pid, ppid, comm)) => nodes.push(crate::proctree::ExecNode {
+            Some((pid, ppid, seq, comm)) => nodes.push(crate::proctree::ExecNode {
+                order: seq.unwrap_or(r.event.ts_millis),
                 pid,
                 ppid,
                 comm,
@@ -302,6 +307,15 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         for u in tree.unattributed.iter().take(20) {
             md.push_str(&format!("- `{u}`\n"));
         }
+        if tree.unattributed.len() > 20 {
+            md.push_str(&format!("- …and {} more\n", tree.unattributed.len() - 20));
+        }
+    }
+    if unparsed_connects > 0 {
+        md.push_str(&format!(
+            "\n{unparsed_connects} connect record(s) could not be read: their detail field did \
+             not match the expected form, so the process that opened them is unknown.\n"
+        ));
     }
     if tree.unparsed > 0 {
         md.push_str(&format!(

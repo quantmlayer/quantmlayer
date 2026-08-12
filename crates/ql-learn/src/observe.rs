@@ -59,6 +59,12 @@ pub struct Finding {
     pub pid: Option<u32>,
     /// That process's parent as the tracer saw it.
     pub ppid: Option<u32>,
+    /// Wall-clock ms at the syscall stop, when this finding came from a
+    /// per-process event. `None` for aggregated filesystem findings.
+    pub ts_millis: Option<u64>,
+    /// Observation order, used to attribute connects to the image that was
+    /// running. `None` for aggregated filesystem findings.
+    pub seq: Option<u64>,
 }
 
 /// The complete observe report: per-dimension counts, the would-deny findings,
@@ -119,6 +125,8 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                 verdict,
                 pid: Some(ev.pid),
                 ppid: ev.ppid,
+                ts_millis: Some(ev.ts_millis),
+                seq: Some(ev.seq),
             });
         }
     } else {
@@ -134,6 +142,8 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                 verdict,
                 pid: None,
                 ppid: None,
+                ts_millis: None,
+                seq: None,
             });
             report.exec_total += 1;
         }
@@ -152,6 +162,8 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                     // Filesystem findings aggregate per path, not per process.
                     pid: None,
                     ppid: None,
+                    ts_millis: None,
+                    seq: None,
                 });
             }
             // NotEnforced paths are not listed as findings — the wall makes no
@@ -190,7 +202,7 @@ mod tests {
     fn obs_with(execs: &[(&str, &str)], reads: &[&str], writes: &[&str]) -> Observation {
         let mut o = Observation::default();
         for (path, hex) in execs {
-            o.record_exec(path.to_string(), 1000, Some(999));
+            o.record_exec(path.to_string(), 1000, Some(999), 1);
             o.exec_digests.insert(
                 path.to_string(),
                 ExecDigest::new(HashAlgo::Sha256, hex.to_string()).unwrap(),

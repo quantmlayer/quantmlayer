@@ -55,13 +55,24 @@ pub struct ExecNode {
     pub enforced: bool,
     /// Milliseconds since the Unix epoch.
     pub ts_millis: u64,
+    /// Observation order within the run. Several execs share a millisecond
+    /// during a PATH search, so this — not the timestamp — is what decides
+    /// which image was live when a connect happened. Falls back to
+    /// `ts_millis` for records written before sequences existed.
+    pub order: u64,
 }
 
 /// Parse `pid <n> ppid <n> (comm)` or `pid <n> (comm)` out of a detail string.
 ///
 /// Strict by design: an unrecognized shape returns `None` so the caller can
 /// report the record as ungrouped instead of attaching it to a guess.
-pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, String)> {
+/// Returns `(pid, ppid, seq, comm)`.
+///
+/// `seq` is the observation sequence when the record carries one. Ordering
+/// uses it rather than the timestamp: several `execve` calls share a
+/// millisecond during a PATH search, so timestamps tie and attribution picks
+/// whichever record came first — observed naming a binary that never ran.
+pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, Option<u64>, String)> {
     let rest = detail.strip_prefix("pid ")?;
     let (pid_str, rest) = rest.split_once(' ')?;
     let pid: u32 = pid_str.parse().ok()?;
@@ -74,12 +85,20 @@ pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, String)> {
         None => (None, rest),
     };
 
+    let (seq, rest) = match rest.strip_prefix("seq ") {
+        Some(after) => {
+            let (seq_str, tail) = after.split_once(' ')?;
+            (Some(seq_str.parse::<u64>().ok()?), tail)
+        }
+        None => (None, rest),
+    };
+
     // Trailing text after the comm is allowed: observe records append their
     // NOT-ENFORCING marker there. Take up to the first ')' rather than
     // requiring the string to end at it.
     let inner = rest.strip_prefix('(')?;
     let (comm, _tail) = inner.split_once(')')?;
-    Some((pid, ppid, comm.to_string()))
+    Some((pid, ppid, seq, comm.to_string()))
 }
 
 /// One egress connect attributed to a process.
@@ -87,9 +106,17 @@ pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, String)> {
 pub struct ConnectNode {
     /// The process that opened it.
     pub pid: u32,
+    /// That process's parent, used to attribute a process that forked and
+    /// never exec'd — such a process is running its parent's image, so its
+    /// parent's node is the right owner.
+    pub ppid: Option<u32>,
     /// `ip:port`. Not a domain: by `connect` time the name is resolved and
     /// gone.
     pub endpoint: String,
+    /// Wall-clock ms at the connect syscall.
+    pub ts_millis: u64,
+    /// Observation order; see [`ExecNode::order`].
+    pub order: u64,
 }
 
 /// A rendered tree, plus what could not be placed in it.
@@ -124,14 +151,54 @@ pub struct Tree {
 ///
 /// Pass an empty `connects` slice for a tree of execs alone.
 pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparsed: usize) -> Tree {
-    let mut by_pid: BTreeMap<u32, Vec<&ConnectNode>> = BTreeMap::new();
-    let known: BTreeSet<u32> = nodes.iter().map(|n| n.pid).collect();
+    // Attribution key is (pid, exec timestamp), not pid alone.
+    //
+    // A single pid routinely holds several exec records — a PATH search emits
+    // one `execve` per directory tried, and `exec` in a shell replaces the
+    // image without forking. Keying on pid alone would hang every connect off
+    // whichever record for that pid happened to be walked first, reporting
+    // that `dash` opened a socket that `curl` opened. So each connect attaches
+    // to the *latest exec at or before it*: the image that was actually
+    // running.
+    //
+    // A process that forked and never exec'd has no record of its own; it is
+    // running its parent's image, so its connects attribute to the nearest
+    // ancestor that does have one. That is a fact about fork semantics, not a
+    // guess about proximity.
+    let mut by_node: BTreeMap<(u32, u64), Vec<&ConnectNode>> = BTreeMap::new();
+    // Keyed on (pid, order) — see ExecNode::order for why not the timestamp.
     let mut unattributed = Vec::new();
+    let parent_of: BTreeMap<u32, Option<u32>> = nodes.iter().map(|n| (n.pid, n.ppid)).collect();
+
     for c in connects {
-        if known.contains(&c.pid) {
-            by_pid.entry(c.pid).or_default().push(c);
-        } else {
-            unattributed.push(format!("{} (pid {})", c.endpoint, c.pid));
+        // Resolve to a pid that has exec records, following fork links.
+        let mut owner = Some(c.pid);
+        if !parent_of.contains_key(&c.pid) {
+            owner = c.ppid;
+            let mut hops = 0;
+            while let Some(p) = owner {
+                if parent_of.contains_key(&p) || hops > 16 {
+                    break;
+                }
+                owner = parent_of.get(&p).copied().flatten();
+                hops += 1;
+            }
+            if owner.map(|p| !parent_of.contains_key(&p)).unwrap_or(true) {
+                owner = None;
+            }
+        }
+
+        // Among that pid's execs, the last one at or before this connect.
+        let chosen = owner.and_then(|pid| {
+            nodes
+                .iter()
+                .filter(|n| n.pid == pid && n.order <= c.order)
+                .max_by_key(|n| n.order)
+                .map(|n| (n.pid, n.order))
+        });
+        match chosen {
+            Some(key) => by_node.entry(key).or_default().push(c),
+            None => unattributed.push(format!("{} (pid {})", c.endpoint, c.pid)),
         }
     }
 
@@ -146,8 +213,22 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
     }
     if !tree.any_parent_data {
         // No parent data: list the execs flat rather than implying structure.
+        // Connects still attach to their own process — attribution does not
+        // depend on parentage, and dropping them here silently lost every
+        // endpoint of a single-process run, where the root has no parent and
+        // there are no children to supply one.
         for n in nodes {
             tree.lines.push(format!("  {}", label(n)));
+            if let Some(cs) = by_node.get(&(n.pid, n.order)) {
+                for (endpoint, count) in tally(cs) {
+                    let times = if count > 1 {
+                        format!(" x{count}")
+                    } else {
+                        String::new()
+                    };
+                    tree.lines.push(format!("    -> {endpoint}{times}"));
+                }
+            }
         }
         return tree;
     }
@@ -171,11 +252,15 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         kids.sort_by(by_time);
     }
 
-    // `seen` bounds the walk: a pid appearing twice (pid reuse within one log)
-    // must not be expanded twice, or the render could recurse without end.
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    // `seen` bounds the walk. Keyed on (pid, exec time) rather than pid alone
+    // because one pid legitimately holds several exec records — a PATH search
+    // emits one per directory tried, and shell `exec` replaces the image in
+    // place. Keying on pid would collapse those into a single line and hide
+    // which image was actually running. Cycles are still bounded, since a
+    // record cannot precede itself.
+    let mut seen: BTreeSet<(u32, u64)> = BTreeSet::new();
     for r in roots {
-        walk(r, &children, &by_pid, 0, &mut seen, &mut tree.lines);
+        walk(r, &children, &by_node, 0, &mut seen, &mut tree.lines);
     }
     tree
 }
@@ -184,20 +269,20 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
 fn walk(
     node: &ExecNode,
     children: &BTreeMap<u32, Vec<&ExecNode>>,
-    connects: &BTreeMap<u32, Vec<&ConnectNode>>,
+    connects: &BTreeMap<(u32, u64), Vec<&ConnectNode>>,
     depth: usize,
-    seen: &mut BTreeSet<u32>,
+    seen: &mut BTreeSet<(u32, u64)>,
     out: &mut Vec<String>,
 ) {
     let indent = "  ".repeat(depth + 1);
     out.push(format!("{indent}{}", label(node)));
-    if !seen.insert(node.pid) {
+    if !seen.insert((node.pid, node.order)) {
         // Already expanded elsewhere; render the line but do not recurse.
         return;
     }
     // Endpoints this process opened, collapsed by destination with a count —
     // an `npm install` opens hundreds and one line each would bury the tree.
-    if let Some(cs) = connects.get(&node.pid) {
+    if let Some(cs) = connects.get(&(node.pid, node.order)) {
         let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
         for c in cs {
             *tally.entry(c.endpoint.as_str()).or_default() += 1;
@@ -216,6 +301,20 @@ fn walk(
             walk(k, children, connects, depth + 1, seen, out);
         }
     }
+}
+
+/// Collapse repeated endpoints into `(endpoint, count)` pairs. An `npm
+/// install` opens hundreds of connections and one line each would bury the
+/// tree.
+///
+/// The count is connect *attempts*, not distinct connections: a `connect`
+/// interrupted by a signal is restarted and recorded again.
+fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<&'a str, usize> {
+    let mut t: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in cs {
+        *t.entry(c.endpoint.as_str()).or_default() += 1;
+    }
+    t
 }
 
 fn label(n: &ExecNode) -> String {
@@ -246,6 +345,17 @@ mod tests {
             allowed,
             enforced: true,
             ts_millis: ts,
+            order: ts,
+        }
+    }
+
+    fn cn(pid: u32, ppid: Option<u32>, endpoint: &str, ts_millis: u64) -> ConnectNode {
+        ConnectNode {
+            pid,
+            ppid,
+            endpoint: endpoint.into(),
+            ts_millis,
+            order: ts_millis,
         }
     }
 
@@ -283,11 +393,11 @@ mod tests {
     fn parses_both_detail_forms_and_rejects_anything_else() {
         assert_eq!(
             parse_detail("pid 4242 ppid 100 (npm)"),
-            Some((4242, Some(100), "npm".to_string()))
+            Some((4242, Some(100), None, "npm".to_string()))
         );
         assert_eq!(
             parse_detail("pid 7 (sh)"),
-            Some((7, None, "sh".to_string()))
+            Some((7, None, None, "sh".to_string()))
         );
         // Strict: no guessing at malformed input.
         assert_eq!(parse_detail("pid abc ppid 1 (x)"), None);
@@ -297,7 +407,12 @@ mod tests {
         // read them, or observe runs group nothing.
         assert_eq!(
             parse_detail("pid 42 ppid 7 (observe) NOT ENFORCING (observe mode)"),
-            Some((42, Some(7), "observe".to_string()))
+            Some((42, Some(7), None, "observe".to_string()))
+        );
+        // With an observation sequence, which is what orders attribution.
+        assert_eq!(
+            parse_detail("pid 42 ppid 7 seq 13 (curl) NOT ENFORCING (observe mode)"),
+            Some((42, Some(7), Some(13), "curl".to_string()))
         );
     }
 
@@ -384,18 +499,9 @@ mod tests {
             n(12, Some(10), "true", true, 3),
         ];
         let connects = vec![
-            ConnectNode {
-                pid: 11,
-                endpoint: "1.2.3.4:443".into(),
-            },
-            ConnectNode {
-                pid: 11,
-                endpoint: "1.2.3.4:443".into(),
-            },
-            ConnectNode {
-                pid: 11,
-                endpoint: "5.6.7.8:443".into(),
-            },
+            cn(11, Some(10), "1.2.3.4:443", 5),
+            cn(11, Some(10), "1.2.3.4:443", 5),
+            cn(11, Some(10), "5.6.7.8:443", 6),
         ];
         let t = build_with_connects(&nodes, &connects, 0);
         let joined = t.lines.join("\n");
@@ -424,10 +530,7 @@ mod tests {
     #[test]
     fn an_unmatched_connect_is_listed_not_guessed() {
         let nodes = vec![n(10, None, "sh", true, 1)];
-        let connects = vec![ConnectNode {
-            pid: 999,
-            endpoint: "9.9.9.9:53".into(),
-        }];
+        let connects = vec![cn(999, None, "9.9.9.9:53", 5)];
         let t = build_with_connects(&nodes, &connects, 0);
 
         assert_eq!(t.unattributed.len(), 1);
@@ -436,6 +539,118 @@ mod tests {
         assert!(
             !t.lines.iter().any(|l| l.contains("9.9.9.9")),
             "{:?}",
+            t.lines
+        );
+    }
+
+    /// **The same-pid, different-image case.** A PATH search emits one
+    /// `execve` per directory tried, and shell `exec` replaces an image
+    /// without forking — so one pid holds several exec records. A connect must
+    /// attach to the image that was live when it happened, not to whichever
+    /// record for that pid was walked first. Observed in a real run: `sh -c
+    /// 'exec curl …'` produced eight exec records under a single pid.
+    #[test]
+    fn a_connect_attaches_to_the_image_that_was_running() {
+        let nodes = vec![
+            // Same pid, three images in sequence — a PATH search then the hit.
+            n(20, None, "dash", true, 10),
+            n(20, None, "missing", false, 20),
+            n(20, None, "curl", true, 30),
+        ];
+        // Connect happens after the final exec.
+        let t = build_with_connects(&nodes, &[cn(20, None, "1.2.3.4:443", 40)], 0);
+
+        let find = |needle: &str| {
+            t.lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no `{needle}` line in {:?}", t.lines))
+        };
+        let ep_at = find("->");
+        // The endpoint follows the LAST exec for that pid, not the first.
+        assert_eq!(ep_at, find("curl") + 1, "{:?}", t.lines);
+        assert!(ep_at > find("dash") + 1, "attached to dash: {:?}", t.lines);
+        assert!(
+            ep_at > find("missing") + 1,
+            "attached to the miss: {:?}",
+            t.lines
+        );
+    }
+
+    /// A process that forked and never exec'd is running its parent's image,
+    /// so its connects belong to the parent's node. Observed in a real run:
+    /// curl forked a helper that opened five of six connections and had no
+    /// exec record of its own.
+    #[test]
+    fn a_forked_child_attributes_to_its_parents_image() {
+        let nodes = vec![
+            n(30, None, "sh", true, 10),
+            n(31, Some(30), "curl", true, 20),
+        ];
+        // pid 32 forked from 31 and never exec'd.
+        let t = build_with_connects(&nodes, &[cn(32, Some(31), "1.2.3.4:443", 30)], 0);
+
+        assert!(t.unattributed.is_empty(), "{:?}", t.unattributed);
+        let curl_at = t.lines.iter().position(|l| l.contains("curl")).unwrap();
+        assert!(
+            t.lines[curl_at + 1].contains("-> 1.2.3.4:443"),
+            "{:?}",
+            t.lines
+        );
+    }
+
+    /// A connect that precedes every exec for its pid has no live image to
+    /// attach to, and is reported rather than attached to a later one.
+    #[test]
+    fn a_connect_before_any_exec_is_unattributed() {
+        let nodes = vec![n(40, None, "sh", true, 100)];
+        let t = build_with_connects(&nodes, &[cn(40, None, "1.2.3.4:443", 50)], 0);
+        assert_eq!(t.unattributed.len(), 1);
+        assert!(!t.lines.iter().any(|l| l.contains("->")), "{:?}", t.lines);
+    }
+
+    /// A single-process run has no parent data anywhere, so the tree lists
+    /// flat — but its connects must still appear. Dropping them here silently
+    /// lost every endpoint of `ql run --observe -- curl …`, which is about the
+    /// simplest thing anyone would try.
+    #[test]
+    fn a_flat_listing_still_shows_its_connects() {
+        let nodes = vec![n(50, None, "curl", true, 10)];
+        let t = build_with_connects(&nodes, &[cn(50, None, "1.2.3.4:443", 20)], 0);
+        assert!(!t.any_parent_data);
+        assert!(
+            t.lines.iter().any(|l| l.contains("-> 1.2.3.4:443")),
+            "{:?}",
+            t.lines
+        );
+    }
+
+    /// Ordering uses observation order, not the timestamp. A PATH search
+    /// emits several `execve` calls inside one millisecond; ordering by
+    /// timestamp ties and picks the first, which in a real run attributed a
+    /// connection to a binary that never ran (`/home/.../bin/curl`, ENOENT)
+    /// instead of the `/usr/bin/curl` that opened it.
+    #[test]
+    fn same_millisecond_execs_are_ordered_by_observation_not_time() {
+        let mut nodes = vec![
+            n(60, None, "dash", true, 100),
+            n(60, None, "miss", true, 100),
+            n(60, None, "curl", true, 100),
+        ];
+        // All in the same millisecond; only `order` distinguishes them.
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.order = i as u64;
+        }
+        let mut c = cn(60, None, "1.2.3.4:443", 100);
+        c.order = 9;
+        let t = build_with_connects(&nodes, &[c], 0);
+
+        let ep_at = t.lines.iter().position(|l| l.contains("->")).unwrap();
+        let curl_at = t.lines.iter().position(|l| l.contains("curl")).unwrap();
+        assert_eq!(
+            ep_at,
+            curl_at + 1,
+            "must follow the last exec: {:?}",
             t.lines
         );
     }

@@ -32,6 +32,14 @@ pub struct ConnectEvent {
     pub port: u16,
     /// The mechanism that observed this event: `"ptrace"` in observe mode.
     pub observed_by: &'static str,
+    /// Wall-clock milliseconds at the syscall stop.
+    ///
+    /// Captured here rather than at audit-write time so records carry real
+    /// times; ordering uses [`Self::seq`], since a millisecond holds several
+    /// events.
+    pub ts_millis: u64,
+    /// Observation order. See [`Observation::next_seq`].
+    pub seq: u64,
 }
 
 /// One observed `execve`, with the process that performed it.
@@ -50,6 +58,12 @@ pub struct ExecEvent {
     pub path: String,
     /// The mechanism that observed this event: `"ptrace"` in observe mode.
     pub observed_by: &'static str,
+    /// Wall-clock milliseconds at the syscall stop. See
+    /// [`ConnectEvent::ts_millis`] for why this is captured in the tracer.
+    pub ts_millis: u64,
+    /// Observation order. See [`Observation::next_seq`] — this, not
+    /// `ts_millis`, is what orders events, because a millisecond holds several.
+    pub seq: u64,
 }
 
 /// Everything the tracer learned from one (or more) processes in a run.
@@ -91,6 +105,14 @@ pub struct Observation {
     pub syscalls: BTreeMap<u64, String>,
     /// Count of distinct processes traced (the agent plus any children).
     pub process_count: u32,
+    /// Monotonic counter stamped onto each event in observation order.
+    ///
+    /// Milliseconds are not enough to order events within a run: a PATH search
+    /// emits several `execve` calls in the same millisecond, and attributing a
+    /// connect by timestamp alone then picks whichever tied record came first
+    /// — observed naming a binary that never ran. The tracer sees events in
+    /// order, so a counter is exact.
+    pub next_seq: u64,
 }
 
 impl Observation {
@@ -107,7 +129,7 @@ impl Observation {
     }
 
     /// Record an `execve` of `path` by `pid`.
-    pub fn record_exec(&mut self, path: String, pid: u32, ppid: Option<u32>) {
+    pub fn record_exec(&mut self, path: String, pid: u32, ppid: Option<u32>, ts_millis: u64) {
         if !path.is_empty() {
             self.execs.insert(path.clone());
             self.exec_events.push(ExecEvent {
@@ -115,12 +137,22 @@ impl Observation {
                 ppid,
                 path,
                 observed_by: "ptrace",
+                ts_millis,
+                seq: self.next_seq,
             });
+            self.next_seq += 1;
         }
     }
 
     /// Record a `connect` to a resolved endpoint by `pid`.
-    pub fn record_connect(&mut self, ip: IpAddr, port: u16, pid: u32, ppid: Option<u32>) {
+    pub fn record_connect(
+        &mut self,
+        ip: IpAddr,
+        port: u16,
+        pid: u32,
+        ppid: Option<u32>,
+        ts_millis: u64,
+    ) {
         self.connects.insert((ip, port));
         self.connect_events.push(ConnectEvent {
             pid,
@@ -128,7 +160,10 @@ impl Observation {
             ip,
             port,
             observed_by: "ptrace",
+            ts_millis,
+            seq: self.next_seq,
         });
+        self.next_seq += 1;
     }
 
     /// Record that syscall number `nr` (named `name`) was used.
