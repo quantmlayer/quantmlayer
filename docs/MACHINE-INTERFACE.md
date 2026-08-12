@@ -200,6 +200,10 @@ that `verify.py` checks, and this file carries no hash of its own.
 - A record whose parent is absent appears at top level (the cell's first exec
   is parented to `ql`, outside the cell; `--since`/`--until` can cut a chain).
 - Denials are leaves: a refused exec never became anyone's parent.
+- **Observe-mode runs are included, and labelled as predictions.** An observe
+  would-deny is a forecast, not a denial that happened — nothing was stopped.
+  Those rows read `would-allow` / `WOULD-DENY` rather than `allow` / `DENY`,
+  so a reader cannot mistake a report-only run for an enforced one.
 - **Tier-2 logs group nothing** and say so. seccomp user-notification delivers
   the execing pid but not its parent, so those records list flat rather than
   rendering a depth-one tree that would imply parentage was observed.

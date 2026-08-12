@@ -53,6 +53,12 @@ pub struct Finding {
     pub target: String,
     /// What enforce mode would have done.
     pub verdict: Verdict,
+    /// The process that performed this action, when the observation carried
+    /// one. Present for exec findings; filesystem findings are aggregated
+    /// per-path rather than per-process, so they have none.
+    pub pid: Option<u32>,
+    /// That process's parent as the tracer saw it.
+    pub ppid: Option<u32>,
 }
 
 /// The complete observe report: per-dimension counts, the would-deny findings,
@@ -91,18 +97,42 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
     let mut report = ObserveReport::default();
 
     // exec — check each execve's content digest against the profile.
-    for path in &obs.execs {
-        let digest = obs.exec_digests.get(path).map(|d| d.hex());
-        let verdict = match profile.admits_exec(digest) {
-            Decision::Allow => Verdict::Allow,
-            Decision::Deny => Verdict::WouldDeny,
-        };
-        report.findings.push(Finding {
-            kind: "exec",
-            target: path.clone(),
-            verdict,
-        });
-        report.exec_total += 1;
+    // Prefer the per-event list, which carries the pid; fall back to the set
+    // for observations produced before event capture existed.
+    if !obs.exec_events.is_empty() {
+        for ev in &obs.exec_events {
+            // Same evaluator as the fallback path below, so observe cannot
+            // report something enforce would not do.
+            let digest = obs.exec_digests.get(&ev.path).map(|d| d.hex());
+            let verdict = match profile.admits_exec(digest) {
+                Decision::Allow => Verdict::Allow,
+                Decision::Deny => Verdict::WouldDeny,
+            };
+            report.exec_total += 1;
+            report.findings.push(Finding {
+                kind: "exec",
+                target: ev.path.clone(),
+                verdict,
+                pid: Some(ev.pid),
+                ppid: ev.ppid,
+            });
+        }
+    } else {
+        for path in &obs.execs {
+            let digest = obs.exec_digests.get(path).map(|d| d.hex());
+            let verdict = match profile.admits_exec(digest) {
+                Decision::Allow => Verdict::Allow,
+                Decision::Deny => Verdict::WouldDeny,
+            };
+            report.findings.push(Finding {
+                kind: "exec",
+                target: path.clone(),
+                verdict,
+                pid: None,
+                ppid: None,
+            });
+            report.exec_total += 1;
+        }
     }
 
     // filesystem — a path is a would-deny iff the profile hides it (`denied`).
@@ -115,6 +145,9 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
                     kind,
                     target: path_str.into_owned(),
                     verdict: Verdict::WouldDeny,
+                    // Filesystem findings aggregate per path, not per process.
+                    pid: None,
+                    ppid: None,
                 });
             }
             // NotEnforced paths are not listed as findings — the wall makes no
@@ -145,7 +178,7 @@ mod tests {
     fn obs_with(execs: &[(&str, &str)], reads: &[&str], writes: &[&str]) -> Observation {
         let mut o = Observation::default();
         for (path, hex) in execs {
-            o.record_exec(path.to_string());
+            o.record_exec(path.to_string(), 1000, Some(999));
             o.exec_digests.insert(
                 path.to_string(),
                 ExecDigest::new(HashAlgo::Sha256, hex.to_string()).unwrap(),

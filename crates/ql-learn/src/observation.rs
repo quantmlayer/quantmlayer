@@ -14,6 +14,24 @@ use std::path::PathBuf;
 
 use ql_profile::ExecDigest;
 
+/// One observed `execve`, with the process that performed it.
+///
+/// `observed_by` names the mechanism rather than leaving it implied, because
+/// ptrace and the kernel's `real_parent` are not the same fact: ptrace reports
+/// the tracer's view, which can differ under re-parenting. A consumer that
+/// joins these with enforce-mode records should know which it is looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecEvent {
+    /// The process that called `execve`.
+    pub pid: u32,
+    /// Its parent as the tracer saw it, when available.
+    pub ppid: Option<u32>,
+    /// The program path passed to `execve`.
+    pub path: String,
+    /// The mechanism that observed this event: `"ptrace"` in observe mode.
+    pub observed_by: &'static str,
+}
+
 /// Everything the tracer learned from one (or more) processes in a run.
 #[derive(Debug, Default, Clone)]
 pub struct Observation {
@@ -23,6 +41,15 @@ pub struct Observation {
     pub writes: BTreeSet<PathBuf>,
     /// Program paths passed to `execve`.
     pub execs: BTreeSet<String>,
+    /// Per-exec events with the pid that performed them, in observed order.
+    ///
+    /// Kept alongside `execs` rather than replacing it: the set drives profile
+    /// synthesis, where order and repetition are noise, while this preserves
+    /// the attribution a process tree needs. Enforce mode gets the same fact
+    /// from the kernel at `sched_process_exec`; here it comes from the ptrace
+    /// stop, which is the tracer's view of the process — see
+    /// [`ExecEvent::observed_by`].
+    pub exec_events: Vec<ExecEvent>,
     /// SHA-256 content digests of the binaries in `execs`, keyed by path.
     /// Filled by the hashing pass after tracing; empty until then.
     pub exec_digests: BTreeMap<String, ExecDigest>,
@@ -47,10 +74,16 @@ impl Observation {
         }
     }
 
-    /// Record an `execve` of `path`.
-    pub fn record_exec(&mut self, path: String) {
+    /// Record an `execve` of `path` by `pid`.
+    pub fn record_exec(&mut self, path: String, pid: u32, ppid: Option<u32>) {
         if !path.is_empty() {
-            self.execs.insert(path);
+            self.execs.insert(path.clone());
+            self.exec_events.push(ExecEvent {
+                pid,
+                ppid,
+                path,
+                observed_by: "ptrace",
+            });
         }
     }
 

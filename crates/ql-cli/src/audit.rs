@@ -218,7 +218,12 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         // process. Matching on the `exec.` prefix counted them as records that
         // "could not be placed", reporting a failure where nothing failed —
         // and a spurious warning on every run trains people to ignore it.
-        if !matches!(r.event.action.as_str(), "exec.run" | "exec.deny") {
+        // Enforce-mode decisions, plus observe-mode exec findings — observe
+        // is the mode someone tries first, and a tree is most useful before
+        // you have committed to enforcing.
+        let is_exec_decision = matches!(r.event.action.as_str(), "exec.run" | "exec.deny")
+            || r.event.action.starts_with("observe.exec.");
+        if !is_exec_decision {
             continue;
         }
         match crate::proctree::parse_detail(&r.event.detail) {
@@ -227,7 +232,11 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
                 ppid,
                 comm,
                 target: r.event.target.clone(),
-                allowed: matches!(r.event.decision, ql_audit::Decision::Allow),
+                // Observe records an allow as `Info`, not `Allow` — testing
+                // for `Allow` rendered every passing observe exec as a denial.
+                // Deny is the only decision that means refused.
+                allowed: !matches!(r.event.decision, ql_audit::Decision::Deny),
+                enforced: !r.event.action.starts_with("observe."),
                 ts_millis: r.event.ts_millis,
             }),
             None => unparsed += 1,

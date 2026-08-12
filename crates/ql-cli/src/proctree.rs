@@ -46,8 +46,13 @@ pub struct ExecNode {
     pub comm: String,
     /// The binary's content digest, or `<unhashed>`.
     pub target: String,
-    /// Whether the exec was allowed.
+    /// Whether the exec was allowed (or, in observe mode, would have been).
     pub allowed: bool,
+    /// False for observe-mode records. An observe "would-deny" is a
+    /// prediction, not a denial that happened: nothing was stopped. Labelling
+    /// it the same as an enforced denial would tell a reader the process was
+    /// blocked when it ran to completion.
+    pub enforced: bool,
     /// Milliseconds since the Unix epoch.
     pub ts_millis: u64,
 }
@@ -69,8 +74,12 @@ pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, String)> {
         None => (None, rest),
     };
 
-    let comm = rest.strip_prefix('(')?.strip_suffix(')')?.to_string();
-    Some((pid, ppid, comm))
+    // Trailing text after the comm is allowed: observe records append their
+    // NOT-ENFORCING marker there. Take up to the first ')' rather than
+    // requiring the string to end at it.
+    let inner = rest.strip_prefix('(')?;
+    let (comm, _tail) = inner.split_once(')')?;
+    Some((pid, ppid, comm.to_string()))
 }
 
 /// A rendered tree, plus what could not be placed in it.
@@ -157,7 +166,12 @@ fn walk(
 }
 
 fn label(n: &ExecNode) -> String {
-    let verdict = if n.allowed { "allow" } else { "DENY " };
+    let verdict = match (n.enforced, n.allowed) {
+        (true, true) => "allow",
+        (true, false) => "DENY ",
+        (false, true) => "would-allow",
+        (false, false) => "WOULD-DENY",
+    };
     let digest = if n.target.len() >= 16 {
         &n.target[..16]
     } else {
@@ -177,7 +191,15 @@ mod tests {
             comm: comm.into(),
             target: "a".repeat(64),
             allowed,
+            enforced: true,
             ts_millis: ts,
+        }
+    }
+
+    fn observed(pid: u32, ppid: Option<u32>, allowed: bool) -> ExecNode {
+        ExecNode {
+            enforced: false,
+            ..n(pid, ppid, "sh", allowed, 1)
         }
     }
 
@@ -218,6 +240,12 @@ mod tests {
         assert_eq!(parse_detail("pid abc ppid 1 (x)"), None);
         assert_eq!(parse_detail("egress.connect pypi.org:443"), None);
         assert_eq!(parse_detail(""), None);
+        // Observe records append a marker after the comm; the tree must still
+        // read them, or observe runs group nothing.
+        assert_eq!(
+            parse_detail("pid 42 ppid 7 (observe) NOT ENFORCING (observe mode)"),
+            Some((42, Some(7), "observe".to_string()))
+        );
     }
 
     /// A log with no parent data anywhere (tier 2) is listed flat and flagged,
@@ -272,6 +300,20 @@ mod tests {
         for action in ["exec.enforce", "exec.digest", "egress.connect"] {
             assert!(!matches!(action, "exec.run" | "exec.deny"), "{action}");
         }
+    }
+
+    /// An observe-mode record is labelled as a prediction, never as an
+    /// enforced outcome. In observe mode nothing is stopped, so rendering a
+    /// would-deny as "DENY" would tell a reader the process was blocked when
+    /// it ran to completion.
+    #[test]
+    fn observe_records_are_labelled_as_predictions() {
+        let t = build(&[observed(1, None, true), observed(2, Some(1), false)], 0);
+        assert!(t.lines[0].contains("would-allow"), "{:?}", t.lines);
+        assert!(t.lines[1].contains("WOULD-DENY"), "{:?}", t.lines);
+        // And never the enforced words, which would overstate what happened.
+        assert!(!t.lines[0].contains("allow  pid"), "{:?}", t.lines);
+        assert!(!t.lines[1].starts_with("    DENY"), "{:?}", t.lines);
     }
 
     /// Unparsed records are counted, never silently dropped.

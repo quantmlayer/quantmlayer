@@ -160,7 +160,32 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             action,
             target: f.target.clone(),
             decision,
-            detail: "NOT ENFORCING (observe mode)".to_string(),
+            // Same `pid N ppid N (comm)` shape enforce mode writes, so the
+            // process tree can read both. The observe marker stays in the
+            // action string, which is where it is unmissable — a detail field
+            // that carried only "NOT ENFORCING" left observe runs with no
+            // attribution at all, and observe is the mode people try first.
+            detail: {
+                // The name slot carries the executable's basename. Enforce
+                // mode puts the kernel's `comm` there; ptrace does not give us
+                // one, and a basename is a real fact rather than a placeholder
+                // repeated on every row.
+                let name = f
+                    .target
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("exec");
+                match (f.pid, f.ppid) {
+                    (Some(pid), Some(ppid)) => {
+                        format!("pid {pid} ppid {ppid} ({name}) NOT ENFORCING (observe mode)")
+                    }
+                    (Some(pid), None) => {
+                        format!("pid {pid} ({name}) NOT ENFORCING (observe mode)")
+                    }
+                    _ => "NOT ENFORCING (observe mode)".to_string(),
+                }
+            },
             system: system.clone(),
         };
         if log.append(event).is_err() {

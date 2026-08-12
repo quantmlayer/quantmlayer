@@ -102,7 +102,9 @@ fn supervise(root: Pid) -> Result<Observation> {
     // resolved), so its content digest matches what the kernel hashes later.
     if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", root.as_raw())) {
         if let Some(p) = exe.to_str() {
-            obs.record_exec(p.to_string());
+            // The root's parent is `ql` itself, outside the traced set, so it
+            // is left unknown and renders as a tree root.
+            obs.record_exec(p.to_string(), root.as_raw() as u32, None);
         }
     }
 
@@ -158,6 +160,26 @@ fn supervise(root: Pid) -> Result<Observation> {
 
     obs.process_count = (seen.len() as u32).max(1);
     Ok(obs)
+}
+
+/// The parent of `pid`, read from `/proc/<pid>/stat` at the syscall stop.
+///
+/// Read live rather than tracked from fork events because the tracer sees
+/// execs, not the full fork graph, and a process that forked before tracing
+/// began would otherwise have no parent at all. The read happens while the
+/// process is stopped at `execve`, so it cannot have exited underneath us —
+/// which is what makes this safe here and unsafe in the Tier-2 supervisor,
+/// where no such stop exists.
+///
+/// Returns `None` when the parent is unreadable or is pid 0, so an unknown
+/// parent is never confused with a real one.
+fn ppid_of(pid: Pid) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw())).ok()?;
+    // Field 4 is ppid, but field 2 (comm) may contain spaces or parentheses,
+    // so parse from the last ')' rather than splitting the whole line.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let ppid: u32 = after_comm.split_whitespace().nth(1)?.parse().ok()?;
+    (ppid != 0).then_some(ppid)
 }
 
 /// Read the syscall number and arguments for `pid` at a syscall-entry stop.
@@ -233,11 +255,11 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
         }
     } else if nr == libc::SYS_execve {
         if let Some(p) = read_cstr(pid, regs.args[0]) {
-            obs.record_exec(p);
+            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid));
         }
     } else if nr == libc::SYS_execveat {
         if let Some(p) = read_cstr(pid, regs.args[1]) {
-            obs.record_exec(p);
+            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid));
         }
     } else if nr == libc::SYS_connect {
         if let Some((ip, port)) = read_sockaddr(pid, regs.args[1], regs.args[2]) {
