@@ -103,7 +103,9 @@ fn supervise(root: Pid) -> Result<Observation> {
     if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", root.as_raw())) {
         if let Some(p) = exe.to_str() {
             // The root's parent is `ql` itself, outside the traced set, so it
-            // is left unknown and renders as a tree root.
+            // is left unknown and renders as a tree root. No `tgid_of` here:
+            // `root` is the process this run forked, so it is a group leader
+            // by construction and its tid is its tgid.
             obs.record_exec(p.to_string(), root.as_raw() as u32, None, now_ms());
         }
     }
@@ -289,7 +291,13 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
         }
     } else if nr == libc::SYS_execveat {
         if let Some(p) = read_cstr(pid, regs.args[1]) {
-            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid), now_ms());
+            // Same tgid attribution as the `execve` arm above. Recording this
+            // one under the tid instead would leave a thread's exec and its
+            // later connects keyed differently, so they would never join and
+            // its egress would fall back to the ancestor — reintroducing the
+            // misattribution through a rarer door.
+            let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+            obs.record_exec(p, owner, ppid_of(pid), now_ms());
         }
     } else if nr == libc::SYS_connect {
         if let Some((ip, port)) = read_sockaddr(pid, regs.args[1], regs.args[2]) {
