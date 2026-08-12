@@ -27,6 +27,7 @@ mod learn;
 mod mcp;
 mod mcp_gateway;
 mod observe;
+mod otlp;
 mod policy;
 mod proctree;
 mod profile;

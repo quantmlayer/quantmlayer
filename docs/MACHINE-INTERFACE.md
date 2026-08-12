@@ -118,6 +118,37 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql audit export --format otlp` — OTLP logs
+
+Emits the audit window as an OTLP/HTTP logs document for an existing
+observability stack. `--out` names the file (not a directory, as it does for
+the evidence bundle), and `--host` sets `host.name`.
+
+```
+ql audit export run.jsonl --format otlp --out otlp.json --host $(hostname)
+curl -X POST -H 'Content-Type: application/json' \
+     --data-binary @otlp.json http://localhost:4318/v1/logs
+```
+
+- **Exporter, not a backend.** No dashboard, storage, or query layer — those
+  would mean competing with Datadog and Grafana rather than feeding them.
+- **No new dependencies.** The document is written directly rather than via the
+  OpenTelemetry SDK: the audit log is a finished file on disk, not live
+  telemetry, so there is nothing to batch, retry, or flush — and `ql` stays a
+  single static binary, which is what makes the install path work.
+- **A denial is `WARN`, not `ERROR`.** Denials are the system working as
+  configured; a stream of ERRORs for correct behaviour gets muted, and then the
+  one that mattered is muted too.
+- **An exported copy is not tamper-evident.** Chain integrity lives in
+  `prev_hash`/`hash` across the whole sequence, and a system that reorders,
+  samples, or drops records breaks it. Every record therefore carries
+  `quantmlayer.seq` and `quantmlayer.record_hash` so an investigator can return
+  to the source log and verify there — the export is a lead, the chain is the
+  evidence.
+- Attributes are namespaced `quantmlayer.*`; agent-chosen strings (targets,
+  details) are JSON-escaped so a contained agent cannot forge records in
+  whatever ingests this.
+
 ## `ql token delegate` — cascading attenuation
 
 Hands a sub-agent a strictly narrower slice of an existing credential:

@@ -287,6 +287,8 @@ fn export(args: &[String]) -> ExitCode {
     let mut since: Option<u64> = None;
     let mut until: Option<u64> = None;
     let mut sign_key: Option<&str> = None;
+    let mut format: Option<&str> = None;
+    let mut host: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -294,6 +296,8 @@ fn export(args: &[String]) -> ExitCode {
             "--since" => since = it.next().and_then(|s| s.parse().ok()),
             "--until" => until = it.next().and_then(|s| s.parse().ok()),
             "--sign-key" => sign_key = it.next().map(String::as_str),
+            "--format" => format = it.next().map(String::as_str),
+            "--host" => host = it.next().map(String::as_str),
             s if !s.starts_with('-') && log_path.is_none() => log_path = Some(s),
             other => {
                 eprintln!("ql audit export: unexpected argument `{other}`");
@@ -353,6 +357,40 @@ fn export(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     let window = &all[lo..hi];
+
+    // OTLP is a different product from the evidence bundle: it feeds an
+    // existing observability stack, so it emits one document rather than a
+    // directory, and it deliberately carries no verifier — an exported copy
+    // is not tamper-evident (see otlp.rs). The chain stays the evidence.
+    if let Some(fmt) = format {
+        if fmt != "otlp" {
+            eprintln!("ql audit export: unknown --format `{fmt}` (known: otlp)");
+            return ExitCode::from(2);
+        }
+        let payload = crate::otlp::render(window, host, None);
+        let path = std::path::Path::new(out);
+        // `--out` names a directory for the bundle; for OTLP it names the file,
+        // since a single JSON document is what a collector ingests.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("ql audit export: cannot create {}: {e}", parent.display());
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        if let Err(e) = std::fs::write(path, &payload) {
+            eprintln!("ql audit export: cannot write {out}: {e}");
+            return ExitCode::from(2);
+        }
+        println!(
+            "exported {} record(s) as OTLP logs to {out}\n\
+             post to a collector:  curl -X POST -H 'Content-Type: application/json' \\\n\
+             \x20                      --data-binary @{out} http://localhost:4318/v1/logs",
+            window.len()
+        );
+        return ExitCode::SUCCESS;
+    }
 
     let mut body = String::new();
     for r in window {
