@@ -17,7 +17,6 @@
 [![CI](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml/badge.svg)](https://github.com/quantmlayer/quantmlayer/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.96](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
-![tests](https://img.shields.io/badge/tests-239%20passing-brightgreen.svg)
 ![agents](https://img.shields.io/badge/agents-claude%20%C2%B7%20codex%20%C2%B7%20gemini%20%C2%B7%20aider%20%C2%B7%20cline%20%C2%B7%20cursor%20%C2%B7%20opencode%20%C2%B7%20openhands%20%C2%B7%20goose-blueviolet.svg)
 
 **A security runtime for coding agents.** We don't secure what agents *say* — we secure what agents are *allowed to do*.

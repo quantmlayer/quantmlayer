@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """scripts/sync-docs.py — keep the README's generated regions truthful.
 
-Two things in the README are copies of data that lives somewhere else: the
-test-count badge (from `cargo test`) and the attack matrix (from
-`benchmark/RESULTS.md`, which `ql-bench` writes). Hand-copied data rots
-silently — the badge went stale three releases running, and the matrix was
-six rows while RESULTS.md had eight.
+The README embeds the attack matrix from `benchmark/RESULTS.md`, which
+`ql-bench` writes. Hand-copied data rots silently: the matrix sat at six rows
+while RESULTS.md had eight. This regenerates it between markers, and
+`--check` fails on drift so CI catches it the way `cargo fmt --check` does.
 
-`--check` verifies without writing so CI can fail on drift, but it checks
-**only the attack matrix**. The matrix is a copy of a committed file, so
-every machine derives the same answer. The test count is not: it depends on
-which targets compile and what cargo has cached, so it legitimately differs
-between a dev box and a CI runner. Gating on it produced a failure the
-developer could not reproduce locally — a gate that cries wolf gets
-disabled, so this one only fires on drift anyone can confirm.
+**A test-count badge used to live here and was removed.** Counting is not as
+simple as it looks — summing cargo's `test result:` lines and counting its
+`^test ` lines disagree with each other on the same machine (243 vs 269),
+because ignored and filtered tests appear in one and not the other. A number
+that cannot be derived unambiguously does not belong in a badge that implies
+precision, and it carried no claim about containment anyway. The matrix does
+carry a claim, which is why it is what gets gated.
 
 Usage:
     scripts/sync-docs.py            # rewrite the generated regions
@@ -21,7 +20,6 @@ Usage:
 """
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -29,34 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 RESULTS = ROOT / "benchmark" / "RESULTS.md"
 
-BADGE_RE = re.compile(
-    r"!\[tests\]\(https://img\.shields\.io/badge/tests-\d+%20passing-brightgreen\.svg\)"
-)
 TABLE_BEGIN = "<!-- BEGIN generated: attack-matrix (scripts/sync-docs.py) -->"
 TABLE_END = "<!-- END generated: attack-matrix -->"
-
-
-def count_tests() -> int:
-    """Total passing tests across the workspace, from cargo's own output.
-
-    Parsed rather than hand-maintained: the number changes on nearly every
-    change, which makes drift the default state otherwise.
-    """
-    out = subprocess.run(
-        ["cargo", "test", "--workspace"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-    )
-    # cargo prints one "test result:" line per target; sum the passed counts.
-    total = 0
-    for line in (out.stdout + out.stderr).splitlines():
-        m = re.search(r"test result: ok\. (\d+) passed", line)
-        if m:
-            total += int(m.group(1))
-    if total == 0:
-        sys.exit("sync-docs: could not read a test count from cargo output")
-    return total
 
 
 def attack_matrix() -> str:
@@ -79,19 +51,8 @@ def attack_matrix() -> str:
     return "\n".join([header, sep, *body])
 
 
-def render(text: str, *, badge: bool) -> str:
-    """Return `text` with the generated regions refreshed.
-
-    `badge` is off under `--check`: see the module docstring for why the test
-    count is generated but not gated.
-    """
-    if badge:
-        n = count_tests()
-        text = BADGE_RE.sub(
-            f"![tests](https://img.shields.io/badge/tests-{n}%20passing-brightgreen.svg)",
-            text,
-            count=1,
-        )
+def render(text: str) -> str:
+    """Return `text` with the generated regions refreshed."""
     if TABLE_BEGIN in text and TABLE_END in text:
         start = text.index(TABLE_BEGIN) + len(TABLE_BEGIN)
         end = text.index(TABLE_END)
@@ -102,14 +63,10 @@ def render(text: str, *, badge: bool) -> str:
 def main() -> int:
     check = "--check" in sys.argv
     current = README.read_text()
-    updated = render(current, badge=not check)
+    updated = render(current)
 
     if current == updated:
-        print(
-            "sync-docs: attack matrix is current"
-            if check
-            else "sync-docs: README is up to date"
-        )
+        print("sync-docs: attack matrix is current")
         return 0
     if check:
         print(
