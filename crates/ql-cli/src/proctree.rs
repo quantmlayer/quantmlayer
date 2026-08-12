@@ -84,6 +84,10 @@ pub struct Detail {
     pub seq: Option<u64>,
     /// True when the `execve` failed — a PATH-search candidate.
     pub failed: bool,
+    /// Errno when a `connect` returned a definite failure.
+    pub failed_errno: Option<i32>,
+    /// True when the kernel restarted a `connect` after a signal.
+    pub restarted: bool,
     /// The task comm, or the binary's basename in observe mode.
     pub comm: String,
 }
@@ -112,6 +116,17 @@ pub fn parse_detail(detail: &str) -> Option<Detail> {
         Some(tail) => (true, tail),
         None => (false, rest),
     };
+    let (restarted, rest) = match rest.strip_prefix("restart ") {
+        Some(tail) => (true, tail),
+        None => (false, rest),
+    };
+    let (failed_errno, rest) = match rest.strip_prefix("failed ") {
+        Some(after) => {
+            let (e, tail) = after.split_once(' ')?;
+            (e.parse::<i32>().ok(), tail)
+        }
+        None => (None, rest),
+    };
 
     // Trailing text after the comm is allowed: observe records append their
     // NOT-ENFORCING marker there. Take up to the first ')' rather than
@@ -123,6 +138,8 @@ pub fn parse_detail(detail: &str) -> Option<Detail> {
         ppid,
         seq,
         failed,
+        failed_errno,
+        restarted,
         comm: comm.to_string(),
     })
 }
@@ -143,6 +160,11 @@ pub struct ConnectNode {
     pub ts_millis: u64,
     /// Observation order; see [`ExecNode::order`].
     pub order: u64,
+    /// Errno when the call returned a definite failure.
+    pub failed_errno: Option<i32>,
+    /// True when the kernel restarted this call after a signal — the retry is
+    /// recorded separately, so counting both reports one call twice.
+    pub restarted: bool,
 }
 
 /// A rendered tree, plus what could not be placed in it.
@@ -250,13 +272,9 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         for n in nodes {
             tree.lines.push(format!("  {}", label(n)));
             if let Some(cs) = by_node.get(&(n.pid, n.order)) {
-                for (endpoint, count) in tally(cs) {
-                    let times = if count > 1 {
-                        format!(" x{count}")
-                    } else {
-                        String::new()
-                    };
-                    tree.lines.push(format!("    -> {endpoint}{times}"));
+                for ((endpoint, err), count) in tally(cs) {
+                    tree.lines
+                        .push(format!("    -> {}", edge(endpoint, err, count)));
                 }
             }
         }
@@ -354,14 +372,31 @@ fn walk(
 /// install` opens hundreds of connections and one line each would bury the
 /// tree.
 ///
-/// The count is connect *attempts*, not distinct connections: a `connect`
-/// interrupted by a signal is restarted and recorded again.
-fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<&'a str, usize> {
-    let mut t: BTreeMap<&str, usize> = BTreeMap::new();
-    for c in cs {
-        *t.entry(c.endpoint.as_str()).or_default() += 1;
+/// Restarted calls are skipped: the kernel re-enters the syscall after a
+/// signal and the retry is recorded separately, so counting both would report
+/// one call twice. Definite failures are counted but kept distinct from
+/// successes, since a refused connection is signal — it is egress the process
+/// intended — unlike an exec that never ran.
+fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<(&'a str, Option<i32>), usize> {
+    let mut t: BTreeMap<(&str, Option<i32>), usize> = BTreeMap::new();
+    for c in cs.iter().filter(|c| !c.restarted) {
+        *t.entry((c.endpoint.as_str(), c.failed_errno)).or_default() += 1;
     }
     t
+}
+
+/// Name the errnos worth reading at a glance.
+fn errno_label(e: i32) -> String {
+    match e {
+        libc::ECONNREFUSED => "ECONNREFUSED".into(),
+        libc::ETIMEDOUT => "ETIMEDOUT".into(),
+        libc::ENETUNREACH => "ENETUNREACH".into(),
+        libc::EHOSTUNREACH => "EHOSTUNREACH".into(),
+        libc::EADDRNOTAVAIL => "EADDRNOTAVAIL".into(),
+        libc::EACCES => "EACCES".into(),
+        libc::EPERM => "EPERM".into(),
+        other => format!("errno {other}"),
+    }
 }
 
 /// Shorten a target for display, keeping the identifying end.
@@ -378,6 +413,20 @@ fn shorten(target: &str, width: usize) -> String {
         format!("…{tail}")
     } else {
         target.chars().take(width).collect()
+    }
+}
+
+/// Render one endpoint line: destination, failure reason when there is one,
+/// and a repeat count.
+fn edge(endpoint: &str, err: Option<i32>, count: usize) -> String {
+    let times = if count > 1 {
+        format!(" x{count}")
+    } else {
+        String::new()
+    };
+    match err {
+        Some(e) => format!("{endpoint} ({}){times}", errno_label(e)),
+        None => format!("{endpoint}{times}"),
     }
 }
 
@@ -426,6 +475,8 @@ mod tests {
             endpoint: endpoint.into(),
             ts_millis,
             order: ts_millis,
+            failed_errno: None,
+            restarted: false,
         }
     }
 
@@ -468,6 +519,8 @@ mod tests {
                 ppid: Some(100),
                 seq: None,
                 failed: false,
+                failed_errno: None,
+                restarted: false,
                 comm: "npm".into()
             })
         );
@@ -478,6 +531,8 @@ mod tests {
                 ppid: None,
                 seq: None,
                 failed: false,
+                failed_errno: None,
+                restarted: false,
                 comm: "sh".into()
             })
         );
@@ -494,6 +549,8 @@ mod tests {
                 ppid: Some(7),
                 seq: None,
                 failed: false,
+                failed_errno: None,
+                restarted: false,
                 comm: "observe".into()
             })
         );
@@ -505,6 +562,8 @@ mod tests {
                 ppid: Some(7),
                 seq: Some(13),
                 failed: false,
+                failed_errno: None,
+                restarted: false,
                 comm: "curl".into()
             })
         );
@@ -817,6 +876,51 @@ mod tests {
             .unwrap();
         let head_at = t.lines.iter().position(|l| l.contains("head")).unwrap();
         assert!(head_at > miss_at + 1, "attached to the miss: {:?}", t.lines);
+    }
+
+    /// Restarted calls collapse: the kernel re-enters the syscall after a
+    /// signal, and the retry is recorded separately, so counting both would
+    /// report one call twice.
+    #[test]
+    fn restarted_connects_do_not_inflate_the_count() {
+        let node = n(110, None, "curl", true, 1);
+        let mut restart = cn(110, None, "1.2.3.4:443", 2);
+        restart.restarted = true;
+        let real = cn(110, None, "1.2.3.4:443", 3);
+
+        let t = build_with_connects(&[node], &[restart, real], 0);
+        let line = t.lines.iter().find(|l| l.contains("->")).unwrap();
+        assert!(!line.contains("x2"), "restart counted: {line}");
+    }
+
+    /// A failed connect is annotated, not dropped: it is egress the process
+    /// intended, which is signal — the opposite disposition from a PATH miss,
+    /// where nothing ran at all.
+    #[test]
+    fn a_failed_connect_is_annotated_with_its_reason() {
+        let node = n(120, None, "curl", true, 1);
+        let mut refused = cn(120, None, "1.2.3.4:443", 2);
+        refused.failed_errno = Some(libc::ECONNREFUSED);
+
+        let t = build_with_connects(&[node], &[refused], 0);
+        let line = t.lines.iter().find(|l| l.contains("->")).unwrap();
+        assert!(line.contains("ECONNREFUSED"), "{line}");
+        assert!(line.contains("1.2.3.4:443"), "{line}");
+    }
+
+    /// A failed connect and a successful one to the same endpoint stay
+    /// distinct, rather than merging into one count that hides the failure.
+    #[test]
+    fn failures_and_successes_to_one_endpoint_stay_separate() {
+        let node = n(130, None, "curl", true, 1);
+        let ok = cn(130, None, "1.2.3.4:443", 2);
+        let mut bad = cn(130, None, "1.2.3.4:443", 3);
+        bad.failed_errno = Some(libc::ETIMEDOUT);
+
+        let t = build_with_connects(&[node], &[ok, bad], 0);
+        let edges: Vec<_> = t.lines.iter().filter(|l| l.contains("->")).collect();
+        assert_eq!(edges.len(), 2, "{:?}", edges);
+        assert!(edges.iter().any(|l| l.contains("ETIMEDOUT")), "{:?}", edges);
     }
 
     /// A failed candidate cannot own a connection: it never ran. The case is

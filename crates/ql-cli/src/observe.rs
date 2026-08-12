@@ -230,15 +230,29 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             // "before" and attribution silently picks that pid's last exec of
             // the whole run — crediting a connect to an image that replaced
             // the one which opened it.
-            detail: match ev.ppid {
-                Some(ppid) => format!(
-                    "pid {} ppid {ppid} seq {} (connect) NOT ENFORCING (observe mode)",
-                    ev.pid, ev.seq
-                ),
-                None => format!(
-                    "pid {} seq {} (connect) NOT ENFORCING (observe mode)",
-                    ev.pid, ev.seq
-                ),
+            detail: {
+                // A restarted call is the same call re-entered, so it is
+                // marked and skipped when counting; a definite failure is
+                // carried by errno, because ECONNREFUSED and ETIMEDOUT mean
+                // very different things to someone reading the tree.
+                let mark = if ev.restarted {
+                    " restart".to_string()
+                } else {
+                    match ev.outcome {
+                        ql_learn::ConnectOutcome::Failed(e) => format!(" failed {e}"),
+                        _ => String::new(),
+                    }
+                };
+                match ev.ppid {
+                    Some(ppid) => format!(
+                        "pid {} ppid {ppid} seq {}{mark} (connect) NOT ENFORCING (observe mode)",
+                        ev.pid, ev.seq
+                    ),
+                    None => format!(
+                        "pid {} seq {}{mark} (connect) NOT ENFORCING (observe mode)",
+                        ev.pid, ev.seq
+                    ),
+                }
             },
             system: system.clone(),
         };

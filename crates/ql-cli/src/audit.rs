@@ -233,6 +233,8 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
                     endpoint: r.event.target.clone(),
                     ts_millis: r.event.ts_millis,
                     order: d.seq.unwrap_or(r.event.ts_millis),
+                    failed_errno: d.failed_errno,
+                    restarted: d.restarted,
                 });
             } else {
                 unparsed_connects += 1;

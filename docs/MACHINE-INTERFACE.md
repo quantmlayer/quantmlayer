@@ -239,8 +239,17 @@ that `verify.py` checks, and this file carries no hash of its own.
   says nothing. The distinction comes from the syscall exit stop: a successful
   `execve` never returns, so any exec reaching that stop failed.
 
-  Caveats worth knowing: counts are connect **attempts** — a `connect`
-  interrupted by a signal is restarted and recorded again; observe records
+  A connect that returned a definite error is annotated with it
+  (`-> tcp 1.2.3.4:443 (ECONNREFUSED)`) and kept distinct from a success to the
+  same endpoint. Failures are shown rather than dropped: unlike a PATH miss,
+  where nothing ran, a refused connection is egress the process intended.
+  Most connects annotate nothing, and that is correct — a non-blocking
+  `connect` returns `EINPROGRESS` and its real outcome arrives later via
+  `SO_ERROR`, which a syscall tracer never sees, so the honest state is
+  undetermined. Calls the kernel restarted after a signal are collapsed, so a
+  count is distinct calls rather than attempts.
+
+  Caveats worth knowing: observe records
   the parent is read from `/proc` at
   the syscall stop, so a process re-parented after its parent exited reports
   its new parent.

@@ -55,6 +55,80 @@ impl SockProto {
     }
 }
 
+/// What a `connect` call resulted in, as far as a syscall tracer can know.
+///
+/// Three-valued deliberately, not a boolean. A non-blocking `connect` returns
+/// `EINPROGRESS` and its real outcome surfaces later through `SO_ERROR`, which
+/// this tracer never sees — so treating a negative return as failure would
+/// mark almost every real connection as failed. Measured: `curl`'s genuine TCP
+/// connect returns `EINPROGRESS`, while its UDP source-address probes return 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectOutcome {
+    /// Not determinable from the return value: the call is still in progress
+    /// (`EINPROGRESS`, `EALREADY`), already connected (`EISCONN`), or was
+    /// interrupted and restarted. This is the honest ceiling, not a gap.
+    #[default]
+    Unknown,
+    /// Returned 0.
+    Completed,
+    /// Returned a definite error, carried as a positive errno.
+    Failed(i32),
+}
+
+impl ConnectOutcome {
+    /// Classify a raw syscall return value.
+    ///
+    /// A pure function of the retval so it is testable without ptrace.
+    pub fn from_ret(ret: i64) -> ConnectOutcome {
+        if ret == 0 {
+            return ConnectOutcome::Completed;
+        }
+        if ret > 0 {
+            // connect(2) never returns a positive value; treat as undetermined
+            // rather than inventing an errno.
+            return ConnectOutcome::Unknown;
+        }
+        let errno = -ret as i32;
+        match errno {
+            // In flight, or already done — the outcome is not knowable here.
+            libc::EINPROGRESS | libc::EALREADY | libc::EISCONN => ConnectOutcome::Unknown,
+            // Interrupted and restarted by the kernel; the retry is what counts.
+            e if is_restart(e) => ConnectOutcome::Unknown,
+            e => ConnectOutcome::Failed(e),
+        }
+    }
+
+    /// Short label for rendering, or `None` when nothing definite is known.
+    pub fn label(self) -> Option<String> {
+        match self {
+            ConnectOutcome::Unknown | ConnectOutcome::Completed => None,
+            ConnectOutcome::Failed(e) => Some(errno_name(e)),
+        }
+    }
+}
+
+/// Kernel-internal restart pseudo-errnos, which never reach userspace: the
+/// syscall is re-entered, so counting both would double-count one call.
+fn is_restart(errno: i32) -> bool {
+    // ERESTARTSYS, ERESTARTNOINTR, ERESTARTNOHAND, ERESTART_RESTARTBLOCK.
+    (512..=516).contains(&errno)
+}
+
+/// Name a few errnos worth reading at a glance; others render numerically
+/// rather than being given a name we are not sure of.
+fn errno_name(e: i32) -> String {
+    match e {
+        libc::ECONNREFUSED => "ECONNREFUSED".into(),
+        libc::ETIMEDOUT => "ETIMEDOUT".into(),
+        libc::ENETUNREACH => "ENETUNREACH".into(),
+        libc::EHOSTUNREACH => "EHOSTUNREACH".into(),
+        libc::EADDRNOTAVAIL => "EADDRNOTAVAIL".into(),
+        libc::EACCES => "EACCES".into(),
+        libc::EPERM => "EPERM".into(),
+        other => format!("errno {other}"),
+    }
+}
+
 /// One observed `connect`, with the process that opened it.
 ///
 /// The endpoint is an IP and port, not a domain: by the time `connect` is
@@ -83,6 +157,11 @@ pub struct ConnectEvent {
     pub seq: u64,
     /// The socket's protocol, when the `socket()` call was observed.
     pub proto: SockProto,
+    /// What the call returned, once the exit stop is seen.
+    pub outcome: ConnectOutcome,
+    /// True when the kernel restarted this call after a signal. The retry is
+    /// recorded separately, so counting both would report one call twice.
+    pub restarted: bool,
 }
 
 /// One observed `execve`, with the process that performed it.
@@ -218,6 +297,25 @@ impl Observation {
         }
     }
 
+    /// Record the outcome of the most recent connect for `pid`.
+    ///
+    /// Same pairing assumption as [`Self::mark_last_exec_failed`]: a process is
+    /// a single flow of control between a syscall's entry and exit stops. An
+    /// entry whose sockaddr could not be read records no event, and the
+    /// following exit would then land on the previous connect.
+    pub fn mark_last_connect_outcome(&mut self, pid: u32, ret: i64) {
+        let restarted = ret < 0 && is_restart(-ret as i32);
+        if let Some(ev) = self
+            .connect_events
+            .iter_mut()
+            .rev()
+            .find(|e| e.pid == pid && e.outcome == ConnectOutcome::Unknown && !e.restarted)
+        {
+            ev.outcome = ConnectOutcome::from_ret(ret);
+            ev.restarted = restarted;
+        }
+    }
+
     /// Record a `connect` to a resolved endpoint by `pid`.
     #[allow(clippy::too_many_arguments)]
     pub fn record_connect(
@@ -239,6 +337,8 @@ impl Observation {
             ts_millis,
             seq: self.next_seq,
             proto,
+            outcome: ConnectOutcome::Unknown,
+            restarted: false,
         });
         self.next_seq += 1;
     }
@@ -255,6 +355,57 @@ impl Observation {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
             IpAddr::V6(v6) => !v6.is_loopback(),
         })
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    /// **The reason this is not a boolean.** A non-blocking connect returns
+    /// EINPROGRESS and its real outcome arrives later via SO_ERROR, which a
+    /// syscall tracer never sees. Measured on a real run: curl's genuine TCP
+    /// connect returns EINPROGRESS, so a failed-flag would have marked the one
+    /// real connection as failed.
+    #[test]
+    fn in_flight_states_are_unknown_not_failures() {
+        for e in [libc::EINPROGRESS, libc::EALREADY, libc::EISCONN] {
+            assert_eq!(
+                ConnectOutcome::from_ret(-(e as i64)),
+                ConnectOutcome::Unknown,
+                "errno {e}"
+            );
+        }
+    }
+
+    /// Kernel restart pseudo-errnos never reach userspace: the call is
+    /// re-entered and recorded again, so treating them as outcomes would
+    /// double-count one call.
+    #[test]
+    fn restart_pseudo_errnos_are_unknown() {
+        for e in 512..=516 {
+            assert_eq!(ConnectOutcome::from_ret(-e), ConnectOutcome::Unknown, "{e}");
+        }
+    }
+
+    /// Definite failures keep their errno: ECONNREFUSED and ETIMEDOUT mean
+    /// very different things to a reader.
+    #[test]
+    fn definite_failures_carry_their_errno() {
+        assert_eq!(
+            ConnectOutcome::from_ret(-(libc::ECONNREFUSED as i64)),
+            ConnectOutcome::Failed(libc::ECONNREFUSED)
+        );
+        assert_eq!(
+            ConnectOutcome::from_ret(-(libc::ETIMEDOUT as i64))
+                .label()
+                .unwrap(),
+            "ETIMEDOUT"
+        );
+        assert_eq!(ConnectOutcome::from_ret(0), ConnectOutcome::Completed);
+        // Success and in-flight annotate nothing — only failures do.
+        assert_eq!(ConnectOutcome::Completed.label(), None);
+        assert_eq!(ConnectOutcome::Unknown.label(), None);
     }
 }
 

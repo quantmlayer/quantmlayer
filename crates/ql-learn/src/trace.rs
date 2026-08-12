@@ -149,6 +149,10 @@ fn supervise(root: Pid) -> Result<Observation> {
                     if is_exec && regs.ret < 0 {
                         let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
                         obs.mark_last_exec_failed(owner);
+                    } else if regs.nr == libc::SYS_connect {
+                        // Same pairing assumption as the exec marking above.
+                        let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+                        obs.mark_last_connect_outcome(owner, regs.ret);
                     } else if regs.nr == libc::SYS_socket {
                         // `socket()` returns the fd here; pair it with the type
                         // captured at entry so a later `connect` on this fd can
