@@ -200,6 +200,17 @@ that `verify.py` checks, and this file carries no hash of its own.
 - A record whose parent is absent appears at top level (the cell's first exec
   is parented to `ql`, outside the cell; `--since`/`--until` can cut a chain).
 - Denials are leaves: a refused exec never became anyone's parent.
+- **Observe-mode runs carry egress lineage.** Each connect hangs off the
+  process that opened it, rendered as `-> ip:port` beneath its process, with
+  repeats collapsed (`x3`). This is exact rather than correlated: the ptrace
+  tracer has the pid at the `connect` syscall stop itself, so no join is
+  involved. Endpoints are `ip:port`, not domains — the name is already
+  resolved and gone by the time `connect` is called. A connect whose pid
+  matches no exec record is listed as **unattributed** rather than attached to
+  a neighbouring process.
+
+  Enforce mode has no equivalent yet: the broker sits across a veth in another
+  network namespace and sees a TCP connection, not a process (see B9).
 - **Observe-mode runs are included, and labelled as predictions.** An observe
   would-deny is a forecast, not a denial that happened — nothing was stopped.
   Those rows read `would-allow` / `WOULD-DENY` rather than `allow` / `DENY`,

@@ -14,6 +14,26 @@ use std::path::PathBuf;
 
 use ql_profile::ExecDigest;
 
+/// One observed `connect`, with the process that opened it.
+///
+/// The endpoint is an IP and port, not a domain: by the time `connect` is
+/// called the name is already resolved and gone. That is a real limit on how
+/// this reads, not a defect in the attribution — the *lineage* (which process
+/// opened it, under which parent) is exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectEvent {
+    /// The process that called `connect`.
+    pub pid: u32,
+    /// Its parent as the tracer saw it, when available.
+    pub ppid: Option<u32>,
+    /// The destination address.
+    pub ip: IpAddr,
+    /// The destination port.
+    pub port: u16,
+    /// The mechanism that observed this event: `"ptrace"` in observe mode.
+    pub observed_by: &'static str,
+}
+
 /// One observed `execve`, with the process that performed it.
 ///
 /// `observed_by` names the mechanism rather than leaving it implied, because
@@ -55,6 +75,18 @@ pub struct Observation {
     pub exec_digests: BTreeMap<String, ExecDigest>,
     /// Network endpoints the agent attempted to `connect` to.
     pub connects: BTreeSet<(IpAddr, u16)>,
+    /// Per-connect events with the process that opened them, in observed
+    /// order.
+    ///
+    /// Kept alongside `connects` for the same reason `exec_events` sits beside
+    /// `execs`: the set drives profile synthesis, where duplicates and order
+    /// are noise, while this preserves the attribution lineage needs.
+    ///
+    /// Enforce mode cannot produce this from the same place — the broker sits
+    /// on the far side of a veth in another network namespace and sees a TCP
+    /// connection, not a process. Here the pid is simply in hand at the
+    /// syscall stop, so attribution is exact and needs no correlation.
+    pub connect_events: Vec<ConnectEvent>,
     /// Raw syscall numbers observed, with a human-readable name when known.
     pub syscalls: BTreeMap<u64, String>,
     /// Count of distinct processes traced (the agent plus any children).
@@ -87,9 +119,16 @@ impl Observation {
         }
     }
 
-    /// Record a `connect` to a resolved endpoint.
-    pub fn record_connect(&mut self, ip: IpAddr, port: u16) {
+    /// Record a `connect` to a resolved endpoint by `pid`.
+    pub fn record_connect(&mut self, ip: IpAddr, port: u16, pid: u32, ppid: Option<u32>) {
         self.connects.insert((ip, port));
+        self.connect_events.push(ConnectEvent {
+            pid,
+            ppid,
+            ip,
+            port,
+            observed_by: "ptrace",
+        });
     }
 
     /// Record that syscall number `nr` (named `name`) was used.

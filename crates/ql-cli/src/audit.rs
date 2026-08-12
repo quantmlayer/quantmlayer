@@ -210,6 +210,7 @@ fn append(args: &[String]) -> ExitCode {
 /// exec time — it does not claim causality, which would have to be inferred.
 fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
     let mut nodes = Vec::new();
+    let mut connects = Vec::new();
     let mut unparsed = 0usize;
     for r in window {
         // Only per-process decisions, not the wall's configuration records.
@@ -221,6 +222,19 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         // Enforce-mode decisions, plus observe-mode exec findings — observe
         // is the mode someone tries first, and a tree is most useful before
         // you have committed to enforcing.
+        // Attributed egress: observe mode records the pid at the connect
+        // syscall itself, so these attach exactly rather than by correlation.
+        if r.event.action == "observe.connect" {
+            if let Some((pid, _ppid, _)) = crate::proctree::parse_detail(&r.event.detail) {
+                connects.push(crate::proctree::ConnectNode {
+                    pid,
+                    endpoint: r.event.target.clone(),
+                });
+            } else {
+                unparsed += 1;
+            }
+            continue;
+        }
         let is_exec_decision = matches!(r.event.action.as_str(), "exec.run" | "exec.deny")
             || r.event.action.starts_with("observe.exec.");
         if !is_exec_decision {
@@ -243,7 +257,7 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
         }
     }
 
-    let tree = crate::proctree::build(&nodes, unparsed);
+    let tree = crate::proctree::build_with_connects(&nodes, &connects, unparsed);
     let mut md = String::from(
         "# Process tree\n\nExec decisions from `records.jsonl`, grouped by the parent the \
          kernel recorded at exec time. This is a *view* of those records, not evidence in \
@@ -279,6 +293,16 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
          `--since`/`--until` filter can cut a chain. Denials appear as leaves because a \
          refused exec never became anyone's parent.\n",
     );
+    if !tree.unattributed.is_empty() {
+        md.push_str(&format!(
+            "\n{} connect(s) could not be attributed to a process in this window and are \
+             listed here rather than attached to a neighbouring one:\n\n",
+            tree.unattributed.len()
+        ));
+        for u in tree.unattributed.iter().take(20) {
+            md.push_str(&format!("- `{u}`\n"));
+        }
+    }
     if tree.unparsed > 0 {
         md.push_str(&format!(
             "\n{} exec record(s) could not be placed: their detail field did not match the \

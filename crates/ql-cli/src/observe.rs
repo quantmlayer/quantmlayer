@@ -193,6 +193,33 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             return;
         }
     }
+
+    // Attributed egress. Recorded per connect rather than as a deduplicated
+    // list so each one hangs off the process that opened it: in observe mode
+    // the pid is in hand at the syscall stop, so this is exact and needs no
+    // correlation. Endpoints are IP:port — the name is already resolved and
+    // gone by the time `connect` is called.
+    for ev in &report.attributed_connects {
+        let event = AuditEvent {
+            ts_millis: AuditLog::now_millis(),
+            actor: "observe".to_string(),
+            action: "observe.connect".to_string(),
+            target: format!("{}:{}", ev.ip, ev.port),
+            decision: Decision::Info,
+            detail: match ev.ppid {
+                Some(ppid) => format!(
+                    "pid {} ppid {ppid} (connect) NOT ENFORCING (observe mode)",
+                    ev.pid
+                ),
+                None => format!("pid {} (connect) NOT ENFORCING (observe mode)", ev.pid),
+            },
+            system: system.clone(),
+        };
+        if log.append(event).is_err() {
+            eprintln!("ql observe: audit append failed");
+            return;
+        }
+    }
     match log.to_jsonl() {
         Ok(text) => {
             if let Err(e) = std::fs::write(audit_path, text) {

@@ -82,6 +82,16 @@ pub fn parse_detail(detail: &str) -> Option<(u32, Option<u32>, String)> {
     Some((pid, ppid, comm.to_string()))
 }
 
+/// One egress connect attributed to a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectNode {
+    /// The process that opened it.
+    pub pid: u32,
+    /// `ip:port`. Not a domain: by `connect` time the name is resolved and
+    /// gone.
+    pub endpoint: String,
+}
+
 /// A rendered tree, plus what could not be placed in it.
 #[derive(Debug, Default)]
 pub struct Tree {
@@ -89,6 +99,11 @@ pub struct Tree {
     pub lines: Vec<String>,
     /// Records whose `detail` did not parse, so their parent is unknown.
     pub unparsed: usize,
+    /// Connects whose pid matched no exec node, rendered separately rather
+    /// than attached to a neighbour. Attaching an unmatched connect to the
+    /// nearest process in time would manufacture exactly the causality this
+    /// module refuses to assert.
+    pub unattributed: Vec<String>,
     /// Whether any record carried a ppid at all. False means the log came from
     /// a substrate that does not report parents (tier 2), and no grouping is
     /// possible — a materially different statement from "everything is a root".
@@ -100,8 +115,28 @@ pub struct Tree {
 /// Nodes whose parent is absent from the set become roots, which is the honest
 /// rendering for the cell's first exec (whose parent is `ql`) and for any chain
 /// broken by filtering.
-pub fn build(nodes: &[ExecNode], unparsed: usize) -> Tree {
+/// Build the tree, hanging each connect off the process that opened it.
+///
+/// This is lineage rather than grouping: a connect's pid comes from the same
+/// syscall stop that recorded it, so "this process opened this endpoint" is an
+/// observation, not a correlation. A connect whose pid matches no exec node is
+/// listed as unattributed.
+///
+/// Pass an empty `connects` slice for a tree of execs alone.
+pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparsed: usize) -> Tree {
+    let mut by_pid: BTreeMap<u32, Vec<&ConnectNode>> = BTreeMap::new();
+    let known: BTreeSet<u32> = nodes.iter().map(|n| n.pid).collect();
+    let mut unattributed = Vec::new();
+    for c in connects {
+        if known.contains(&c.pid) {
+            by_pid.entry(c.pid).or_default().push(c);
+        } else {
+            unattributed.push(format!("{} (pid {})", c.endpoint, c.pid));
+        }
+    }
+
     let mut tree = Tree {
+        unattributed,
         unparsed,
         any_parent_data: nodes.iter().any(|n| n.ppid.is_some()),
         ..Default::default()
@@ -140,14 +175,16 @@ pub fn build(nodes: &[ExecNode], unparsed: usize) -> Tree {
     // must not be expanded twice, or the render could recurse without end.
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     for r in roots {
-        walk(r, &children, 0, &mut seen, &mut tree.lines);
+        walk(r, &children, &by_pid, 0, &mut seen, &mut tree.lines);
     }
     tree
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     node: &ExecNode,
     children: &BTreeMap<u32, Vec<&ExecNode>>,
+    connects: &BTreeMap<u32, Vec<&ConnectNode>>,
     depth: usize,
     seen: &mut BTreeSet<u32>,
     out: &mut Vec<String>,
@@ -158,9 +195,25 @@ fn walk(
         // Already expanded elsewhere; render the line but do not recurse.
         return;
     }
+    // Endpoints this process opened, collapsed by destination with a count —
+    // an `npm install` opens hundreds and one line each would bury the tree.
+    if let Some(cs) = connects.get(&node.pid) {
+        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+        for c in cs {
+            *tally.entry(c.endpoint.as_str()).or_default() += 1;
+        }
+        for (endpoint, n) in tally {
+            let times = if n > 1 {
+                format!(" x{n}")
+            } else {
+                String::new()
+            };
+            out.push(format!("{indent}  -> {endpoint}{times}"));
+        }
+    }
     if let Some(kids) = children.get(&node.pid) {
         for k in kids {
-            walk(k, children, depth + 1, seen, out);
+            walk(k, children, connects, depth + 1, seen, out);
         }
     }
 }
@@ -211,7 +264,7 @@ mod tests {
             n(34348, Some(34347), "sh", true, 10),
             n(34349, Some(34348), "dash", true, 20),
         ];
-        let t = build(&nodes, 0);
+        let t = build_with_connects(&nodes, &[], 0);
         assert!(t.any_parent_data);
         assert_eq!(t.lines.len(), 2);
         // 34347 is `ql` itself, outside the cell, so 34348 is a root...
@@ -254,7 +307,7 @@ mod tests {
     #[test]
     fn no_parent_data_lists_flat_and_says_so() {
         let nodes = vec![n(1, None, "sh", true, 1), n(2, None, "cc", false, 2)];
-        let t = build(&nodes, 0);
+        let t = build_with_connects(&nodes, &[], 0);
         assert!(!t.any_parent_data);
         assert_eq!(t.lines.len(), 2);
         assert!(t.lines.iter().all(|l| l.starts_with("  ")));
@@ -269,7 +322,7 @@ mod tests {
             n(10, Some(9), "sh", true, 1),
             n(11, Some(10), "curl", false, 2),
         ];
-        let t = build(&nodes, 0);
+        let t = build_with_connects(&nodes, &[], 0);
         assert!(t.lines[1].contains("DENY"));
         assert!(t.lines[1].starts_with("    "), "{:?}", t.lines);
     }
@@ -283,7 +336,7 @@ mod tests {
             n(6, Some(5), "child", true, 2),
             n(6, Some(5), "child-again", true, 3),
         ];
-        let t = build(&nodes, 0);
+        let t = build_with_connects(&nodes, &[], 0);
         // Terminates, and every record is accounted for.
         assert_eq!(t.lines.len(), 3);
     }
@@ -308,7 +361,11 @@ mod tests {
     /// it ran to completion.
     #[test]
     fn observe_records_are_labelled_as_predictions() {
-        let t = build(&[observed(1, None, true), observed(2, Some(1), false)], 0);
+        let t = build_with_connects(
+            &[observed(1, None, true), observed(2, Some(1), false)],
+            &[],
+            0,
+        );
         assert!(t.lines[0].contains("would-allow"), "{:?}", t.lines);
         assert!(t.lines[1].contains("WOULD-DENY"), "{:?}", t.lines);
         // And never the enforced words, which would overstate what happened.
@@ -316,10 +373,77 @@ mod tests {
         assert!(!t.lines[1].starts_with("    DENY"), "{:?}", t.lines);
     }
 
+    /// **Lineage.** A connect hangs off the process that opened it, because in
+    /// observe mode the pid comes from the same syscall stop that recorded the
+    /// connect — an observation, not a correlation.
+    #[test]
+    fn connects_attach_to_the_process_that_opened_them() {
+        let nodes = vec![
+            n(10, None, "sh", true, 1),
+            n(11, Some(10), "curl", true, 2),
+            n(12, Some(10), "true", true, 3),
+        ];
+        let connects = vec![
+            ConnectNode {
+                pid: 11,
+                endpoint: "1.2.3.4:443".into(),
+            },
+            ConnectNode {
+                pid: 11,
+                endpoint: "1.2.3.4:443".into(),
+            },
+            ConnectNode {
+                pid: 11,
+                endpoint: "5.6.7.8:443".into(),
+            },
+        ];
+        let t = build_with_connects(&nodes, &connects, 0);
+        let joined = t.lines.join("\n");
+
+        // Repeats collapse with a count rather than one line each.
+        assert!(joined.contains("-> 1.2.3.4:443 x2"), "{joined}");
+        assert!(joined.contains("-> 5.6.7.8:443"), "{joined}");
+        assert!(t.unattributed.is_empty());
+
+        // The endpoints sit under curl (pid 11), not under its siblings.
+        let curl_at = t.lines.iter().position(|l| l.contains("pid 11")).unwrap();
+        let true_at = t.lines.iter().position(|l| l.contains("pid 12")).unwrap();
+        assert!(curl_at < true_at);
+        for i in curl_at + 1..true_at {
+            assert!(
+                t.lines[i].contains("->"),
+                "only endpoints between: {:?}",
+                t.lines[i]
+            );
+        }
+    }
+
+    /// A connect whose pid matches no exec node is listed as unattributed —
+    /// never attached to the nearest process in time, which would manufacture
+    /// causality out of coincidence.
+    #[test]
+    fn an_unmatched_connect_is_listed_not_guessed() {
+        let nodes = vec![n(10, None, "sh", true, 1)];
+        let connects = vec![ConnectNode {
+            pid: 999,
+            endpoint: "9.9.9.9:53".into(),
+        }];
+        let t = build_with_connects(&nodes, &connects, 0);
+
+        assert_eq!(t.unattributed.len(), 1);
+        assert!(t.unattributed[0].contains("9.9.9.9:53"));
+        assert!(t.unattributed[0].contains("999"));
+        assert!(
+            !t.lines.iter().any(|l| l.contains("9.9.9.9")),
+            "{:?}",
+            t.lines
+        );
+    }
+
     /// Unparsed records are counted, never silently dropped.
     #[test]
     fn unparsed_records_are_surfaced() {
-        let t = build(&[n(1, Some(0), "sh", true, 1)], 3);
+        let t = build_with_connects(&[n(1, Some(0), "sh", true, 1)], &[], 3);
         assert_eq!(t.unparsed, 3);
     }
 }

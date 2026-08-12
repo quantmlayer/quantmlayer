@@ -67,6 +67,10 @@ pub struct Finding {
 pub struct ObserveReport {
     /// Every evaluated action (exec + filesystem). Allows and would-denies.
     pub findings: Vec<Finding>,
+    /// External connects with the process that opened them, in observed order.
+    /// Empty for observations recorded before per-connect attribution existed;
+    /// `external_endpoints` remains the deduplicated view either way.
+    pub attributed_connects: Vec<crate::ConnectEvent>,
     /// External endpoints the agent connected to (IP:port), NOT domain-evaluated
     /// here — see the module's network note.
     pub external_endpoints: Vec<(IpAddr, u16)>,
@@ -157,13 +161,21 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
     }
 
     // network — collect external endpoints for awareness; not domain-evaluated.
+    let is_external = |ip: &IpAddr| match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(v6) => !v6.is_loopback(),
+    };
     for (ip, port) in &obs.connects {
-        let external = match ip {
-            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
-            IpAddr::V6(v6) => !v6.is_loopback(),
-        };
-        if external {
+        if is_external(ip) {
             report.external_endpoints.push((*ip, *port));
+        }
+    }
+    // The attributed view: same connects, but carrying the process that opened
+    // each one, so egress can hang off the process tree instead of sitting
+    // beside it as an unowned list.
+    for ev in &obs.connect_events {
+        if is_external(&ev.ip) {
+            report.attributed_connects.push(ev.clone());
         }
     }
 

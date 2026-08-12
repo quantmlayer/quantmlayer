@@ -263,7 +263,11 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
         }
     } else if nr == libc::SYS_connect {
         if let Some((ip, port)) = read_sockaddr(pid, regs.args[1], regs.args[2]) {
-            obs.record_connect(ip, port);
+            // The pid is already in hand here — `read_sockaddr` needs it to
+            // read the peer's memory. Carrying it into the record is what
+            // makes per-process egress lineage exact in observe mode, with no
+            // correlation join anywhere.
+            obs.record_connect(ip, port, pid.as_raw() as u32, ppid_of(pid));
         }
     } else {
         // x86-64 additionally has the legacy open(2)/creat(2); aarch64 routes
