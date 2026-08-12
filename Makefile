@@ -3,7 +3,8 @@
 # These targets are the project's CI gates. Every PR must pass `make check`.
 
 .PHONY: all check test test-priv fmt fmt-fix clippy benchmark bench-build overhead clean \
-        build-release install uninstall install-apparmor uninstall-apparmor
+        build-release install uninstall install-apparmor uninstall-apparmor \
+        sync-docs check-docs
 
 # Install layout (override with `make install PREFIX=/opt/quantmlayer`).
 PREFIX ?= /usr/local
@@ -18,6 +19,17 @@ all: check
 # (clippy is included; it requires a rustup toolchain. On environments without
 # it, run `make fmt test` directly.)
 check: fmt clippy test
+
+# Regenerate the README's generated regions (test-count badge, attack matrix)
+# from their sources. Hand-copied data rots: the badge went stale twice in two
+# releases and the matrix was two rows behind RESULTS.md.
+sync-docs:
+	python3 scripts/sync-docs.py
+
+# Fail if those regions are out of date. This is the part that prevents
+# recurrence — a sync script nobody remembers to run is not a fix.
+check-docs:
+	python3 scripts/sync-docs.py --check
 
 # Unit + integration tests that do NOT need elevated namespace privileges.
 test:

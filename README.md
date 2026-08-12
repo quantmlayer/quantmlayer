@@ -182,16 +182,18 @@ ql broker --profile profiles/coding.yaml --listen 127.0.0.1:8080
 
 Every row below is measured by a reproducible benchmark (`make benchmark`) — never asserted. **Docker** is a default `docker run` with the workspace mounted (no hardening flags); each attack's exact scenario and target wall is documented under [`benchmark/`](benchmark/), and the live scorecard is regenerated into [`benchmark/RESULTS.md`](benchmark/RESULTS.md) on every run.
 
+<!-- BEGIN generated: attack-matrix (scripts/sync-docs.py) -->
 | Attack | Wall | No containment | Docker | QuantmLayer |
 |---|---|---|---|---|
-| SSH private-key theft | mount | vulnerable | blocked | blocked |
-| Read secrets outside the workspace | mount | vulnerable | blocked | blocked |
-| Resource exhaustion (fork bomb) | cgroups | vulnerable | vulnerable | blocked |
-| Cross-process memory read / ptrace | seccomp | vulnerable | vulnerable | blocked |
-| Cloud-metadata SSRF | network | vulnerable | vulnerable | blocked |
-| Run an unauthorized tool (content-addressed exec) | exec | vulnerable | vulnerable | blocked |
-| DNS rebinding to a private address (allow-listed host) | broker | vulnerable | vulnerable | blocked |
-| Interpreter loads mutable code (script read at open time) | exec (open-time measurement) | pending | pending | pending |
+| SSH private-key theft | `mount` | ❌ vulnerable | ✅ blocked | ✅ blocked |
+| Read secrets outside the workspace | `mount` | ❌ vulnerable | ✅ blocked | ✅ blocked |
+| Resource exhaustion (fork bomb) | `cgroups` | ❌ vulnerable | ❌ vulnerable | ✅ blocked |
+| Cross-process memory read / ptrace | `seccomp` | ❌ vulnerable | ❌ vulnerable | ✅ blocked |
+| Cloud-metadata SSRF (169.254.169.254) | `network` | ❌ vulnerable | ❌ vulnerable | ✅ blocked |
+| Run an unauthorized tool (content-addressed exec) | `exec` | ❌ vulnerable | ❌ vulnerable | ✅ blocked |
+| DNS rebinding to a private address (allow-listed host) | `broker` | ❌ vulnerable | ❌ vulnerable | ✅ blocked |
+| Interpreter loads mutable code (script read at open time) | `exec (open-time measurement)` | — pending | — pending | — pending |
+<!-- END generated: attack-matrix -->
 
 The rebinding row is a different wall from metadata SSRF: there the network namespace has no route off-host at all; here the destination **is** on the allow-list and is refused because it *resolves* to a private address. The interpreter row is reported pending rather than scored — [`benchmark/RESULTS.md`](benchmark/RESULTS.md) explains why the exec wall does not cover it.
 

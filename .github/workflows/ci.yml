@@ -34,3 +34,9 @@ jobs:
 
       - name: Run the gate (fmt, clippy, tests)
         run: make check
+
+      # The README carries two copies of generated data: the test-count badge
+      # and the attack matrix. Both have gone stale in the past, so drift is
+      # a build failure rather than something noticed later by a reader.
+      - name: Check generated README regions are current
+        run: make check-docs
