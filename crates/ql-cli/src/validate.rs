@@ -20,6 +20,15 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--agent" => agent_name = it.next().cloned(),
             "--mcp" => mcp = true,
             "--json" => json = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: ql validate --profile <p.yaml> | --agent <name> | --mcp [--json]\n\
+                     \n\
+                     Checks a profile is well-formed and prints what it grants, including\n\
+                     any lockfile provenance recorded by `ql compile`.\n"
+                );
+                return ExitCode::from(0);
+            }
             other => {
                 eprintln!("ql validate: unknown option `{other}`");
                 return ExitCode::from(2);

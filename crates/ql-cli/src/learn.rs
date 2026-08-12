@@ -26,6 +26,15 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--out" => out = it.next().cloned(),
             "--verbose" => verbose = true,
             "--json" => json = true,
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: ql learn [--out <p.yaml>] [--json] [--verbose] -- <cmd...>\n\
+                     \n\
+                     Runs <cmd> uncontained while observing what it touches, then\n\
+                     synthesizes a least-privilege profile from the observed behavior.\n"
+                );
+                return ExitCode::from(0);
+            }
             other => {
                 eprintln!("ql learn: unknown option `{other}`");
                 return ExitCode::from(2);

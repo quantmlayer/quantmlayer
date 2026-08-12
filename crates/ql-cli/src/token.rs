@@ -59,6 +59,23 @@ pub fn cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// Usage for `ql token delegate`.
+fn print_delegate_usage() {
+    eprintln!(
+        "usage: ql token delegate --from <parent.json> --out <child.json> \\\n\
+         \x20         [--only-domains a,b] [--only-read <glob>] [--only-write <glob>] \\\n\
+         \x20         [--only-exec <path>]\n\
+         \n\
+         Issues a sub-agent a strictly narrower slice of an existing credential.\n\
+         Narrowing intersects with the parent's grant: naming something the parent\n\
+         never held grants nothing rather than failing. With no --only-* flag the\n\
+         child inherits the parent's full authority.\n\
+         \n\
+         A token governs what the broker admits, not what the sub-agent's process\n\
+         can do — contain the sub-agent's cell as well.\n"
+    );
+}
+
 /// `ql token delegate` — issue a sub-agent a strictly narrower credential
 /// derived from an existing one.
 fn delegate_cmd(args: &[String]) -> ExitCode {
@@ -84,6 +101,10 @@ fn delegate_cmd(args: &[String]) -> ExitCode {
             "--only-read" => n.only_read = it.next().map(|v| list(v)),
             "--only-write" => n.only_write = it.next().map(|v| list(v)),
             "--only-exec" => n.only_exec = it.next().map(|v| list(v)),
+            "-h" | "--help" => {
+                print_delegate_usage();
+                return ExitCode::from(0);
+            }
             other => {
                 eprintln!("ql token delegate: unexpected argument `{other}`");
                 return ExitCode::from(2);

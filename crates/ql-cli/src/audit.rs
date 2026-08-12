@@ -281,6 +281,22 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
     md
 }
 
+/// Usage for `ql audit export`. Its own function because the sub-subcommand
+/// parses its own arguments; a `--help` that reaches an argument loop and is
+/// rejected as "unexpected" is the worst possible answer to someone trying to
+/// find out how the command works.
+fn print_export_usage() {
+    eprintln!(
+        "usage: ql audit export <log.jsonl> --out <dir> [--since <ms>] [--until <ms>] \
+         [--sign-key <path>]\n\
+         \x20      ql audit export <log.jsonl> --format otlp --out <file.json> [--host <name>]\n\
+         \n\
+         Default: a verifiable evidence bundle (records, manifest, verifier, process tree).\n\
+         --format otlp: an OTLP/HTTP logs document for an existing collector; --out names\n\
+         the file rather than a directory.\n"
+    );
+}
+
 fn export(args: &[String]) -> ExitCode {
     let mut log_path: Option<&str> = None;
     let mut out_dir: Option<&str> = None;
@@ -297,6 +313,10 @@ fn export(args: &[String]) -> ExitCode {
             "--until" => until = it.next().and_then(|s| s.parse().ok()),
             "--sign-key" => sign_key = it.next().map(String::as_str),
             "--format" => format = it.next().map(String::as_str),
+            "-h" | "--help" => {
+                print_export_usage();
+                return ExitCode::from(0);
+            }
             "--host" => host = it.next().map(String::as_str),
             s if !s.starts_with('-') && log_path.is_none() => log_path = Some(s),
             other => {
