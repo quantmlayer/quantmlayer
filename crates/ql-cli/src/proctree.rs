@@ -655,6 +655,31 @@ mod tests {
         );
     }
 
+    /// **Serialization must preserve ordering.** If connect records lack a
+    /// sequence, their order falls back to epoch milliseconds while execs
+    /// carry small counters — so every exec of a pid compares as "before" and
+    /// attribution picks that pid's last exec of the whole run. A process that
+    /// connects and *then* execs in place would have its connection credited
+    /// to the later image.
+    #[test]
+    fn a_connect_is_not_credited_to_a_later_image() {
+        let mut early = n(70, None, "curl", true, 100);
+        early.order = 1;
+        let mut later = n(70, None, "python", true, 100);
+        later.order = 9;
+
+        // Connect happened between the two execs.
+        let mut c = cn(70, None, "1.2.3.4:443", 100);
+        c.order = 5;
+
+        let t = build_with_connects(&[early, later], &[c], 0);
+        let ep_at = t.lines.iter().position(|l| l.contains("->")).unwrap();
+        let curl_at = t.lines.iter().position(|l| l.contains("curl")).unwrap();
+        let py_at = t.lines.iter().position(|l| l.contains("python")).unwrap();
+        assert_eq!(ep_at, curl_at + 1, "must follow curl: {:?}", t.lines);
+        assert!(ep_at < py_at, "credited to the later image: {:?}", t.lines);
+    }
+
     /// Unparsed records are counted, never silently dropped.
     #[test]
     fn unparsed_records_are_surfaced() {

@@ -214,12 +214,21 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             action: "observe.connect".to_string(),
             target: format!("{}:{}", ev.ip, ev.port),
             decision: Decision::Info,
+            // `seq` must be here, not just on exec records: without it the
+            // tree's order falls back to epoch milliseconds for connects while
+            // execs carry small counters, so every exec of a pid compares as
+            // "before" and attribution silently picks that pid's last exec of
+            // the whole run — crediting a connect to an image that replaced
+            // the one which opened it.
             detail: match ev.ppid {
                 Some(ppid) => format!(
-                    "pid {} ppid {ppid} (connect) NOT ENFORCING (observe mode)",
-                    ev.pid
+                    "pid {} ppid {ppid} seq {} (connect) NOT ENFORCING (observe mode)",
+                    ev.pid, ev.seq
                 ),
-                None => format!("pid {} (connect) NOT ENFORCING (observe mode)", ev.pid),
+                None => format!(
+                    "pid {} seq {} (connect) NOT ENFORCING (observe mode)",
+                    ev.pid, ev.seq
+                ),
             },
             system: system.clone(),
         };

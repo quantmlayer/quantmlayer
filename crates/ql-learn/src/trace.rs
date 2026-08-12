@@ -170,6 +170,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The thread-group id of `tid` — the process it belongs to.
+///
+/// ptrace stops report *threads*, and a thread has no exec record of its own:
+/// only the group leader execs. A resolver thread inside `curl` therefore
+/// looks like an unknown pid, and `/proc/<tid>/stat` field 4 names the
+/// *process's* parent, not `curl` — so attributing by that parent credits the
+/// connection one image too high, to whatever spawned curl.
+///
+/// Recording events under the tgid makes a thread's activity belong to its own
+/// process, which is what a reader means by "curl opened this".
+fn tgid_of(tid: Pid) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw())).ok()?;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("Tgid:") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// The parent of `pid`, read from `/proc/<pid>/stat` at the syscall stop.
 ///
 /// Read live rather than tracked from fork events because the tracer sees
@@ -263,7 +283,9 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
         }
     } else if nr == libc::SYS_execve {
         if let Some(p) = read_cstr(pid, regs.args[0]) {
-            obs.record_exec(p, pid.as_raw() as u32, ppid_of(pid), now_ms());
+            // Attribute to the process, not the thread: see `tgid_of`.
+            let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+            obs.record_exec(p, owner, ppid_of(pid), now_ms());
         }
     } else if nr == libc::SYS_execveat {
         if let Some(p) = read_cstr(pid, regs.args[1]) {
@@ -275,7 +297,8 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
             // read the peer's memory. Carrying it into the record is what
             // makes per-process egress lineage exact in observe mode, with no
             // correlation join anywhere.
-            obs.record_connect(ip, port, pid.as_raw() as u32, ppid_of(pid), now_ms());
+            let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+            obs.record_connect(ip, port, owner, ppid_of(pid), now_ms());
         }
     } else {
         // x86-64 additionally has the legacy open(2)/creat(2); aarch64 routes

@@ -217,6 +217,11 @@ that `verify.py` checks, and this file carries no hash of its own.
   exec'd is running its parent's image, so its connects attribute to the
   nearest ancestor that has one.
 
+  Threads are attributed to their process: ptrace stops report threads, and
+  only a thread-group leader execs, so a resolver thread's connect is recorded
+  under its tgid rather than left to the ancestor fallback — which would have
+  credited it to whatever spawned the process, one image too high.
+
   Caveats worth knowing: counts are connect **attempts** — a `connect`
   interrupted by a signal is restarted and recorded again; observe records
   exec *attempts*, so a PATH search shows the misses too, since decoding at
