@@ -30,7 +30,7 @@ mod synth;
 mod trace;
 
 pub use error::{LearnError, Result};
-pub use observation::{ConnectEvent, ExecEvent, Observation};
+pub use observation::{ConnectEvent, ExecEvent, Observation, SockProto};
 pub use observe::{evaluate, Finding, ObserveReport, Verdict};
 pub use risk::{build_risk_report, risk_report_for_profile};
 pub use shim::{exec_shim_gaps, resolve_shebang_interpreter, resolve_shim_interpreters};

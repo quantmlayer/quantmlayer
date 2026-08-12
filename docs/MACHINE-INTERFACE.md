@@ -217,6 +217,17 @@ that `verify.py` checks, and this file carries no hash of its own.
   exec'd is running its parent's image, so its connects attribute to the
   nearest ancestor that has one.
 
+  Endpoints carry the socket protocol when the `socket()` call was observed
+  (`-> udp 1.2.3.4:53`, `-> tcp 1.2.3.4:443`), because a destination alone can
+  mislead. `curl` reuses one UDP socket to probe several addresses before
+  opening its real TCP session, so without the protocol those probes render as
+  sessions that never happened; a UDP connect to port 0 is how `getaddrinfo`
+  asks which source address a destination would use, and sends nothing. The
+  tree states the protocol and stops — calling something a "resolver probe"
+  would be an inference, and this view does not render inferences. A socket
+  created before tracing began has no observed type and is shown without a
+  label rather than guessed.
+
   Threads are attributed to their process: ptrace stops report threads, and
   only a thread-group leader execs, so a resolver thread's connect is recorded
   under its tgid rather than left to the ancestor fallback — which would have

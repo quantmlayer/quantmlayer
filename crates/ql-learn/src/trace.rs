@@ -115,6 +115,7 @@ fn supervise(root: Pid) -> Result<Observation> {
 
     // Per-pid state: are we at a syscall *entry* (true) or *exit* (false next)?
     let mut at_entry: HashMap<Pid, bool> = HashMap::new();
+    let mut fds = FdTable::default();
     at_entry.insert(root, true);
     let mut seen: HashSet<Pid> = HashSet::new();
     seen.insert(root);
@@ -135,7 +136,7 @@ fn supervise(root: Pid) -> Result<Observation> {
                 let entry = at_entry.entry(pid).or_insert(true);
                 if *entry {
                     if let Some(regs) = read_regs(pid) {
-                        decode_entry(pid, &regs, &mut obs);
+                        decode_entry(pid, &regs, &mut obs, &mut fds);
                     }
                 } else if let Some(regs) = read_regs(pid) {
                     // Exit stop. Both outcomes reach here — a successful
@@ -148,6 +149,12 @@ fn supervise(root: Pid) -> Result<Observation> {
                     if is_exec && regs.ret < 0 {
                         let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
                         obs.mark_last_exec_failed(owner);
+                    } else if regs.nr == libc::SYS_socket {
+                        // `socket()` returns the fd here; pair it with the type
+                        // captured at entry so a later `connect` on this fd can
+                        // be labelled with its protocol.
+                        let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+                        fds.note_socket_exit(pid, owner, regs.ret);
                     }
                 }
                 *entry = !*entry;
@@ -177,6 +184,51 @@ fn supervise(root: Pid) -> Result<Observation> {
 
     obs.process_count = (seen.len() as u32).max(1);
     Ok(obs)
+}
+
+/// Transient per-run tracer state: which protocol each open socket fd was
+/// created with, so a `connect` can be labelled.
+///
+/// Not part of [`Observation`] because it is bookkeeping that dies with the
+/// trace — only the resolved protocol on each connect event outlives it.
+#[derive(Default)]
+struct FdTable {
+    /// `(tgid, fd)` -> protocol, for sockets created during the trace.
+    sockets: HashMap<(u32, i64), crate::SockProto>,
+    /// `tid` -> the `socket()` type argument seen at entry, awaiting the fd
+    /// that the exit stop returns.
+    pending: HashMap<Pid, u64>,
+}
+
+impl FdTable {
+    /// Record a `socket()` entry; the fd is not known until the exit stop.
+    fn note_socket_entry(&mut self, tid: Pid, ty: u64) {
+        self.pending.insert(tid, ty);
+    }
+
+    /// Pair a `socket()` exit with its entry, binding fd to protocol.
+    fn note_socket_exit(&mut self, tid: Pid, tgid: u32, fd: i64) {
+        if let Some(ty) = self.pending.remove(&tid) {
+            if fd >= 0 {
+                self.sockets
+                    .insert((tgid, fd), crate::SockProto::from_socket_type(ty));
+            }
+        }
+    }
+
+    /// Forget a closed fd, so a later socket reusing the number is not
+    /// mislabelled with the old protocol.
+    fn note_close(&mut self, tgid: u32, fd: i64) {
+        self.sockets.remove(&(tgid, fd));
+    }
+
+    /// The protocol of `fd`, or `Unknown` when the socket predates the trace.
+    fn proto(&self, tgid: u32, fd: i64) -> crate::SockProto {
+        self.sockets
+            .get(&(tgid, fd))
+            .copied()
+            .unwrap_or(crate::SockProto::Unknown)
+    }
 }
 
 /// Wall-clock milliseconds now, stamped at the syscall stop.
@@ -289,7 +341,7 @@ fn read_regs(pid: Pid) -> Option<Regs> {
 
 /// Decode and record a single syscall *entry* for `pid`. Syscall numbers come
 /// from `libc::SYS_*` (arch-correct); argument positions are ABI-stable.
-fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
+fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation, fds: &mut FdTable) {
     let nr = regs.nr;
     obs.record_syscall(nr as u64, syscall_name(nr));
 
@@ -317,6 +369,12 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
             let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
             obs.record_exec(p, owner, ppid_of(pid), now_ms());
         }
+    } else if nr == libc::SYS_socket {
+        // The fd arrives at the exit stop; stash the type until then.
+        fds.note_socket_entry(pid, regs.args[1]);
+    } else if nr == libc::SYS_close {
+        let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
+        fds.note_close(owner, regs.args[0] as i64);
     } else if nr == libc::SYS_connect {
         if let Some((ip, port)) = read_sockaddr(pid, regs.args[1], regs.args[2]) {
             // The pid is already in hand here — `read_sockaddr` needs it to
@@ -324,7 +382,8 @@ fn decode_entry(pid: Pid, regs: &Regs, obs: &mut Observation) {
             // makes per-process egress lineage exact in observe mode, with no
             // correlation join anywhere.
             let owner = tgid_of(pid).unwrap_or(pid.as_raw() as u32);
-            obs.record_connect(ip, port, owner, ppid_of(pid), now_ms());
+            let proto = fds.proto(owner, regs.args[0] as i64);
+            obs.record_connect(ip, port, owner, ppid_of(pid), now_ms(), proto);
         }
     } else {
         // x86-64 additionally has the legacy open(2)/creat(2); aarch64 routes

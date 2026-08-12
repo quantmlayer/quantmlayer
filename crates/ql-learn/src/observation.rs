@@ -14,6 +14,47 @@ use std::path::PathBuf;
 
 use ql_profile::ExecDigest;
 
+/// The socket protocol a `connect` was made on.
+///
+/// Recorded because a destination alone can mislead: a UDP `connect` to port 0
+/// is how `getaddrinfo` asks the kernel which source address would be used for
+/// a destination — it sends nothing. Rendering that identically to a TCP
+/// session invites a reader to see traffic that never happened. The tree
+/// states the protocol as fact and stops there; calling it a "resolver probe"
+/// would be an inference, and inference is the one thing this view does not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SockProto {
+    /// `SOCK_STREAM` — TCP.
+    Stream,
+    /// `SOCK_DGRAM` — UDP.
+    Dgram,
+    /// Another type, or the socket was created before tracing began.
+    #[default]
+    Unknown,
+}
+
+impl SockProto {
+    /// From the `type` argument of `socket(2)`, whose low bits carry the type
+    /// and whose high bits carry `SOCK_CLOEXEC`/`SOCK_NONBLOCK`.
+    pub fn from_socket_type(ty: u64) -> SockProto {
+        match (ty & 0xF) as i32 {
+            libc::SOCK_STREAM => SockProto::Stream,
+            libc::SOCK_DGRAM => SockProto::Dgram,
+            _ => SockProto::Unknown,
+        }
+    }
+
+    /// Short label for rendering, or `None` when unknown — an unknown protocol
+    /// is shown as absent rather than guessed.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            SockProto::Stream => Some("tcp"),
+            SockProto::Dgram => Some("udp"),
+            SockProto::Unknown => None,
+        }
+    }
+}
+
 /// One observed `connect`, with the process that opened it.
 ///
 /// The endpoint is an IP and port, not a domain: by the time `connect` is
@@ -40,6 +81,8 @@ pub struct ConnectEvent {
     pub ts_millis: u64,
     /// Observation order. See [`Observation::next_seq`].
     pub seq: u64,
+    /// The socket's protocol, when the `socket()` call was observed.
+    pub proto: SockProto,
 }
 
 /// One observed `execve`, with the process that performed it.
@@ -176,6 +219,7 @@ impl Observation {
     }
 
     /// Record a `connect` to a resolved endpoint by `pid`.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_connect(
         &mut self,
         ip: IpAddr,
@@ -183,6 +227,7 @@ impl Observation {
         pid: u32,
         ppid: Option<u32>,
         ts_millis: u64,
+        proto: SockProto,
     ) {
         self.connects.insert((ip, port));
         self.connect_events.push(ConnectEvent {
@@ -193,6 +238,7 @@ impl Observation {
             observed_by: "ptrace",
             ts_millis,
             seq: self.next_seq,
+            proto,
         });
         self.next_seq += 1;
     }
@@ -209,5 +255,39 @@ impl Observation {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
             IpAddr::V6(v6) => !v6.is_loopback(),
         })
+    }
+}
+
+#[cfg(test)]
+mod sockproto_tests {
+    use super::*;
+
+    /// The type argument carries flags in its high bits, so the low nibble is
+    /// what identifies the socket.
+    #[test]
+    fn socket_type_flags_do_not_confuse_the_protocol() {
+        let cloexec = 0o2000000u64;
+        let nonblock = 0o4000u64;
+        assert_eq!(
+            SockProto::from_socket_type(libc::SOCK_DGRAM as u64 | cloexec | nonblock),
+            SockProto::Dgram
+        );
+        assert_eq!(
+            SockProto::from_socket_type(libc::SOCK_STREAM as u64 | cloexec),
+            SockProto::Stream
+        );
+        assert_eq!(
+            SockProto::from_socket_type(libc::SOCK_RAW as u64),
+            SockProto::Unknown
+        );
+    }
+
+    /// An unknown protocol renders as absent, never guessed — a socket created
+    /// before tracing began has no observed type.
+    #[test]
+    fn unknown_protocol_has_no_label() {
+        assert_eq!(SockProto::Unknown.label(), None);
+        assert_eq!(SockProto::Dgram.label(), Some("udp"));
+        assert_eq!(SockProto::Stream.label(), Some("tcp"));
     }
 }

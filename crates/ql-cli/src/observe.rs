@@ -215,7 +215,14 @@ fn write_observe_audit(audit_path: &str, report: &ql_learn::ObserveReport, opts:
             ts_millis: ev.ts_millis,
             actor: "observe".to_string(),
             action: "observe.connect".to_string(),
-            target: format!("{}:{}", ev.ip, ev.port),
+            // Protocol prefixes the target so the record is self-describing:
+            // `udp 1.2.3.4:0` is a source-address probe, `tcp 1.2.3.4:443` is
+            // a session, and rendering them alike invites a reader to see
+            // traffic that never happened.
+            target: match ev.proto.label() {
+                Some(p) => format!("{p} {}:{}", ev.ip, ev.port),
+                None => format!("{}:{}", ev.ip, ev.port),
+            },
             decision: Decision::Info,
             // `seq` must be here, not just on exec records: without it the
             // tree's order falls back to epoch milliseconds for connects while
