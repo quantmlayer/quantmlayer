@@ -118,6 +118,49 @@ the reason on stderr before any summary. Counts mirror the human summary.
 }
 ```
 
+## `ql run --phase <name>` and `requirements`
+
+Two additive profile fields, both absent by default — a profile without them
+behaves exactly as before.
+
+**`phases`** gives one step of a task its own narrower authority. The same
+agent needs different authority at different moments: dependency install needs
+the registries but not the model endpoint; build and test need the workspace
+but usually no egress at all, and that is where freshly-downloaded code first
+executes. Without phases a profile must cover the session at its widest point.
+
+```yaml
+phases:
+  install:
+    only_domains: ["crates.io", "static.crates.io"]
+  build:
+    no_egress: true
+    output_path: "/work/target"
+```
+
+`ql run --phase build ...` applies it. **A phase can only narrow**: every list
+is intersected with the base profile's, never unioned, so naming a domain the
+base does not grant grants nothing. That keeps the base profile an upper bound
+on the whole session, which is what makes a signature over it meaningful. A
+narrowed profile drops the base's signature, since it is a different document.
+An unknown phase name exits `2` and lists the phases the profile defines.
+
+**`requirements`** lets a policy state the guarantee it needs rather than the
+platform it runs on, so a substrate that cannot deliver is disqualified instead
+of silently providing something weaker:
+
+```yaml
+requirements:
+  exec_identity: content_hash      # or path_or_signer
+  secret_visibility: absent        # or access_denied
+  degradation: refuse              # or allow
+```
+
+An unmet requirement is named (`exec_identity requires 'content_hash' but this
+host provides 'path_or_signer'`) and exits `1` under the default
+`degradation: refuse`. `allow` proceeds with the strongest available substitute
+and says so.
+
 ## `ql run --ci`
 
 An alias, not a mode: it fills in machine-readable artifact paths the caller

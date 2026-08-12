@@ -525,3 +525,398 @@ argv_deny:
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Guarantee requirements (Cross-platform Cell, cheap half)
+// ---------------------------------------------------------------------------
+
+/// The identity property an approved-execution decision rests on.
+///
+/// Named as a *guarantee* rather than a mechanism so a policy can state what it
+/// needs without naming a backend. The distinction is load-bearing: a
+/// path-based allow-list and a content digest both "approve executables", but
+/// only one survives an attacker replacing the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecIdentity {
+    /// The executable's own content is hashed and compared (Linux BPF-LSM
+    /// tier 1, or the userspace seccomp-notify tier 2).
+    ContentHash,
+    /// Approval is by path, signer, or ACL — not by content. An attacker who
+    /// replaces the file at an approved path is not caught.
+    PathOrSigner,
+}
+
+/// How thoroughly a secret outside the grant is kept from the workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretVisibility {
+    /// The path does not exist in the cell's view at all: `ENOENT`, not
+    /// `EACCES`. A mount namespace constructs the view, so there is nothing to
+    /// probe for.
+    Absent,
+    /// The path exists and is denied on access. Its existence, name, and
+    /// metadata still leak.
+    AccessDenied,
+}
+
+/// What to do when the substrate cannot meet a requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Degradation {
+    /// Refuse to run. The policy asked for a guarantee this host cannot give,
+    /// and running anyway would silently deliver something weaker than what
+    /// was authorized.
+    #[default]
+    Refuse,
+    /// Run with the strongest available substitute, and say so. Appropriate
+    /// when the policy author has decided partial containment beats none.
+    Allow,
+}
+
+/// Guarantees a policy requires of the substrate, and what to do without them.
+///
+/// This exists so that a profile states *what it needs* rather than *where it
+/// runs*: a host that cannot meet a requirement is disqualified rather than
+/// silently delivering something weaker. Absent (the default) preserves
+/// today's behavior — take the strongest available tier and report it.
+///
+/// The fields are deliberately additive and default to `None`, so this can
+/// land long before any non-Linux backend exists; retrofitting a requirements
+/// vocabulary onto a mature schema is far more expensive than reserving it now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Requirements {
+    /// Required execution-identity guarantee, if the policy cares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_identity: Option<ExecIdentity>,
+    /// Required secret-visibility guarantee, if the policy cares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_visibility: Option<SecretVisibility>,
+    /// What to do when a requirement cannot be met. Defaults to refusing:
+    /// a policy that bothered to state a requirement should not quietly get
+    /// less than it asked for.
+    #[serde(default)]
+    pub degradation: Degradation,
+}
+
+/// What the running substrate can actually guarantee, for comparison against
+/// [`Requirements`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guarantees {
+    /// The execution-identity property this host provides.
+    pub exec_identity: ExecIdentity,
+    /// The secret-visibility property this host provides.
+    pub secret_visibility: SecretVisibility,
+}
+
+/// One unmet requirement, named for the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmet {
+    /// Which requirement failed, e.g. `exec_identity`.
+    pub requirement: &'static str,
+    /// What the policy asked for.
+    pub required: &'static str,
+    /// What this host can actually provide.
+    pub available: &'static str,
+}
+
+impl std::fmt::Display for Unmet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} requires `{}` but this host provides `{}`",
+            self.requirement, self.required, self.available
+        )
+    }
+}
+
+impl Requirements {
+    /// Every requirement this substrate cannot meet. Empty means qualified.
+    pub fn unmet(&self, have: &Guarantees) -> Vec<Unmet> {
+        let mut out = Vec::new();
+        if self.exec_identity == Some(ExecIdentity::ContentHash)
+            && have.exec_identity != ExecIdentity::ContentHash
+        {
+            out.push(Unmet {
+                requirement: "exec_identity",
+                required: "content_hash",
+                available: "path_or_signer",
+            });
+        }
+        if self.secret_visibility == Some(SecretVisibility::Absent)
+            && have.secret_visibility != SecretVisibility::Absent
+        {
+            out.push(Unmet {
+                requirement: "secret_visibility",
+                required: "absent",
+                available: "access_denied",
+            });
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase-scoped authority
+// ---------------------------------------------------------------------------
+
+/// Narrower authority for one named phase of a task.
+///
+/// The same agent needs different authority at different moments: dependency
+/// install needs the registries but no credentials; build and test need the
+/// workspace and toolchain but frequently **no egress at all**. A single
+/// profile has to cover the session at its widest point — the union of every
+/// phase — so the agent runs at maximum width the whole time. A phase runs one
+/// step at its own narrower width instead.
+///
+/// This is a profile-structure change, not new enforcement: a phase is applied
+/// by [`Phase::narrow`] to produce an ordinary [`crate::Profile`] which the
+/// existing walls enforce unchanged.
+///
+/// # Invariant: a phase can only narrow
+///
+/// Every field here *removes* authority. There is deliberately no way to add a
+/// domain, a path, or a digest — if a phase could widen, the base profile
+/// would stop being an upper bound on the session, and a signature over the
+/// base profile would no longer bound what the agent can do. [`Phase::narrow`]
+/// intersects with the base rather than replacing it, so even a hand-edited
+/// phase naming a domain the base lacks grants nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Phase {
+    /// Human note about what this phase is for. Not enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Drop all egress for this phase. The common case for build/test: the
+    /// dependencies are already fetched, so nothing legitimate needs the
+    /// network, and this is the phase where untrusted downloaded code first
+    /// executes.
+    #[serde(default)]
+    pub no_egress: bool,
+
+    /// Restrict egress to these domains. Intersected with the base allow-list,
+    /// so a domain the base does not grant is not granted here either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only_domains: Vec<String>,
+
+    /// Restrict read-write filesystem access to these globs. Intersected with
+    /// the base grants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only_readwrite: Vec<String>,
+
+    /// The single path this phase's results are expected to land in.
+    ///
+    /// Everything else in the working area is scratch. Recording it makes
+    /// "what this step produced" distinguishable from "what it merely touched"
+    /// — useful for auditing, and the natural input to any future isolation
+    /// work. Advisory today: it is not enforced as the *only* writable path,
+    /// because a build that cannot write its own temporary files is useless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+}
+
+impl Phase {
+    /// Apply this phase to `base`, returning a profile that grants no more
+    /// than `base` did.
+    ///
+    /// Narrowing only: each list is *intersected* with the base's, never
+    /// unioned. A phase naming something the base lacks contributes nothing.
+    pub fn narrow(&self, base: &crate::Profile) -> crate::Profile {
+        let mut p = base.clone();
+
+        if self.no_egress {
+            p.network.allow_domains.clear();
+            p.network.default_deny = true;
+        } else if !self.only_domains.is_empty() {
+            p.network
+                .allow_domains
+                .retain(|d| self.only_domains.contains(d));
+        }
+
+        if !self.only_readwrite.is_empty() {
+            p.filesystem
+                .readwrite
+                .retain(|g| self.only_readwrite.contains(g));
+        }
+
+        // A phase is a runtime narrowing of an already-approved policy, so any
+        // signature over the base no longer describes this document. Drop it
+        // rather than carry one that would fail verification and look like
+        // tampering.
+        p.signature = None;
+        p
+    }
+}
+
+#[cfg(test)]
+mod phase_and_requirement_tests {
+    use super::*;
+    use crate::Profile;
+
+    fn base() -> Profile {
+        let mut p = Profile::default();
+        p.network.default_deny = true;
+        p.network.allow_domains = vec![
+            "crates.io".into(),
+            "registry.npmjs.org".into(),
+            "api.anthropic.com".into(),
+        ];
+        p.filesystem.readwrite = vec!["/work/**".into(), "/tmp/**".into()];
+        p
+    }
+
+    /// **The B2b invariant.** A phase cannot grant anything the base did not.
+    /// Naming a domain or path outside the base contributes nothing, so the
+    /// base profile stays an upper bound on the whole session — which is what
+    /// makes a signature over it meaningful.
+    #[test]
+    fn a_phase_can_never_widen_the_base() {
+        let b = base();
+        let ph = Phase {
+            only_domains: vec![
+                "crates.io".into(),
+                // Not in the base: must NOT appear in the result.
+                "evil.example".into(),
+            ],
+            only_readwrite: vec!["/work/**".into(), "/etc/**".into()],
+            ..Default::default()
+        };
+        let out = ph.narrow(&b);
+
+        assert_eq!(out.network.allow_domains, vec!["crates.io".to_string()]);
+        assert!(!out
+            .network
+            .allow_domains
+            .iter()
+            .any(|d| d == "evil.example"));
+        assert_eq!(out.filesystem.readwrite, vec!["/work/**".to_string()]);
+        assert!(!out.filesystem.readwrite.iter().any(|g| g == "/etc/**"));
+
+        // Every grant in the narrowed profile was present in the base.
+        for d in &out.network.allow_domains {
+            assert!(b.network.allow_domains.contains(d), "widened with {d}");
+        }
+        for g in &out.filesystem.readwrite {
+            assert!(b.filesystem.readwrite.contains(g), "widened with {g}");
+        }
+    }
+
+    /// The build/test case: no egress at all, which is the phase where
+    /// freshly-downloaded code first runs.
+    #[test]
+    fn no_egress_phase_drops_every_domain() {
+        let out = Phase {
+            no_egress: true,
+            ..Default::default()
+        }
+        .narrow(&base());
+        assert!(out.network.allow_domains.is_empty());
+        assert!(out.network.default_deny);
+    }
+
+    /// An empty phase changes nothing — absence of a restriction is not a
+    /// restriction.
+    #[test]
+    fn an_empty_phase_is_a_no_op() {
+        let b = base();
+        let out = Phase::default().narrow(&b);
+        assert_eq!(out.network.allow_domains, b.network.allow_domains);
+        assert_eq!(out.filesystem.readwrite, b.filesystem.readwrite);
+    }
+
+    /// A narrowed profile drops the base's signature: the signature covered a
+    /// different document, and carrying one that cannot verify would look like
+    /// tampering rather than like the deliberate narrowing it is.
+    #[test]
+    fn narrowing_drops_a_signature_it_would_invalidate() {
+        let mut b = base();
+        b.signature = Some(crate::ProfileSignature {
+            algorithm: "ed25519".into(),
+            public_key: "00".repeat(32),
+            value: "00".repeat(64),
+        });
+        let out = Phase {
+            no_egress: true,
+            ..Default::default()
+        }
+        .narrow(&b);
+        assert!(out.signature.is_none());
+    }
+
+    /// Phases and requirements survive a YAML round-trip, and a profile
+    /// without them serializes exactly as before (the additive guarantee).
+    #[test]
+    fn phases_and_requirements_round_trip_and_stay_additive() {
+        let mut b = base();
+        let plain = b.to_yaml().unwrap();
+        assert!(
+            !plain.contains("phases"),
+            "absent fields must not serialize"
+        );
+        assert!(!plain.contains("requirements"));
+
+        b.phases.insert(
+            "build".into(),
+            Phase {
+                description: Some("compile and test; nothing to fetch".into()),
+                no_egress: true,
+                output_path: Some("/work/target".into()),
+                ..Default::default()
+            },
+        );
+        b.requirements = Some(Requirements {
+            exec_identity: Some(ExecIdentity::ContentHash),
+            secret_visibility: Some(SecretVisibility::Absent),
+            degradation: Degradation::Refuse,
+        });
+
+        let round = Profile::from_yaml(&b.to_yaml().unwrap()).unwrap();
+        assert!(round.phases["build"].no_egress);
+        assert_eq!(
+            round.phases["build"].output_path.as_deref(),
+            Some("/work/target")
+        );
+        assert_eq!(
+            round.requirements.unwrap().exec_identity,
+            Some(ExecIdentity::ContentHash)
+        );
+    }
+
+    /// A host that cannot meet a stated requirement is disqualified, and the
+    /// report names what was asked for versus what is available.
+    #[test]
+    fn unmet_requirements_are_named_not_silently_downgraded() {
+        let req = Requirements {
+            exec_identity: Some(ExecIdentity::ContentHash),
+            secret_visibility: Some(SecretVisibility::Absent),
+            degradation: Degradation::Refuse,
+        };
+
+        let linux = Guarantees {
+            exec_identity: ExecIdentity::ContentHash,
+            secret_visibility: SecretVisibility::Absent,
+        };
+        assert!(req.unmet(&linux).is_empty(), "tier-1 Linux must qualify");
+
+        let weaker = Guarantees {
+            exec_identity: ExecIdentity::PathOrSigner,
+            secret_visibility: SecretVisibility::AccessDenied,
+        };
+        let gaps = req.unmet(&weaker);
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps[0].to_string().contains("exec_identity"));
+        assert!(gaps[0].to_string().contains("content_hash"));
+        assert!(gaps[1].to_string().contains("secret_visibility"));
+    }
+
+    /// Stating no requirement qualifies everywhere: this is what keeps the
+    /// field additive for every profile that predates it.
+    #[test]
+    fn no_requirements_qualifies_on_any_substrate() {
+        let weakest = Guarantees {
+            exec_identity: ExecIdentity::PathOrSigner,
+            secret_visibility: SecretVisibility::AccessDenied,
+        };
+        assert!(Requirements::default().unmet(&weakest).is_empty());
+    }
+}

@@ -37,6 +37,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
     let mut verdicts_path: Option<String> = None;
     let mut prune_provider = false;
     let mut ci_mode = false;
+    let mut phase: Option<String> = None;
     let mut proposed_path: Option<String> = None;
     let mut issue_token_path: Option<String> = None;
     let mut system_id: Option<String> = None;
@@ -67,6 +68,7 @@ pub fn cmd(args: &[String]) -> ExitCode {
             "--verdicts" => verdicts_path = it.next().cloned(),
             "--prune-provider" => prune_provider = true,
             "--ci" => ci_mode = true,
+            "--phase" => phase = it.next().cloned(),
             "--proposed" => proposed_path = it.next().cloned(),
             "--issue-token" => issue_token_path = it.next().cloned(),
             "--system-id" => system_id = it.next().cloned(),
@@ -344,6 +346,73 @@ pub fn cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Requirements qualification (see ql_profile::Requirements). A policy that
+    // stated a guarantee should not silently receive something weaker, so an
+    // unmet requirement refuses by default and names the gap.
+    if let Some(req) = profile.requirements.clone() {
+        let have = ql_profile::Guarantees {
+            exec_identity: tier.exec_identity(),
+            // The mount wall constructs the cell's view, so a path outside the
+            // grant is absent rather than merely denied.
+            secret_visibility: ql_profile::SecretVisibility::Absent,
+        };
+        let unmet = req.unmet(&have);
+        if !unmet.is_empty() {
+            for u in &unmet {
+                eprintln!("ql run: unmet requirement — {u}");
+            }
+            match req.degradation {
+                ql_profile::Degradation::Refuse => {
+                    eprintln!(
+                        "ql run: this host cannot provide what the profile requires. Set \
+                         `requirements.degradation: allow` to run with the strongest \
+                         available substitute instead."
+                    );
+                    crate::registry::deregister(&id);
+                    return ExitCode::from(1);
+                }
+                ql_profile::Degradation::Allow => eprintln!(
+                    "ql run: proceeding with the strongest available substitute \
+                     (requirements.degradation: allow)"
+                ),
+            }
+        }
+    }
+
+    // --phase narrows the profile for one step of a task. Applied AFTER the
+    // signature gate: narrowing is a runtime restriction of an already-approved
+    // policy, and it can only ever reduce authority (see ql_profile::Phase).
+    if let Some(name) = phase.as_deref() {
+        match profile.phases.get(name).cloned() {
+            Some(ph) => {
+                let before = profile.network.allow_domains.len();
+                profile = ph.narrow(&profile);
+                eprintln!(
+                    "ql: phase `{name}` — egress narrowed to {} domain(s) (from {before}){}",
+                    profile.network.allow_domains.len(),
+                    ph.output_path
+                        .as_deref()
+                        .map(|p| format!(", output path {p}"))
+                        .unwrap_or_default()
+                );
+            }
+            None => {
+                let mut known: Vec<&str> = profile.phases.keys().map(String::as_str).collect();
+                known.sort();
+                eprintln!(
+                    "ql run: profile defines no phase `{name}`{}",
+                    if known.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (known: {})", known.join(", "))
+                    }
+                );
+                crate::registry::deregister(&id);
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     if profile.exec.enforce {
         eprintln!("ql: exec enforcement tier: {}", tier.label());
     } else {

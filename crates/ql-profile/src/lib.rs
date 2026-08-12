@@ -37,9 +37,10 @@ pub use export::{
     to_docker_notes, to_docker_run, to_oci_seccomp, to_oci_seccomp_notes, ExportNotes,
 };
 pub use policy::{
-    evaluate_argv, AgentType, ArgvDeny, ArgvRule, ArgvVerdict, CapPolicy, ExecDigest,
-    ExecDigestError, ExecPolicy, FsPolicy, HashAlgo, NetPolicy, ProcPolicy, ResourceLimits,
-    SeccompDefault, SyscallPolicy,
+    evaluate_argv, AgentType, ArgvDeny, ArgvRule, ArgvVerdict, CapPolicy, Degradation, ExecDigest,
+    ExecDigestError, ExecIdentity, ExecPolicy, FsPolicy, Guarantees, HashAlgo, NetPolicy, Phase,
+    ProcPolicy, Requirements, ResourceLimits, SeccompDefault, SecretVisibility, SyscallPolicy,
+    Unmet,
 };
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +90,17 @@ pub struct Profile {
     /// Additive over `processes`; off unless `exec.enforce` is set.
     #[serde(default)]
     pub exec: ExecPolicy,
+
+    /// Guarantees this policy requires of the enforcement substrate, and what
+    /// to do when they cannot be met. Absent means today's behavior exactly:
+    /// take the strongest available tier and report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<Requirements>,
+
+    /// Narrower authority for named phases of a task. A phase can only ever
+    /// *reduce* what the base policy grants — see [`Phase`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub phases: std::collections::BTreeMap<String, Phase>,
 
     /// The deployment context this profile was approved for (git commit and/or
     /// container image digest), if pinned. Part of [`Profile::signing_bytes`],
@@ -318,6 +330,8 @@ impl Default for Profile {
             syscalls: SyscallPolicy::default(),
             resources: ResourceLimits::default(),
             processes: ProcPolicy::default(),
+            requirements: None,
+            phases: std::collections::BTreeMap::new(),
             exec: ExecPolicy::default(),
             approved_for: None,
             signature: None,

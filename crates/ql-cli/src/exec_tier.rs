@@ -27,6 +27,20 @@ pub enum ExecTier {
 }
 
 impl ExecTier {
+    /// What this tier actually guarantees about execution identity.
+    ///
+    /// Both content-verified tiers hash the executable's own bytes, so both
+    /// satisfy `content_hash`; they differ in where enforcement happens
+    /// (in-kernel vs. userspace supervision), not in what property is checked.
+    /// `None` means the profile requested no exec wall, so approval is by path
+    /// alone.
+    pub fn exec_identity(self) -> ql_profile::ExecIdentity {
+        match self {
+            ExecTier::BpfLsm | ExecTier::SeccompNotify => ql_profile::ExecIdentity::ContentHash,
+            ExecTier::None => ql_profile::ExecIdentity::PathOrSigner,
+        }
+    }
+
     /// Stable label for audit records, matching `ql doctor`'s tier names.
     pub fn label(self) -> &'static str {
         match self {

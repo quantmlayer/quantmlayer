@@ -187,6 +187,10 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
         },
         approved_for: None,
         signature: None,
+        // `ql learn` synthesizes a base policy; requirements and phases are
+        // authored deliberately, not inferred from observed behavior.
+        requirements: None,
+        phases: std::collections::BTreeMap::new(),
     };
 
     SynthResult { profile, notes }
