@@ -222,6 +222,23 @@ fn parse_argv_event(data: &[u8]) -> Option<ArgvRecord> {
     })
 }
 
+/// Which process opened one TCP connection, keyed by the port the broker will
+/// see at `accept()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnOwner {
+    /// Network-namespace inode the connection was made in. Part of the key
+    /// because source ports are unique only within a namespace.
+    pub netns: u32,
+    /// Source port, allocated by the time this was recorded.
+    pub sport: u16,
+    /// The process (thread-group id), not the thread.
+    pub pid: u32,
+    /// Its real parent's tgid.
+    pub ppid: u32,
+    /// The task comm.
+    pub comm: String,
+}
+
 /// A live content-addressed exec enforcer attached to one cgroup.
 ///
 /// Enforcement is active for as long as this value is alive; dropping it
@@ -230,6 +247,9 @@ pub struct ExecEnforcer {
     // Field order matters for drop: the links are torn down before the skel.
     _link: Link,
     _argv_link: Link,
+    /// Egress-attribution tracepoint link; held so the program stays attached
+    /// for the life of the cell.
+    _conn_link: Link,
     _skel: EnforceSkel<'static>,
 }
 
@@ -303,11 +323,57 @@ impl ExecEnforcer {
         // `inflight` map that the cgroup-attached enforce_exec populates.
         let argv_link = skel.progs.capture_argv.attach()?;
 
+        // Attach the egress-attribution tracepoint. Like `capture_argv` this is
+        // system-wide; unlike it, nothing scopes it to this cell in-kernel — the
+        // netns in each key is what lets a consumer select its own cell's
+        // connections. Attaching is explicit here: a program that loads but is
+        // never attached compiles, verifies, and silently never fires.
+        let conn_link = skel.progs.note_connect_owner.attach()?;
+
         Ok(ExecEnforcer {
             _link: link,
             _argv_link: argv_link,
+            _conn_link: conn_link,
             _skel: skel,
         })
+    }
+
+    /// Every connection the kernel attributed to a process, for verifying that
+    /// the attribution hook works before anything consumes it.
+    ///
+    /// Step 1 of B9: read-only, deletes nothing, and no other code path depends
+    /// on it. The broker join comes later, and only if this shows sane data.
+    pub fn dump_conn_owners(&self) -> Result<Vec<ConnOwner>, LsmError> {
+        let map = &self._skel.maps.conn_owners;
+        let mut out = Vec::new();
+        for key in map.keys() {
+            let Some(val) = map.lookup(&key, libbpf_rs::MapFlags::ANY)? else {
+                continue;
+            };
+            if key.len() < 6 || val.len() < 8 {
+                continue;
+            }
+            let netns = u32::from_ne_bytes(key[0..4].try_into().unwrap_or_default());
+            let sport = u16::from_ne_bytes(key[4..6].try_into().unwrap_or_default());
+            let pid = u32::from_ne_bytes(val[0..4].try_into().unwrap_or_default());
+            let ppid = u32::from_ne_bytes(val[4..8].try_into().unwrap_or_default());
+            let comm = val
+                .get(8..)
+                .map(|b| {
+                    String::from_utf8_lossy(b)
+                        .trim_end_matches('\0')
+                        .to_string()
+                })
+                .unwrap_or_default();
+            out.push(ConnOwner {
+                netns,
+                sport,
+                pid,
+                ppid,
+                comm,
+            });
+        }
+        Ok(out)
     }
 
     /// Drain every exec decision the kernel has emitted so far, returning them

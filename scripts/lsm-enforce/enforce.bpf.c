@@ -162,6 +162,54 @@ struct {
     __type(value, struct argv_buf);
 } argv_scratch SEC(".maps");
 
+// ---------------------------------------------------------------------------
+// Egress attribution (B9 step 1): which process opened a TCP connection.
+// ---------------------------------------------------------------------------
+//
+// The broker sees an inbound connection and knows the peer only as
+// (cell address, source port). Source port is therefore the sole key that can
+// tie a broker decision back to a process — which is why the obvious LSM hook,
+// `security_socket_connect`, cannot be used: it runs BEFORE the kernel
+// allocates the port, so `inet_sport` is still zero there.
+//
+// `inet_sock_set_state` fires from tcp_set_state(). The CLOSE -> SYN_SENT
+// transition happens inside tcp_connect(), after the port is allocated and in
+// the calling task's context, so both the port and `current` are meaningful.
+// Later transitions are NOT usable: SYN_SENT -> ESTABLISHED happens in softirq
+// on the ACK, where `current` is whatever was interrupted.
+//
+// UDP has no SYN_SENT and therefore no attribution here. That is the right
+// scope: the broker proxies TCP CONNECT, so there is no broker decision for a
+// UDP flow to be joined to.
+
+#ifndef TCP_SYN_SENT
+#define TCP_SYN_SENT 2
+#endif
+
+// Keyed on (netns inode, source port). Source ports are unique per network
+// namespace among live connections, and each cell has its own netns, so two
+// cells picking the same port do not collide.
+struct conn_key {
+    __u32 netns;
+    __u16 sport;
+    __u16 _pad;
+};
+
+struct conn_owner {
+    __u32 pid;   // thread-group id: the process, not the thread
+    __u32 ppid;  // real_parent's tgid, for the same reason exec records carry it
+    char comm[COMM_LEN];
+};
+
+// LRU so a connection the broker never accepts — refused, or racing teardown —
+// cannot leak an entry. Userspace deletes on lookup; this bounds the rest.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct conn_key);
+    __type(value, struct conn_owner);
+} conn_owners SEC(".maps");
+
 // State threaded through the bpf_loop match: the deny key (digest prefilled,
 // token built up as we walk), how far to scan, the current token length, and
 // whether a rule matched.
@@ -335,5 +383,39 @@ int BPF_PROG(capture_argv, struct task_struct *task)
     }
 
     bpf_map_delete_elem(&inflight, &pid_tgid);
+    return 0;
+}
+
+
+// Record which process opened a TCP connection, keyed so the broker can look it
+// up at accept() by the peer's source port.
+//
+// Filtered to SYN_SENT deliberately — see the map comment: it is the only
+// transition that runs in the connecting task's context, so it is the only one
+// where `current` names the process that actually called connect().
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(note_connect_owner, struct sock *sk, int oldstate, int newstate)
+{
+    if (newstate != TCP_SYN_SENT)
+        return 0;
+
+    struct conn_key key = {};
+    key.sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+    if (key.sport == 0)
+        return 0;
+    key.netns = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+
+    struct conn_owner owner = {};
+    owner.pid = bpf_get_current_pid_tgid() >> 32;
+
+    // real_parent, not parent: parent is reparented under ptrace, which would
+    // attribute a debugged process to its debugger. Same reasoning as the exec
+    // records.
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (task)
+        owner.ppid = BPF_CORE_READ(task, real_parent, tgid);
+    bpf_get_current_comm(&owner.comm, sizeof(owner.comm));
+
+    bpf_map_update_elem(&conn_owners, &key, &owner, BPF_ANY);
     return 0;
 }
