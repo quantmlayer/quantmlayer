@@ -167,10 +167,49 @@ pub struct ConnectNode {
     pub restarted: bool,
 }
 
+/// One endpoint a process reached, with its outcome and repeat count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    /// `proto ip:port` as recorded.
+    pub endpoint: String,
+    /// Errno when the connect returned a definite failure.
+    pub errno: Option<i32>,
+    /// Distinct calls, with restarts already collapsed.
+    pub count: usize,
+}
+
+/// One node of the process tree, with what it reached and what it spawned.
+///
+/// The structured form both renderers consume. Text and HTML walking the same
+/// structure is deliberate: two independent walks over the same data drift,
+/// and a discrepancy between the artifact someone reads and the one they
+/// verify would be the worst possible bug in a tool about provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    /// The process.
+    pub pid: u32,
+    /// Its comm, or the binary's basename in observe mode.
+    pub comm: String,
+    /// The binary path or content digest.
+    pub target: String,
+    /// Rendered verdict word.
+    pub verdict: &'static str,
+    /// True when this exec never ran (a PATH-search candidate).
+    pub failed: bool,
+    /// True when the record came from an enforced run rather than observe.
+    pub enforced: bool,
+    /// Endpoints this process opened.
+    pub endpoints: Vec<Endpoint>,
+    /// Processes it spawned.
+    pub children: Vec<TreeNode>,
+}
+
 /// A rendered tree, plus what could not be placed in it.
 #[derive(Debug, Default)]
 pub struct Tree {
-    /// Rendered lines, already indented.
+    /// The structured tree, for renderers that need shape rather than text.
+    pub roots: Vec<TreeNode>,
+    /// Rendered lines, already indented. Derived from [`Self::roots`].
     pub lines: Vec<String>,
     /// Records whose `detail` did not parse, so their parent is unknown.
     pub unparsed: usize,
@@ -270,13 +309,32 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         // endpoint of a single-process run, where the root has no parent and
         // there are no children to supply one.
         for n in nodes {
-            tree.lines.push(format!("  {}", label(n)));
-            if let Some(cs) = by_node.get(&(n.pid, n.order)) {
-                for ((endpoint, err), count) in tally(cs) {
-                    tree.lines
-                        .push(format!("    -> {}", edge(endpoint, err, count)));
-                }
-            }
+            let endpoints = by_node
+                .get(&(n.pid, n.order))
+                .map(|cs| {
+                    tally(cs)
+                        .into_iter()
+                        .map(|((endpoint, errno), count)| Endpoint {
+                            endpoint: endpoint.to_string(),
+                            errno,
+                            count,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            tree.roots.push(TreeNode {
+                pid: n.pid,
+                comm: n.comm.clone(),
+                target: n.target.clone(),
+                verdict: verdict_of(n.failed, n.enforced, n.allowed),
+                failed: n.failed,
+                enforced: n.enforced,
+                endpoints,
+                children: Vec::new(),
+            });
+        }
+        for r in &tree.roots {
+            render_lines(r, 0, &mut tree.lines);
         }
         return tree;
     }
@@ -325,46 +383,106 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
     // record cannot precede itself.
     let mut seen: BTreeSet<(u32, u64)> = BTreeSet::new();
     for r in roots {
-        walk(r, &children, &by_node, 0, &mut seen, &mut tree.lines);
+        tree.roots.push(shape(r, &children, &by_node, &mut seen));
+    }
+    // Text is derived from the structure, never walked separately: two walks
+    // over the same data drift, and a discrepancy between the artifact someone
+    // reads and the one they verify is the worst bug a provenance tool can have.
+    for r in &tree.roots {
+        render_lines(r, 0, &mut tree.lines);
     }
     tree
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk(
+/// Build the structured node for `node` and everything beneath it.
+///
+/// `seen` bounds the walk on `(pid, order)`: one pid legitimately holds several
+/// exec records, but a record cannot precede itself, so cycles terminate. A
+/// node already expanded elsewhere renders its own line without repeating its
+/// endpoints or children.
+fn shape(
     node: &ExecNode,
     children: &BTreeMap<(u32, u64), Vec<&ExecNode>>,
     connects: &BTreeMap<(u32, u64), Vec<&ConnectNode>>,
-    depth: usize,
     seen: &mut BTreeSet<(u32, u64)>,
-    out: &mut Vec<String>,
-) {
+) -> TreeNode {
+    let key = (node.pid, node.order);
+    let first_visit = seen.insert(key);
+
+    let endpoints = if first_visit {
+        connects
+            .get(&key)
+            .map(|cs| {
+                tally(cs)
+                    .into_iter()
+                    .map(|((endpoint, errno), count)| Endpoint {
+                        endpoint: endpoint.to_string(),
+                        errno,
+                        count,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let kids = if first_visit {
+        children
+            .get(&key)
+            .map(|ks| {
+                ks.iter()
+                    .map(|k| shape(k, children, connects, seen))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    TreeNode {
+        pid: node.pid,
+        comm: node.comm.clone(),
+        target: node.target.clone(),
+        verdict: verdict_of(node.failed, node.enforced, node.allowed),
+        failed: node.failed,
+        enforced: node.enforced,
+        endpoints,
+        children: kids,
+    }
+}
+
+/// Render one node and its subtree as indented text.
+fn render_lines(node: &TreeNode, depth: usize, out: &mut Vec<String>) {
     let indent = "  ".repeat(depth + 1);
-    out.push(format!("{indent}{}", label(node)));
-    if !seen.insert((node.pid, node.order)) {
-        // Already expanded elsewhere; render the line but do not recurse.
-        return;
+    out.push(format!(
+        "{indent}{:<11} pid {:<7} {:<16} {}",
+        node.verdict,
+        node.pid,
+        node.comm,
+        shorten(&node.target, 22)
+    ));
+    for e in &node.endpoints {
+        out.push(format!(
+            "{indent}  -> {}",
+            edge(&e.endpoint, e.errno, e.count)
+        ));
     }
-    // Endpoints this process opened, collapsed by destination with a count —
-    // an `npm install` opens hundreds and one line each would bury the tree.
-    if let Some(cs) = connects.get(&(node.pid, node.order)) {
-        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
-        for c in cs {
-            *tally.entry(c.endpoint.as_str()).or_default() += 1;
-        }
-        for (endpoint, n) in tally {
-            let times = if n > 1 {
-                format!(" x{n}")
-            } else {
-                String::new()
-            };
-            out.push(format!("{indent}  -> {endpoint}{times}"));
-        }
+    for k in &node.children {
+        render_lines(k, depth + 1, out);
     }
-    if let Some(kids) = children.get(&(node.pid, node.order)) {
-        for k in kids {
-            walk(k, children, connects, depth + 1, seen, out);
-        }
+}
+
+/// The verdict word for a node. A candidate the kernel refused never ran, so
+/// no verdict about it is meaningful — saying "would-allow" of a program that
+/// was not there invites the reader to think it executed.
+fn verdict_of(failed: bool, enforced: bool, allowed: bool) -> &'static str {
+    match (failed, enforced, allowed) {
+        (true, _, _) => "PATH miss",
+        (false, true, true) => "allow",
+        (false, true, false) => "DENY ",
+        (false, false, true) => "would-allow",
+        (false, false, false) => "WOULD-DENY",
     }
 }
 
@@ -428,26 +546,6 @@ fn edge(endpoint: &str, err: Option<i32>, count: usize) -> String {
         Some(e) => format!("{endpoint} ({}){times}", errno_label(e)),
         None => format!("{endpoint}{times}"),
     }
-}
-
-fn label(n: &ExecNode) -> String {
-    // A candidate the kernel refused never ran, so no verdict about it is
-    // meaningful — saying "would-allow" of a program that was not there
-    // invites the reader to think it executed.
-    let verdict = match (n.failed, n.enforced, n.allowed) {
-        (true, _, _) => "PATH miss ",
-        (false, true, true) => "allow",
-        (false, true, false) => "DENY ",
-        (false, false, true) => "would-allow",
-        (false, false, false) => "WOULD-DENY",
-    };
-    // Paths truncate from the LEFT: the tail identifies the program, and
-    // cutting `/home/u/.local/bin/curl` to `/home/u/.local/` says nothing.
-    // Digests truncate from the right, where the leading bytes identify them.
-    let shown = shorten(&n.target, 22);
-    let digest = shown.as_str();
-    // Padded so the pid column lines up across verdicts of differing widths.
-    format!("{verdict:<11} pid {:<7} {:<16} {digest}", n.pid, n.comm)
 }
 
 #[cfg(test)]

@@ -180,7 +180,7 @@ client presenting it; the cell's walls are what stop a process from acting. A
 sub-agent with a narrow token in a wide cell is as dangerous as its cell —
 narrow the cell too (`--phase`, `ql compile`).
 
-## `ql audit export` — `process-tree.md`
+## `ql audit export` — `process-tree.md` and `process-tree.html`
 
 Export bundles now include `process-tree.md`: the same exec records as
 `records.jsonl`, grouped by the parent the kernel recorded at exec time.
@@ -191,8 +191,17 @@ Export bundles now include `process-tree.md`: the same exec records as
       DENY  pid 34350   curl             cccccccccccccccc
 ```
 
-It is a **view**, never evidence: the bundle's evidence is the hash-chained log
-that `verify.py` checks, and this file carries no hash of its own.
+The same tree also ships as `process-tree.html`: expandable, colour-coded by
+verdict, and **self-contained** — no CDN, no external fonts, nothing loaded
+when opened, because an evidence artifact that phones home is a contradiction.
+Every agent-chosen string (paths, comms, hostnames) is HTML-escaped, since a
+process named `<script>` would otherwise execute in the reader's browser.
+
+Both renderings come from one structure, so the page a reader opens and the
+file they verify cannot drift apart.
+
+They are a **view**, never evidence: the bundle's evidence is the hash-chained
+log that `verify.py` checks, and neither file carries a hash of its own.
 
 - Grouping shows what ran under what. It does not claim causality — parentage
   and ordering are facts the kernel supplies; "this exec caused that

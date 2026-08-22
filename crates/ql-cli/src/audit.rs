@@ -208,7 +208,7 @@ fn append(args: &[String]) -> ExitCode {
 /// happened: four isolated denials read very differently from four denials
 /// under one `npm install`. It groups by the parent the kernel recorded at
 /// exec time — it does not claim causality, which would have to be inferred.
-fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
+fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize) {
     let mut nodes = Vec::new();
     let mut connects = Vec::new();
     let mut unparsed = 0usize;
@@ -266,6 +266,16 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
     }
 
     let tree = crate::proctree::build_with_connects(&nodes, &connects, unparsed);
+    (tree, unparsed_connects)
+}
+
+/// Render the tree as markdown.
+///
+/// Takes the built tree so this and the HTML artifact share one structure:
+/// two walks over the same data drift, and a discrepancy between the page
+/// someone reads and the file they verify would be the worst possible bug in
+/// a tool about provenance.
+fn render_process_tree(tree: &crate::proctree::Tree, unparsed_connects: usize) -> String {
     let mut md = String::from(
         "# Process tree\n\nExec decisions from `records.jsonl`, grouped by the parent the \
          kernel recorded at exec time. This is a *view* of those records, not evidence in \
@@ -275,7 +285,7 @@ fn render_process_tree(window: &[ql_audit::AuditRecord]) -> String {
          would have to be inferred.\n\n",
     );
 
-    if nodes.is_empty() {
+    if tree.roots.is_empty() {
         md.push_str("No exec records in this window.\n");
         return md;
     }
@@ -528,7 +538,12 @@ fn export(args: &[String]) -> ExitCode {
     // what. It is a view of records.jsonl, never a substitute: the bundle's
     // evidence is the verifiable chain, and this file carries no hash of its
     // own precisely so nobody mistakes it for the record.
-    let tree_md = render_process_tree(window);
+    let (tree, unparsed_connects) = build_tree(window);
+    let tree_md = render_process_tree(&tree, unparsed_connects);
+    // The same structure rendered as HTML, so a page a reader opens and a file
+    // they verify cannot disagree.
+    let head = window.last().map(|r| r.hash.as_str()).unwrap_or("(empty)");
+    let tree_html = crate::htmltree::render(&tree, path, head, window.len());
 
     for (name, content) in [
         ("records.jsonl", body.as_str()),
@@ -536,6 +551,7 @@ fn export(args: &[String]) -> ExitCode {
         ("verify.py", VERIFY_PY),
         ("VERIFY.md", VERIFY_MD),
         ("process-tree.md", tree_md.as_str()),
+        ("process-tree.html", tree_html.as_str()),
     ] {
         let p = std::path::Path::new(out).join(name);
         if let Err(e) = std::fs::write(&p, content) {

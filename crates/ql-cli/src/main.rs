@@ -22,6 +22,7 @@ mod compile;
 mod doctor;
 mod exec_tier;
 mod export;
+mod htmltree;
 mod kill;
 mod learn;
 mod mcp;
