@@ -247,9 +247,10 @@ pub struct ExecEnforcer {
     // Field order matters for drop: the links are torn down before the skel.
     _link: Link,
     _argv_link: Link,
-    /// Egress-attribution tracepoint link; held so the program stays attached
-    /// for the life of the cell.
+    /// Egress-attribution links (IPv4 and IPv6); held so the programs stay
+    /// attached for the life of the cell.
     _conn_link: Link,
+    _conn_link6: Link,
     _skel: EnforceSkel<'static>,
 }
 
@@ -329,11 +330,13 @@ impl ExecEnforcer {
         // connections. Attaching is explicit here: a program that loads but is
         // never attached compiles, verifies, and silently never fires.
         let conn_link = skel.progs.note_connect_owner.attach()?;
+        let conn_link6 = skel.progs.note_connect_owner6.attach()?;
 
         Ok(ExecEnforcer {
             _link: link,
             _argv_link: argv_link,
             _conn_link: conn_link,
+            _conn_link6: conn_link6,
             _skel: skel,
         })
     }
@@ -374,6 +377,39 @@ impl ExecEnforcer {
             });
         }
         Ok(out)
+    }
+
+    /// The process that opened the connection using `sport`, excluding any
+    /// entry in `exclude_netns`.
+    ///
+    /// Source ports are unique per network namespace among live connections,
+    /// but this map is populated by a system-wide hook, so the same port can
+    /// appear for several namespaces. Rather than requiring the caller to know
+    /// the cell's namespace — which the broker, running on the far side of a
+    /// veth, does not — it excludes its *own*: any entry sharing the broker's
+    /// namespace is the broker's onward connection, not the client's.
+    ///
+    /// Returns `None` when nothing matches **or when more than one does**. An
+    /// ambiguous port is reported as unattributed rather than resolved by
+    /// guessing, which is the same discipline the process tree applies to
+    /// connects it cannot place.
+    pub fn lookup_conn_owner(
+        &self,
+        sport: u16,
+        exclude_netns: u32,
+    ) -> Result<Option<ConnOwner>, LsmError> {
+        let mut found: Option<ConnOwner> = None;
+        for owner in self.dump_conn_owners()? {
+            if owner.sport != sport || owner.netns == exclude_netns {
+                continue;
+            }
+            if found.is_some() {
+                // Two live namespaces using the same port: not resolvable.
+                return Ok(None);
+            }
+            found = Some(owner);
+        }
+        Ok(found)
     }
 
     /// Drain every exec decision the kernel has emitted so far, returning them

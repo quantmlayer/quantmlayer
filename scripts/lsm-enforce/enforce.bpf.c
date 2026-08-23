@@ -182,10 +182,6 @@ struct {
 // scope: the broker proxies TCP CONNECT, so there is no broker decision for a
 // UDP flow to be joined to.
 
-#ifndef TCP_SYN_SENT
-#define TCP_SYN_SENT 2
-#endif
-
 // Keyed on (netns inode, source port). Source ports are unique per network
 // namespace among live connections, and each cell has its own netns, so two
 // cells picking the same port do not collide.
@@ -390,13 +386,29 @@ int BPF_PROG(capture_argv, struct task_struct *task)
 // Record which process opened a TCP connection, keyed so the broker can look it
 // up at accept() by the peer's source port.
 //
-// Filtered to SYN_SENT deliberately — see the map comment: it is the only
-// transition that runs in the connecting task's context, so it is the only one
-// where `current` names the process that actually called connect().
-SEC("tp_btf/inet_sock_set_state")
-int BPF_PROG(note_connect_owner, struct sock *sk, int oldstate, int newstate)
+// `fexit/tcp_v4_connect`, not a connect-time hook. Two earlier candidates both
+// fail for the same reason, and it is worth stating so nobody re-derives it:
+// **anything keyed on source port must run after `inet_hash_connect()`**, which
+// is what allocates the ephemeral port.
+//
+//   - `security_socket_connect` (LSM) runs on the sockaddr the caller passed,
+//     long before any port exists.
+//   - `inet_sock_set_state` at SYN_SENT looks later but is not: in
+//     tcp_v4_connect() the order is `tcp_set_state(sk, TCP_SYN_SENT)` *then*
+//     `inet_hash_connect(...)`. Measured on a live box — the hook fired
+//     reliably with correct pid, comm, and netns, and `skc_num` was 0 every
+//     time.
+//
+// fexit runs after the function returns, so the port is assigned, and it stays
+// in the calling task's context, so `current` still names the connecting
+// process. `ret` is the function's return value: a failed connect assigns no
+// usable port and is skipped.
+//
+// TCP only. UDP has no equivalent, and needs none: the broker proxies TCP
+// CONNECT, so there is no broker decision for a UDP flow to be joined to.
+static __always_inline int note_owner(struct sock *sk, int ret)
 {
-    if (newstate != TCP_SYN_SENT)
+    if (ret != 0)
         return 0;
 
     struct conn_key key = {};
@@ -418,4 +430,16 @@ int BPF_PROG(note_connect_owner, struct sock *sk, int oldstate, int newstate)
 
     bpf_map_update_elem(&conn_owners, &key, &owner, BPF_ANY);
     return 0;
+}
+
+SEC("fexit/tcp_v4_connect")
+int BPF_PROG(note_connect_owner, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    return note_owner(sk, ret);
+}
+
+SEC("fexit/tcp_v6_connect")
+int BPF_PROG(note_connect_owner6, struct sock *sk, struct sockaddr *uaddr, int addr_len, int ret)
+{
+    return note_owner(sk, ret);
 }

@@ -247,19 +247,28 @@ fn attach_exec_wall(pid: nix::unistd::Pid, profile: &Profile) -> Result<()> {
     // the enforcer is dropped (at drain time, or at process exit). The parent
     // hook runs in the same thread as the caller of `Cell::run`, so a
     // thread-local needs no `Send` handling.
-    EXEC_ENFORCER.with(|slot| {
-        *slot.borrow_mut() = Some(enforcer);
-    });
+    *EXEC_ENFORCER.lock().unwrap_or_else(|e| e.into_inner()) = Some(enforcer);
     Ok(())
 }
 
+/// The live exec enforcer for the current run (one cell per `ql run` process).
+/// Set by [`attach_exec_wall`]; the wall stays attached while this is `Some`.
+/// Drained and dropped by [`drain_exec_events`] after the run.
+///
+/// Process-global rather than thread-local. It was thread-local originally,
+/// which was correct for its only user — draining after the run, on the thread
+/// that ran the cell. Egress attribution broke that assumption: the broker runs
+/// on a spawned thread and each connection on another, so a thread-local was
+/// invisible there and every lookup returned `None` regardless of timing.
 #[cfg(feature = "lsm")]
-thread_local! {
-    /// The live exec enforcer for the current run (one cell per `ql run`
-    /// process). Set by [`attach_exec_wall`]; the wall stays attached while this
-    /// is `Some`. Drained and dropped by [`drain_exec_events`] after the run.
-    static EXEC_ENFORCER: std::cell::RefCell<Option<ql_lsm::ExecEnforcer>> =
-        std::cell::RefCell::new(None);
+static EXEC_ENFORCER: std::sync::Mutex<Option<ql_lsm::ExecEnforcer>> = std::sync::Mutex::new(None);
+
+/// Run `f` with the live enforcer, if there is one. Never panics on a poisoned
+/// lock: a run whose attribution thread died should still tear down cleanly.
+#[cfg(feature = "lsm")]
+fn with_enforcer<T>(f: impl FnOnce(&ql_lsm::ExecEnforcer) -> T) -> Option<T> {
+    let guard = EXEC_ENFORCER.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(f)
 }
 
 /// Drain the kernel's per-execve audit stream for the run that just finished,
@@ -267,13 +276,54 @@ thread_local! {
 /// enforcer, detaching the wall — the run is over. Empty if no wall was active.
 #[cfg(feature = "lsm")]
 pub fn drain_exec_events() -> Vec<ql_lsm::ExecRecord> {
-    EXEC_ENFORCER.with(|slot| {
-        let enforcer = slot.borrow_mut().take();
-        match enforcer {
-            Some(e) => e.drain_events().unwrap_or_default(),
-            None => Vec::new(),
-        }
-    })
+    let enforcer = EXEC_ENFORCER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    match enforcer {
+        Some(e) => e.drain_events().unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Peek at the kernel's connection-attribution map without detaching the wall.
+///
+/// Every connection the kernel attributed to a process, for diagnosis.
+///
+/// Borrows rather than takes: [`drain_exec_events`] drops the enforcer, so a
+/// dump placed after it would always be empty — which reads identically to the
+/// hook not working, and cost a wrong diagnosis once already.
+#[cfg(feature = "lsm")]
+pub fn dump_conn_owners() -> Vec<ql_lsm::ConnOwner> {
+    with_enforcer(|e| e.dump_conn_owners().unwrap_or_default()).unwrap_or_default()
+}
+
+/// Look up which process opened the connection using `sport`, excluding the
+/// caller's own network namespace.
+///
+/// Called from the broker thread while the connection is live, which is why the
+/// enforcer slot is process-global: a thread-local was invisible here and every
+/// lookup returned `None` no matter the timing.
+///
+/// No retry. A retry was added first, on the theory that the lookup races the
+/// fexit hook — the kernel queues a connection to the accept backlog while the
+/// client is still inside `connect(2)`. That theory fitted the evidence
+/// (nothing at decision time, the entry present by end of run) but was not the
+/// cause, and the retry changed nothing. Whether a real race remains is now a
+/// question to measure rather than pre-empt.
+#[cfg(feature = "lsm")]
+pub fn lookup_conn_owner(sport: u16, exclude_netns: u32) -> Option<ql_lsm::ConnOwner> {
+    with_enforcer(|e| e.lookup_conn_owner(sport, exclude_netns).unwrap_or(None)).flatten()
+}
+
+/// The inode of the current process's network namespace, used to exclude the
+/// broker's own connections from attribution lookups.
+#[cfg(feature = "lsm")]
+pub fn own_netns() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self/ns/net")
+        .map(|m| m.ino() as u32)
+        .unwrap_or(0)
 }
 
 /// Resolve the cell's cgroup-v2 directory from a pid via the unified (`0::`)

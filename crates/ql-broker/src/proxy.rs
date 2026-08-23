@@ -62,6 +62,13 @@ fn fd_exhaustion(e: &io::Error) -> bool {
 /// Handle one proxied connection: parse the request, apply policy, and either
 /// tunnel or refuse.
 pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result<()> {
+    // The client's source port, captured at accept while the connection is
+    // provably live. This is the only handle on which process made the request
+    // — the broker sees a socket, not a task — and it is unique within the
+    // client's network namespace for exactly as long as the connection lasts,
+    // which is why the lookup happens now rather than by correlating logs after
+    // the fact, where port reuse would make it ambiguous.
+    let peer_port = client.peer_addr().ok().map(|a| a.port());
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(client.try_clone()?);
 
@@ -111,7 +118,7 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
     // A denied host never triggers a DNS lookup, and the decision is audited.
     let now = ql_audit::AuditLog::now_millis();
     if let Decision::Deny(reason) = policy.authorize_connect(&host, port, auth.as_deref(), now) {
-        policy.report_final(&host, port, &Decision::Deny(reason));
+        policy.report_final(&host, port, &Decision::Deny(reason), peer_port);
         log_decision(&host, port, "DENY (authorization)");
         return write_status(&mut client, 403, "Forbidden", reason);
     }
@@ -124,7 +131,7 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
         Ok(addrs) => addrs.collect(),
         Err(_) => {
             let d = Decision::Deny("host did not resolve");
-            policy.report_final(&host, port, &d);
+            policy.report_final(&host, port, &d, peer_port);
             log_decision(&host, port, "DENY (unresolved)");
             return write_status(&mut client, 502, "Bad Gateway", "could not resolve host");
         }
@@ -133,12 +140,12 @@ pub fn handle_connection(client: TcpStream, policy: &BrokerPolicy) -> io::Result
 
     match policy.evaluate(&host, &ips) {
         Decision::Deny(reason) => {
-            policy.report_final(&host, port, &Decision::Deny(reason));
+            policy.report_final(&host, port, &Decision::Deny(reason), peer_port);
             log_decision(&host, port, "DENY (policy)");
             write_status(&mut client, 403, "Forbidden", reason)
         }
         Decision::Allow => {
-            policy.report_final(&host, port, &Decision::Allow);
+            policy.report_final(&host, port, &Decision::Allow, peer_port);
             // The policy has already vetted every resolved IP (when
             // block_private_ranges is on, evaluate() guaranteed none are
             // blocked; when off, the operator opted into them). Connect to the

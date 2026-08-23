@@ -856,8 +856,8 @@ fn run_brokered(
     {
         let vw = verdicts.clone();
         let sm = summary.clone();
-        policy =
-            policy.with_decision_hook(ql_broker::DecisionHook::new(move |host, port, decision| {
+        policy = policy.with_decision_hook(ql_broker::DecisionHook::new(
+            move |host, port, decision, _peer_port| {
                 let (allowed, rule) = match decision {
                     ql_broker::Decision::Allow => (true, "allowed"),
                     ql_broker::Decision::Deny(r) => (false, *r),
@@ -866,7 +866,8 @@ fn run_brokered(
                 if let Some(vw) = &vw {
                     vw.egress(host, port, allowed, rule);
                 }
-            }));
+            },
+        ));
     }
     let policy = Arc::new(policy);
     std::thread::spawn(move || {
@@ -921,11 +922,6 @@ fn run_brokered(
     }
 }
 
-/// Drain the kernel's per-execve audit stream (content-addressed exec wall) for
-/// the run that just finished and append one attributed record per decision —
-/// `exec.run` (allowed) / `exec.deny` (denied) — to the unified ledger, chaining
-/// onto the policy and egress records. No-op without the `lsm` feature, when no
-/// wall was active, or when no audit log is set.
 #[cfg(feature = "lsm")]
 fn write_exec_events(
     audit_path: Option<&str>,

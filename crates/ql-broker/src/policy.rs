@@ -51,16 +51,20 @@ pub enum Decision {
 pub struct DecisionHook(Arc<DecisionFn>);
 
 /// The callback shape a [`DecisionHook`] wraps: `(host, port, decision)`.
-type DecisionFn = dyn Fn(&str, u16, &Decision) + Send + Sync;
+type DecisionFn = dyn Fn(&str, u16, &Decision, Option<u16>) + Send + Sync;
 
 impl DecisionHook {
     /// Wrap a callback as a decision hook.
-    pub fn new(f: impl Fn(&str, u16, &Decision) + Send + Sync + 'static) -> Self {
+    pub fn new(f: impl Fn(&str, u16, &Decision, Option<u16>) + Send + Sync + 'static) -> Self {
         DecisionHook(Arc::new(f))
     }
 
-    fn call(&self, host: &str, port: u16, decision: &Decision) {
-        (self.0)(host, port, decision);
+    /// `peer_port` is the source port of the client's connection to the broker,
+    /// when known. It is the only handle on *which process* made the request:
+    /// the broker sees a TCP connection, not a task, and that port is what the
+    /// kernel-side attribution map is keyed on.
+    fn call(&self, host: &str, port: u16, decision: &Decision, peer_port: Option<u16>) {
+        (self.0)(host, port, decision, peer_port);
     }
 }
 
@@ -258,7 +262,7 @@ impl BrokerPolicy {
     /// A canary trip keeps its distinct `canary.triggered` audit event
     /// (recorded when tripped) instead of gaining a generic egress record, but
     /// still reaches the decision hook like every other final decision.
-    pub fn report_final(&self, host: &str, port: u16, decision: &Decision) {
+    pub fn report_final(&self, host: &str, port: u16, decision: &Decision, peer_port: Option<u16>) {
         let is_canary_trip = matches!(decision, Decision::Deny(r) if *r == CANARY_DENY_REASON);
         if !is_canary_trip {
             if let Some(sink) = &self.audit {
@@ -278,7 +282,7 @@ impl BrokerPolicy {
             }
         }
         if let Some(hook) = &self.decision_hook {
-            hook.call(host, port, decision);
+            hook.call(host, port, decision, peer_port);
         }
     }
 
@@ -502,7 +506,7 @@ mod tests {
         };
         let policy = BrokerPolicy::from_net_policy(&np)
             .with_canaries(vec!["canary.example".into()], None)
-            .with_decision_hook(DecisionHook::new(move |h, p, d| {
+            .with_decision_hook(DecisionHook::new(move |h, p, d, _peer| {
                 sink.lock().unwrap().push((h.to_string(), p, d.clone()));
             }));
 
@@ -518,13 +522,13 @@ mod tests {
         // The proxy contract: exactly one report_final per connection, at the
         // true final decision — including an evaluate() (rebinding) denial
         // AFTER a provisional authorization allow.
-        policy.report_final("pypi.org", 443, &Decision::Allow);
+        policy.report_final("pypi.org", 443, &Decision::Allow, None);
         let d = policy.authorize_connect("pastebin.com", 443, None, 0);
         assert_eq!(d, Decision::Deny("host not in allow-list"));
-        policy.report_final("pastebin.com", 443, &d);
+        policy.report_final("pastebin.com", 443, &d, None);
         let c = policy.authorize_connect("canary.example", 443, None, 0);
         assert_eq!(c, Decision::Deny(CANARY_DENY_REASON));
-        policy.report_final("canary.example", 443, &c);
+        policy.report_final("canary.example", 443, &c, None);
 
         let got = seen.lock().unwrap();
         assert_eq!(got.len(), 3);
@@ -857,9 +861,9 @@ mod token_gating_tests {
 
         let blob = authz(&root, &agent, "pypi.org", "pypi.org");
         let a = p.authorize_connect("pypi.org", 443, Some(&blob), 0); // allow
-        p.report_final("pypi.org", 443, &a);
+        p.report_final("pypi.org", 443, &a, None);
         let d = p.authorize_connect("evil.com", 443, None, 0); // deny
-        p.report_final("evil.com", 443, &d);
+        p.report_final("evil.com", 443, &d, None);
 
         let text = std::fs::read_to_string(&log).unwrap();
         let parsed = AuditLog::from_jsonl(&text).unwrap();
