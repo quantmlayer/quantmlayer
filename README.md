@@ -192,6 +192,20 @@ ql audit append run.log --actor broker --action egress.connect \
   --target 169.254.169.254:80 --decision deny --detail "cloud metadata blocked"
 ql audit verify run.log
 
+# WHAT DID THE AGENT ACTUALLY DO — export the log as an evidence bundle and get
+# a process tree: what ran under what, and what each process reached. Endpoints
+# attach to the process that opened them, so a denial is attributable, not just
+# recorded. Every line is a kernel observation; grouping shows what descended
+# from what and never claims causality. Bundles include a self-contained
+# process-tree.html you can hand to someone — no CDN, nothing loaded on open:
+ql audit export run.log --out bundle
+cat bundle/process-tree.md          # and bundle/process-tree.html
+python3 bundle/verify.py            # the chain is the evidence; the tree is a view
+#   would-allow pid 2978  curl   /usr/bin/curl
+#     -> tcp 151.101.130.137:443
+#     -> DENIED tcp 104.20.0.1:443
+#     -> udp 8.8.8.8:53
+
 # FEED YOUR EXISTING STACK — export the same records as OTLP logs for a
 # collector you already run. An exporter, not a backend: no dashboard, no
 # storage, no query layer. Application-layer tracing shows what an agent SAID
