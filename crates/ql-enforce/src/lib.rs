@@ -216,7 +216,16 @@ fn brokered_parent_hook(plan: veth::VethPlan, profile: &Profile) -> cell::Parent
             attach_exec_wall(pid, &prof)
         })
     } else {
-        Box::new(move |pid| veth::wire(pid, &plan))
+        // No exec wall, but this run is brokered, so its egress decisions can
+        // still be attributed. The connect hooks need no cgroup and no digests;
+        // they rode inside the exec wall only because it was the sole BPF
+        // loader here, which made attribution depend on a policy choice that
+        // has nothing to do with it.
+        Box::new(move |pid| {
+            veth::wire(pid, &plan)?;
+            attach_conn_tracker();
+            Ok(())
+        })
     }
 }
 
@@ -262,6 +271,12 @@ fn attach_exec_wall(pid: nix::unistd::Pid, profile: &Profile) -> Result<()> {
 /// invisible there and every lookup returned `None` regardless of timing.
 #[cfg(feature = "lsm")]
 static EXEC_ENFORCER: std::sync::Mutex<Option<ql_lsm::ExecEnforcer>> = std::sync::Mutex::new(None);
+
+/// The connect-only attribution tracker, used when a brokered run does not
+/// enable the exec wall — which is the common case, since digests are per-host
+/// and no shipped profile carries them.
+#[cfg(feature = "lsm")]
+static CONN_TRACKER: std::sync::Mutex<Option<ql_lsm::ConnTracker>> = std::sync::Mutex::new(None);
 
 /// Run `f` with the live enforcer, if there is one. Never panics on a poisoned
 /// lock: a run whose attribution thread died should still tear down cleanly.
@@ -313,7 +328,58 @@ pub fn dump_conn_owners() -> Vec<ql_lsm::ConnOwner> {
 /// question to measure rather than pre-empt.
 #[cfg(feature = "lsm")]
 pub fn lookup_conn_owner(sport: u16, exclude_netns: u32) -> Option<ql_lsm::ConnOwner> {
-    with_enforcer(|e| e.lookup_conn_owner(sport, exclude_netns).unwrap_or(None)).flatten()
+    // Whichever loader is live. Exactly one is: the exec wall carries the
+    // connect hooks when it is on, and the standalone tracker attaches when it
+    // is not, so attribution does not depend on a policy choice unrelated to it.
+    if let Some(found) =
+        with_enforcer(|e| e.lookup_conn_owner(sport, exclude_netns).unwrap_or(None)).flatten()
+    {
+        return Some(found);
+    }
+    let guard = CONN_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|t| t.lookup_conn_owner(sport, exclude_netns).unwrap_or(None))
+}
+
+/// Attach the connect-only attribution tracker for this run.
+///
+/// Best-effort: a host without BPF privileges, or a kernel without the target
+/// functions, simply gets no attribution. It must not fail the run — the walls
+/// that actually contain the agent are unaffected, and a run that refused to
+/// start because it could not *observe* itself would be trading containment for
+/// telemetry.
+#[cfg(feature = "lsm")]
+pub fn attach_conn_tracker() {
+    match ql_lsm::ConnTracker::attach() {
+        Ok(tracker) => {
+            *CONN_TRACKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tracker);
+        }
+        // Say so. A silent failure here is indistinguishable from "nothing
+        // connected", and an absence that looks like evidence is the one
+        // outcome this whole path exists to avoid.
+        Err(e) => {
+            eprintln!("ql: egress attribution unavailable ({e}); decisions will not name a process")
+        }
+    }
+}
+
+/// Whether egress attribution is available for this run, so a consumer can
+/// report coverage instead of leaving an empty column to be read as "nothing
+/// connected".
+#[cfg(feature = "lsm")]
+pub fn egress_attribution_live() -> bool {
+    with_enforcer(|_| ()).is_some()
+        || CONN_TRACKER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+}
+
+/// No BPF, so no attribution.
+#[cfg(not(feature = "lsm"))]
+pub fn egress_attribution_live() -> bool {
+    false
 }
 
 /// The inode of the current process's network namespace, used to exclude the

@@ -856,6 +856,10 @@ fn run_brokered(
     {
         let vw = verdicts.clone();
         let sm = summary.clone();
+        // Resolve each decision to the process that made it. The lookup happens
+        // while the connection is live, which is what makes the source port
+        // unambiguous — after the fact it can have been reused.
+        policy = attach_attributor(policy);
         policy = policy.with_decision_hook(ql_broker::DecisionHook::new(
             move |host, port, decision, _peer_port| {
                 let (allowed, rule) = match decision {
@@ -920,6 +924,31 @@ fn run_brokered(
             ExitCode::from(1)
         }
     }
+}
+
+/// Give the broker a source-port -> process resolver, when the kernel can
+/// supply one.
+///
+/// Formats the answer exactly as exec records do, so `ql audit export` reads
+/// enforce-mode egress with the same parser and no separate branch.
+#[cfg(feature = "lsm")]
+fn attach_attributor(policy: ql_broker::BrokerPolicy) -> ql_broker::BrokerPolicy {
+    // Deliberately not gated on whether attribution is live *now*: the policy is
+    // built before the cell starts, and the tracker attaches in the parent hook
+    // afterwards, so a check here always runs too early and would skip the
+    // closure permanently. The closure itself resolves nothing when no tracker
+    // is live, which is the correct answer at that point rather than a gap.
+    let own = ql_enforce::own_netns();
+    policy.with_attributor(move |sport| {
+        ql_enforce::lookup_conn_owner(sport, own)
+            .map(|o| format!("pid {} ppid {} ({})", o.pid, o.ppid, o.comm))
+    })
+}
+
+/// Without the `lsm` feature there is no attribution to attach.
+#[cfg(not(feature = "lsm"))]
+fn attach_attributor(policy: ql_broker::BrokerPolicy) -> ql_broker::BrokerPolicy {
+    policy
 }
 
 #[cfg(feature = "lsm")]

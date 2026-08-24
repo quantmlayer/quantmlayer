@@ -239,6 +239,130 @@ pub struct ConnOwner {
     pub comm: String,
 }
 
+/// Read every entry of the `conn_owners` map.
+///
+/// Free function so [`ExecEnforcer`] and [`ConnTracker`] share one decoder:
+/// two copies of a wire-format reader drift, and a divergence between them
+/// would attribute connections differently depending on whether the exec wall
+/// happened to be on.
+fn dump_owners(skel: &EnforceSkel<'static>) -> Result<Vec<ConnOwner>, LsmError> {
+    let map = &skel.maps.conn_owners;
+    let mut out = Vec::new();
+    for key in map.keys() {
+        let Some(val) = map.lookup(&key, libbpf_rs::MapFlags::ANY)? else {
+            continue;
+        };
+        if key.len() < 6 || val.len() < 8 {
+            continue;
+        }
+        out.push(ConnOwner {
+            netns: u32::from_ne_bytes(key[0..4].try_into().unwrap_or_default()),
+            sport: u16::from_ne_bytes(key[4..6].try_into().unwrap_or_default()),
+            pid: u32::from_ne_bytes(val[0..4].try_into().unwrap_or_default()),
+            ppid: u32::from_ne_bytes(val[4..8].try_into().unwrap_or_default()),
+            comm: val
+                .get(8..)
+                .map(|b| {
+                    String::from_utf8_lossy(b)
+                        .trim_end_matches('\0')
+                        .to_string()
+                })
+                .unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+/// The single non-excluded owner of `sport`, or `None` when nothing matches or
+/// more than one does.
+///
+/// Ambiguity resolves to no answer rather than a choice: two live namespaces on
+/// the same port cannot be told apart from here, and guessing would be the one
+/// failure this whole path exists to avoid.
+fn lookup_owner(
+    skel: &EnforceSkel<'static>,
+    sport: u16,
+    exclude_netns: u32,
+) -> Result<Option<ConnOwner>, LsmError> {
+    let mut found: Option<ConnOwner> = None;
+    for owner in dump_owners(skel)? {
+        if owner.sport != sport || owner.netns == exclude_netns {
+            continue;
+        }
+        if found.is_some() {
+            return Ok(None);
+        }
+        found = Some(owner);
+    }
+    Ok(found)
+}
+
+/// Egress attribution without the exec wall.
+///
+/// The connect hooks answer a different question from the exec wall — *which
+/// process opened this socket*, not *is this binary approved* — and they need
+/// none of its machinery: no cgroup, no allow-list, no per-host digests. They
+/// were nonetheless attached inside [`ExecEnforcer`] because that was the only
+/// BPF loader in the tree, which made attribution depend on `exec.enforce`.
+/// That is false on every shipped profile (digests are per-host, which is what
+/// `ql learn` exists to resolve), so attribution silently did nothing for the
+/// common case.
+///
+/// This loads the same object with the exec programs' autoload disabled and
+/// attaches only the two `fexit` hooks.
+pub struct ConnTracker {
+    _conn_link: Link,
+    _conn_link6: Link,
+    _skel: EnforceSkel<'static>,
+}
+
+impl ConnTracker {
+    /// Load and attach the connect hooks alone.
+    ///
+    /// Requires the same BPF privileges as the exec wall, but no cgroup: these
+    /// are system-wide `fexit` programs, scoped at lookup time by network
+    /// namespace rather than in-kernel.
+    pub fn attach() -> Result<Self, LsmError> {
+        let open_object: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+            Box::leak(Box::new(MaybeUninit::uninit()));
+
+        let builder = EnforceSkelBuilder::default();
+        let mut open_skel = builder.open(open_object)?;
+
+        // Do not load the exec programs. `enforce_exec` is an lsm_cgroup
+        // program that would need a cgroup to attach to, and `capture_argv`
+        // exists to annotate exec events nobody is collecting here.
+        // `let _ =` so this compiles whether the API returns `()` or `Result`.
+        let _ = open_skel.progs.enforce_exec.set_autoload(false);
+        let _ = open_skel.progs.capture_argv.set_autoload(false);
+
+        let skel = open_skel.load()?;
+
+        let conn_link = skel.progs.note_connect_owner.attach()?;
+        let conn_link6 = skel.progs.note_connect_owner6.attach()?;
+
+        Ok(ConnTracker {
+            _conn_link: conn_link,
+            _conn_link6: conn_link6,
+            _skel: skel,
+        })
+    }
+
+    /// See [`ExecEnforcer::dump_conn_owners`].
+    pub fn dump_conn_owners(&self) -> Result<Vec<ConnOwner>, LsmError> {
+        dump_owners(&self._skel)
+    }
+
+    /// See [`ExecEnforcer::lookup_conn_owner`].
+    pub fn lookup_conn_owner(
+        &self,
+        sport: u16,
+        exclude_netns: u32,
+    ) -> Result<Option<ConnOwner>, LsmError> {
+        lookup_owner(&self._skel, sport, exclude_netns)
+    }
+}
+
 /// A live content-addressed exec enforcer attached to one cgroup.
 ///
 /// Enforcement is active for as long as this value is alive; dropping it
@@ -347,69 +471,17 @@ impl ExecEnforcer {
     /// Step 1 of B9: read-only, deletes nothing, and no other code path depends
     /// on it. The broker join comes later, and only if this shows sane data.
     pub fn dump_conn_owners(&self) -> Result<Vec<ConnOwner>, LsmError> {
-        let map = &self._skel.maps.conn_owners;
-        let mut out = Vec::new();
-        for key in map.keys() {
-            let Some(val) = map.lookup(&key, libbpf_rs::MapFlags::ANY)? else {
-                continue;
-            };
-            if key.len() < 6 || val.len() < 8 {
-                continue;
-            }
-            let netns = u32::from_ne_bytes(key[0..4].try_into().unwrap_or_default());
-            let sport = u16::from_ne_bytes(key[4..6].try_into().unwrap_or_default());
-            let pid = u32::from_ne_bytes(val[0..4].try_into().unwrap_or_default());
-            let ppid = u32::from_ne_bytes(val[4..8].try_into().unwrap_or_default());
-            let comm = val
-                .get(8..)
-                .map(|b| {
-                    String::from_utf8_lossy(b)
-                        .trim_end_matches('\0')
-                        .to_string()
-                })
-                .unwrap_or_default();
-            out.push(ConnOwner {
-                netns,
-                sport,
-                pid,
-                ppid,
-                comm,
-            });
-        }
-        Ok(out)
+        dump_owners(&self._skel)
     }
 
     /// The process that opened the connection using `sport`, excluding any
-    /// entry in `exclude_netns`.
-    ///
-    /// Source ports are unique per network namespace among live connections,
-    /// but this map is populated by a system-wide hook, so the same port can
-    /// appear for several namespaces. Rather than requiring the caller to know
-    /// the cell's namespace — which the broker, running on the far side of a
-    /// veth, does not — it excludes its *own*: any entry sharing the broker's
-    /// namespace is the broker's onward connection, not the client's.
-    ///
-    /// Returns `None` when nothing matches **or when more than one does**. An
-    /// ambiguous port is reported as unattributed rather than resolved by
-    /// guessing, which is the same discipline the process tree applies to
-    /// connects it cannot place.
+    /// entry in `exclude_netns`. See [`lookup_owner`].
     pub fn lookup_conn_owner(
         &self,
         sport: u16,
         exclude_netns: u32,
     ) -> Result<Option<ConnOwner>, LsmError> {
-        let mut found: Option<ConnOwner> = None;
-        for owner in self.dump_conn_owners()? {
-            if owner.sport != sport || owner.netns == exclude_netns {
-                continue;
-            }
-            if found.is_some() {
-                // Two live namespaces using the same port: not resolvable.
-                return Ok(None);
-            }
-            found = Some(owner);
-        }
-        Ok(found)
+        lookup_owner(&self._skel, sport, exclude_netns)
     }
 
     /// Drain every exec decision the kernel has emitted so far, returning them

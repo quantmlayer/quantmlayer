@@ -271,6 +271,7 @@ mod tests {
             order,
             failed_errno: None,
             restarted: false,
+            comm: None,
         }
     }
 

@@ -263,8 +263,24 @@ log that `verify.py` checks, and neither file carries a hash of its own.
   the syscall stop, so a process re-parented after its parent exited reports
   its new parent.
 
-  Enforce mode has no equivalent yet: the broker sits across a veth in another
-  network namespace and sees a TCP connection, not a process (see B9).
+  **Enforce mode attributes too**, by a different route. The broker sits across
+  a veth in another network namespace and sees a TCP connection, not a process,
+  so a kernel hook records `(netns, source port) -> process` and the broker
+  resolves it at the moment of the decision, while the connection is live —
+  after the fact the port can have been reused. Validated under a real
+  `npm install`: 508 of 508 connections attributed, none misattributed, and two
+  concurrent clients resolved to distinct processes.
+
+  When a run has no exec wall, connections still get a node — the kernel named
+  the process even though nothing measured its binary, so the node reads
+  `connected … (not measured — no exec wall)` rather than claiming an exec that
+  was never observed.
+
+  This needs BPF, so it is Tier-1 only; on other hosts egress records carry no
+  process and the tree reports them as unattributed rather than omitting them.
+  It does **not** require `exec.enforce` — the hooks attach on any brokered run,
+  since which process opened a socket is a separate question from whether a
+  binary was approved.
 - **Observe-mode runs are included, and labelled as predictions.** An observe
   would-deny is a forecast, not a denial that happened — nothing was stopped.
   Those rows read `would-allow` / `WOULD-DENY` rather than `allow` / `DENY`,

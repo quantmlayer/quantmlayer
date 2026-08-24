@@ -225,7 +225,10 @@ fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize
         // you have committed to enforcing.
         // Attributed egress: observe mode records the pid at the connect
         // syscall itself, so these attach exactly rather than by correlation.
-        if r.event.action == "observe.connect" {
+        // Observe mode attributes in-band; enforce mode attributes via the
+        // broker's kernel lookup. Both write the process into `detail` in the
+        // same shape, so one parser reads both and the tree needs no branch.
+        if r.event.action == "observe.connect" || r.event.action == "egress.connect" {
             if let Some(d) = crate::proctree::parse_detail(&r.event.detail) {
                 connects.push(crate::proctree::ConnectNode {
                     pid: d.pid,
@@ -235,8 +238,15 @@ fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize
                     order: d.seq.unwrap_or(r.event.ts_millis),
                     failed_errno: d.failed_errno,
                     restarted: d.restarted,
+                    // Enforce mode names the owning process even when no exec
+                    // record exists for it; observe mode's placeholder comm is
+                    // not a process name, so it is not carried.
+                    comm: (r.event.action == "egress.connect").then(|| d.comm.clone()),
                 });
             } else {
+                // An egress record with no attribution: the host had no BPF
+                // substrate, or the port could not be resolved. Counted, not
+                // guessed at.
                 unparsed_connects += 1;
             }
             continue;

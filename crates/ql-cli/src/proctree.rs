@@ -153,6 +153,14 @@ pub struct ConnectNode {
     /// never exec'd — such a process is running its parent's image, so its
     /// parent's node is the right owner.
     pub ppid: Option<u32>,
+    /// The owning process's name, when the record carries one.
+    ///
+    /// Enforce mode without the exec wall produces connects whose owner is
+    /// known — the kernel named the process — but for which no exec record
+    /// exists, because nothing was measuring execs. Carrying the name lets the
+    /// tree show a node for it rather than reporting a connection as
+    /// unattributed when its owner is, in fact, attributed.
+    pub comm: Option<String>,
     /// `ip:port`. Not a domain: by `connect` time the name is resolved and
     /// gone.
     pub endpoint: String,
@@ -255,6 +263,9 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
     let mut by_node: BTreeMap<(u32, u64), Vec<&ConnectNode>> = BTreeMap::new();
     // Keyed on (pid, order) — see ExecNode::order for why not the timestamp.
     let mut unattributed = Vec::new();
+    // Nodes for processes the network hook named but no exec record covers.
+    // Keyed by pid so several connections from one process share a node.
+    let mut synthesized: Vec<TreeNode> = Vec::new();
     let parent_of: BTreeMap<u32, Option<u32>> = nodes.iter().map(|n| (n.pid, n.ppid)).collect();
 
     for c in connects {
@@ -289,7 +300,24 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         });
         match chosen {
             Some(key) => by_node.entry(key).or_default().push(c),
-            None => unattributed.push(format!("{} (pid {})", c.endpoint, c.pid)),
+            // No exec record for this pid — but the kernel named the process,
+            // so synthesize a node for it rather than discarding what we know.
+            // Marked `from_egress` so the render can say the process was named
+            // by the network hook, not observed executing: reporting it as an
+            // exec that happened would claim more than was measured.
+            None => match &c.comm {
+                Some(comm) => synthesized.push(TreeNode {
+                    pid: c.pid,
+                    comm: comm.clone(),
+                    target: String::from("(not measured — no exec wall)"),
+                    verdict: "connected",
+                    failed: false,
+                    enforced: true,
+                    endpoints: Vec::new(),
+                    children: Vec::new(),
+                }),
+                None => unattributed.push(format!("{} (pid {})", c.endpoint, c.pid)),
+            },
         }
     }
 
@@ -299,8 +327,11 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
         any_parent_data: nodes.iter().any(|n| n.ppid.is_some()),
         ..Default::default()
     };
+    // No early return on empty `nodes`: enforce mode without the exec wall
+    // produces connects whose owner the kernel named but for which no exec
+    // record exists, and those still deserve a tree.
     if nodes.is_empty() {
-        return tree;
+        return finish(tree, synthesized, connects);
     }
     if !tree.any_parent_data {
         // No parent data: list the execs flat rather than implying structure.
@@ -333,10 +364,7 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
                 children: Vec::new(),
             });
         }
-        for r in &tree.roots {
-            render_lines(r, 0, &mut tree.lines);
-        }
-        return tree;
+        return finish(tree, synthesized, connects);
     }
 
     let present: BTreeSet<u32> = nodes.iter().map(|n| n.pid).collect();
@@ -385,9 +413,45 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
     for r in roots {
         tree.roots.push(shape(r, &children, &by_node, &mut seen));
     }
-    // Text is derived from the structure, never walked separately: two walks
-    // over the same data drift, and a discrepancy between the artifact someone
-    // reads and the one they verify is the worst bug a provenance tool can have.
+    finish(tree, synthesized, connects)
+}
+
+/// Fold in nodes synthesized from attribution, then render the text form.
+///
+/// One tail for every path so the three ways out of `build_with_connects`
+/// cannot render differently — the flat-listing branch already lost every
+/// endpoint once by having its own exit.
+fn finish(mut tree: Tree, synthesized: Vec<TreeNode>, connects: &[ConnectNode]) -> Tree {
+    if !synthesized.is_empty() {
+        // One node per pid, each carrying its own endpoints. Roots, because
+        // nothing observed what spawned them — claiming a parent would be
+        // inventing structure.
+        let mut by_pid: BTreeMap<u32, TreeNode> = BTreeMap::new();
+        for node in synthesized {
+            by_pid.entry(node.pid).or_insert(node);
+        }
+        for c in connects.iter() {
+            if c.restarted {
+                continue;
+            }
+            if let Some(node) = by_pid.get_mut(&c.pid) {
+                match node
+                    .endpoints
+                    .iter_mut()
+                    .find(|e| e.endpoint == c.endpoint && e.errno == c.failed_errno)
+                {
+                    Some(existing) => existing.count += 1,
+                    None => node.endpoints.push(Endpoint {
+                        endpoint: c.endpoint.clone(),
+                        errno: c.failed_errno,
+                        count: 1,
+                    }),
+                }
+            }
+        }
+        tree.roots.extend(by_pid.into_values());
+    }
+
     for r in &tree.roots {
         render_lines(r, 0, &mut tree.lines);
     }
@@ -575,6 +639,7 @@ mod tests {
             order: ts_millis,
             failed_errno: None,
             restarted: false,
+            comm: None,
         }
     }
 
@@ -974,6 +1039,56 @@ mod tests {
             .unwrap();
         let head_at = t.lines.iter().position(|l| l.contains("head")).unwrap();
         assert!(head_at > miss_at + 1, "attached to the miss: {:?}", t.lines);
+    }
+
+    /// A connection whose owner the kernel named, but for which no exec record
+    /// exists — enforce mode without the exec wall — gets a node rather than
+    /// being reported as unattributed. The node says the binary was not
+    /// measured, because it was not: claiming an exec that nothing observed
+    /// would assert more than the data supports.
+    #[test]
+    fn a_named_owner_without_an_exec_record_still_gets_a_node() {
+        let mut c = cn(500, None, "tcp 1.2.3.4:443", 1);
+        c.comm = Some("curl".into());
+        let t = build_with_connects(&[], &[c], 0);
+
+        assert!(t.unattributed.is_empty(), "{:?}", t.unattributed);
+        let joined = t.lines.join("\n");
+        assert!(joined.contains("curl"), "{joined}");
+        assert!(joined.contains("1.2.3.4:443"), "{joined}");
+        assert!(joined.contains("not measured"), "{joined}");
+    }
+
+    /// Without a name there is nothing to build a node from, so it stays
+    /// unattributed — the honest outcome, not a placeholder process.
+    #[test]
+    fn an_unnamed_owner_stays_unattributed() {
+        let t = build_with_connects(&[], &[cn(501, None, "tcp 1.2.3.4:443", 1)], 0);
+        assert_eq!(t.unattributed.len(), 1);
+    }
+
+    /// Enforce-mode egress records carry attribution in the same shape as
+    /// observe-mode ones, so a single parser reads both. A deny also carries
+    /// its reason after the process, which must not confuse the parse.
+    #[test]
+    fn enforce_mode_egress_detail_parses_like_observe() {
+        assert_eq!(
+            parse_detail("pid 4242 ppid 100 (curl)"),
+            Some(Detail {
+                pid: 4242,
+                ppid: Some(100),
+                seq: None,
+                failed: false,
+                failed_errno: None,
+                restarted: false,
+                comm: "curl".into()
+            })
+        );
+        // Denied: the reason trails the process and is ignored by the parse.
+        assert_eq!(
+            parse_detail("pid 7 ppid 1 (node) host not in allow-list").map(|d| (d.pid, d.comm)),
+            Some((7, "node".to_string()))
+        );
     }
 
     /// Restarted calls collapse: the kernel re-enters the syscall after a

@@ -53,6 +53,13 @@ pub struct DecisionHook(Arc<DecisionFn>);
 /// The callback shape a [`DecisionHook`] wraps: `(host, port, decision)`.
 type DecisionFn = dyn Fn(&str, u16, &Decision, Option<u16>) + Send + Sync;
 
+/// Resolves a client source port to a description of the process that owns it.
+///
+/// A closure rather than a direct call because the answer comes from a BPF map
+/// this crate has no business knowing about: the broker's job is to decide, and
+/// where attribution comes from is the caller's concern.
+type AttributorFn = dyn Fn(u16) -> Option<String> + Send + Sync;
+
 impl DecisionHook {
     /// Wrap a callback as a decision hook.
     pub fn new(f: impl Fn(&str, u16, &Decision, Option<u16>) + Send + Sync + 'static) -> Self {
@@ -113,7 +120,7 @@ impl AuditSink {
 }
 
 /// An egress policy compiled from a profile's [`NetPolicy`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BrokerPolicy {
     default_deny: bool,
     allow_domains: Vec<String>,
@@ -142,6 +149,13 @@ pub struct BrokerPolicy {
     /// stream). Fires alongside the audit sink, never instead of it, and never
     /// influences the decision.
     decision_hook: Option<DecisionHook>,
+    /// Resolves a client source port to the process that owns it, when the
+    /// caller can supply that. See [`AttributorFn`].
+    ///
+    /// Skipped by `Debug`: a closure has no useful representation, and the
+    /// policy is debug-printed in tests where the noise would obscure the
+    /// fields that matter.
+    attributor: Option<std::sync::Arc<AttributorFn>>,
 }
 
 impl BrokerPolicy {
@@ -158,6 +172,7 @@ impl BrokerPolicy {
             canary_destinations: Vec::new(),
             canary_id: None,
             decision_hook: None,
+            attributor: None,
         }
     }
 
@@ -180,6 +195,19 @@ impl BrokerPolicy {
     /// cannot change it.
     pub fn with_decision_hook(mut self, hook: DecisionHook) -> Self {
         self.decision_hook = Some(hook);
+        self
+    }
+
+    /// Supply a resolver from client source port to owning process.
+    ///
+    /// When set, an audited egress decision carries the process that made it,
+    /// in the same `pid N ppid N (comm)` form exec records use — so the process
+    /// tree reads enforce-mode egress with no separate code path.
+    pub fn with_attributor(
+        mut self,
+        f: impl Fn(u16) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.attributor = Some(std::sync::Arc::new(f));
         self
     }
 
@@ -266,9 +294,23 @@ impl BrokerPolicy {
         let is_canary_trip = matches!(decision, Decision::Deny(r) if *r == CANARY_DENY_REASON);
         if !is_canary_trip {
             if let Some(sink) = &self.audit {
-                let (dec, detail) = match decision {
+                let (dec, reason) = match decision {
                     Decision::Allow => (AuditDecision::Allow, String::new()),
                     Decision::Deny(r) => (AuditDecision::Deny, r.to_string()),
+                };
+                // Attribution leads the detail, matching the shape exec records
+                // use, so one parser reads both. Absent when the resolver has
+                // no answer — an unattributed decision says so rather than
+                // borrowing a neighbouring process's identity.
+                let detail = match self
+                    .attributor
+                    .as_ref()
+                    .zip(peer_port)
+                    .and_then(|(f, p)| f(p))
+                {
+                    Some(who) if reason.is_empty() => who,
+                    Some(who) => format!("{who} {reason}"),
+                    None => reason,
                 };
                 sink.record(AuditEvent {
                     ts_millis: AuditLog::now_millis(),
@@ -484,6 +526,7 @@ mod tests {
             canary_destinations: vec![],
             canary_id: None,
             decision_hook: None,
+            attributor: None,
         };
         assert!(p.host_allowed("pypi.org"));
         assert!(p.host_allowed("files.pypi.org"));
@@ -564,6 +607,7 @@ mod tests {
             canary_destinations: vec![],
             canary_id: None,
             decision_hook: None,
+            attributor: None,
         };
         // Allowed host, public IP → allow.
         assert_eq!(
@@ -669,6 +713,7 @@ mod token_gating_tests {
             canary_destinations: vec![],
             canary_id: None,
             decision_hook: None,
+            attributor: None,
         }
     }
 
