@@ -276,8 +276,13 @@ log that `verify.py` checks, and neither file carries a hash of its own.
   `connected … (not measured — no exec wall)` rather than claiming an exec that
   was never observed.
 
+  A refused connection renders as `DENIED <endpoint>` and never merges with an
+  allowed one to the same endpoint — an artifact whose purpose is showing what
+  was stopped must not make a blocked attempt look like a successful fetch.
+
   This needs BPF, so it is Tier-1 only; on other hosts egress records carry no
-  process and the tree reports them as unattributed rather than omitting them.
+  process, and the export says so explicitly rather than leaving an empty column
+  to be read as "nothing connected".
   It does **not** require `exec.enforce` — the hooks attach on any brokered run,
   since which process opened a socket is a separate question from whether a
   binary was approved.

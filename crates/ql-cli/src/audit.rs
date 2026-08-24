@@ -208,7 +208,18 @@ fn append(args: &[String]) -> ExitCode {
 /// happened: four isolated denials read very differently from four denials
 /// under one `npm install`. It groups by the parent the kernel recorded at
 /// exec time — it does not claim causality, which would have to be inferred.
-fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize) {
+/// What the export can and cannot say about this window, so absences are
+/// reported rather than left to be read as evidence.
+struct Coverage {
+    /// Connect records whose detail did not parse.
+    unparsed_connects: usize,
+    /// Egress decisions in the window.
+    egress_total: usize,
+    /// How many of those named a process.
+    egress_attributed: usize,
+}
+
+fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, Coverage) {
     let mut nodes = Vec::new();
     let mut connects = Vec::new();
     let mut unparsed = 0usize;
@@ -242,6 +253,7 @@ fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize
                     // record exists for it; observe mode's placeholder comm is
                     // not a process name, so it is not carried.
                     comm: (r.event.action == "egress.connect").then(|| d.comm.clone()),
+                    denied: matches!(r.event.decision, ql_audit::Decision::Deny),
                 });
             } else {
                 // An egress record with no attribution: the host had no BPF
@@ -275,8 +287,20 @@ fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize
         }
     }
 
+    let egress_total = window
+        .iter()
+        .filter(|r| r.event.action == "egress.connect")
+        .count();
+    let egress_attributed = connects.iter().filter(|c| c.comm.is_some()).count();
     let tree = crate::proctree::build_with_connects(&nodes, &connects, unparsed);
-    (tree, unparsed_connects)
+    (
+        tree,
+        Coverage {
+            unparsed_connects,
+            egress_total,
+            egress_attributed,
+        },
+    )
 }
 
 /// Render the tree as markdown.
@@ -285,7 +309,7 @@ fn build_tree(window: &[ql_audit::AuditRecord]) -> (crate::proctree::Tree, usize
 /// two walks over the same data drift, and a discrepancy between the page
 /// someone reads and the file they verify would be the worst possible bug in
 /// a tool about provenance.
-fn render_process_tree(tree: &crate::proctree::Tree, unparsed_connects: usize) -> String {
+fn render_process_tree(tree: &crate::proctree::Tree, cov: &Coverage) -> String {
     let mut md = String::from(
         "# Process tree\n\nExec decisions from `records.jsonl`, grouped by the parent the \
          kernel recorded at exec time. This is a *view* of those records, not evidence in \
@@ -295,10 +319,37 @@ fn render_process_tree(tree: &crate::proctree::Tree, unparsed_connects: usize) -
          would have to be inferred.\n\n",
     );
 
+    // Coverage: egress records with no attribution at all mean the host had no
+    // BPF substrate, not that nothing connected. Saying so is the difference
+    // between an honest gap and an absence a reader mistakes for evidence.
+    if cov.egress_total > 0 && cov.egress_attributed == 0 {
+        md.push_str(
+            "\n**Egress in this run was not attributed to processes.** That needs the \
+             Tier-1 (BPF) substrate; on other hosts the broker records which endpoints were \
+             reached but not which process reached them. The connections below are real — \
+             their owners were simply not observable here.\n\n",
+        );
+    } else if cov.egress_total > cov.egress_attributed {
+        md.push_str(&format!(
+            "\n{} of {} egress decision(s) could not be attributed to a process.\n\n",
+            cov.egress_total - cov.egress_attributed,
+            cov.egress_total
+        ));
+    }
+
     if tree.roots.is_empty() {
-        md.push_str("No exec records in this window.\n");
+        // Distinguish "nothing to show" from "nothing happened": a window can
+        // hold real egress decisions and still produce no tree, when no process
+        // could be named. Saying "no exec records" there reads as an empty run.
+        md.push_str(if cov.egress_total > 0 {
+            "No process tree: the decisions in this window could not be attributed to a \
+             process. See `records.jsonl` for what was reached.\n"
+        } else {
+            "No exec records in this window.\n"
+        });
         return md;
     }
+
     if !tree.any_parent_data {
         md.push_str(
             "**No parent data in this log.** The recording run used the Tier-2 \
@@ -334,10 +385,11 @@ fn render_process_tree(tree: &crate::proctree::Tree, unparsed_connects: usize) -
             md.push_str(&format!("- …and {} more\n", tree.unattributed.len() - 20));
         }
     }
-    if unparsed_connects > 0 {
+    if cov.unparsed_connects > 0 {
         md.push_str(&format!(
-            "\n{unparsed_connects} connect record(s) could not be read: their detail field did \
-             not match the expected form, so the process that opened them is unknown.\n"
+            "\n{} connect record(s) could not be read: their detail field did \
+             not match the expected form, so the process that opened them is unknown.\n",
+            cov.unparsed_connects
         ));
     }
     if tree.unparsed > 0 {
@@ -548,8 +600,8 @@ fn export(args: &[String]) -> ExitCode {
     // what. It is a view of records.jsonl, never a substitute: the bundle's
     // evidence is the verifiable chain, and this file carries no hash of its
     // own precisely so nobody mistakes it for the record.
-    let (tree, unparsed_connects) = build_tree(window);
-    let tree_md = render_process_tree(&tree, unparsed_connects);
+    let (tree, cov) = build_tree(window);
+    let tree_md = render_process_tree(&tree, &cov);
     // The same structure rendered as HTML, so a page a reader opens and a file
     // they verify cannot disagree.
     let head = window.last().map(|r| r.hash.as_str()).unwrap_or("(empty)");

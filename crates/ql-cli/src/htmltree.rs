@@ -77,8 +77,15 @@ fn render_endpoint(e: &Endpoint, out: &mut String) {
         Some(_) => " <span class=\"err\">failed</span>".to_string(),
         None => String::new(),
     };
+    // A broker refusal is what a reader came to find, so it leads and is the
+    // one thing on the line with colour of its own.
+    let denied = if e.denied {
+        "<span class=\"denied\">DENIED</span> "
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "<li class=\"ep\"><span class=\"arrow\">-&gt;</span> <code>{}</code>{times}{err}</li>",
+        "<li class=\"ep\"><span class=\"arrow\">-&gt;</span> {denied}<code>{}</code>{times}{err}</li>",
         esc(&e.endpoint)
     ));
 }
@@ -206,6 +213,7 @@ summary {{ cursor: pointer; }}
 .arrow {{ opacity: .5; }}
 .count {{ opacity: .6; }}
 .err {{ color: #cf222e; }}
+.denied {{ color: #cf222e; font-weight: 700; }}
 .note {{ border-left: 3px solid #bc4c00; padding: .5rem .9rem; margin: 1rem 0;
          background: rgba(188,76,0,.07); font-size: .85rem; }}
 .empty {{ opacity: .7; }}
@@ -272,6 +280,7 @@ mod tests {
             failed_errno: None,
             restarted: false,
             comm: None,
+            denied: false,
         }
     }
 

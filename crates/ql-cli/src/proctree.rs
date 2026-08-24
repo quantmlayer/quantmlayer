@@ -164,6 +164,14 @@ pub struct ConnectNode {
     /// `ip:port`. Not a domain: by `connect` time the name is resolved and
     /// gone.
     pub endpoint: String,
+    /// Whether the broker refused this connection.
+    ///
+    /// Only enforce mode has a verdict to report: observe mode makes no
+    /// decision, and the exec-wall path carries its verdict on the process
+    /// node. Without this a blocked exfiltration attempt renders identically to
+    /// a successful fetch — which would undersell the artifact and mislead
+    /// whoever reads it, since showing what was *stopped* is the point.
+    pub denied: bool,
     /// Wall-clock ms at the connect syscall.
     pub ts_millis: u64,
     /// Observation order; see [`ExecNode::order`].
@@ -180,6 +188,8 @@ pub struct ConnectNode {
 pub struct Endpoint {
     /// `proto ip:port` as recorded.
     pub endpoint: String,
+    /// True when the broker refused this connection.
+    pub denied: bool,
     /// Errno when the connect returned a definite failure.
     pub errno: Option<i32>,
     /// Distinct calls, with restarts already collapsed.
@@ -345,8 +355,9 @@ pub fn build_with_connects(nodes: &[ExecNode], connects: &[ConnectNode], unparse
                 .map(|cs| {
                     tally(cs)
                         .into_iter()
-                        .map(|((endpoint, errno), count)| Endpoint {
+                        .map(|((endpoint, errno, denied), count)| Endpoint {
                             endpoint: endpoint.to_string(),
+                            denied,
                             errno,
                             count,
                         })
@@ -435,14 +446,13 @@ fn finish(mut tree: Tree, synthesized: Vec<TreeNode>, connects: &[ConnectNode]) 
                 continue;
             }
             if let Some(node) = by_pid.get_mut(&c.pid) {
-                match node
-                    .endpoints
-                    .iter_mut()
-                    .find(|e| e.endpoint == c.endpoint && e.errno == c.failed_errno)
-                {
+                match node.endpoints.iter_mut().find(|e| {
+                    e.endpoint == c.endpoint && e.errno == c.failed_errno && e.denied == c.denied
+                }) {
                     Some(existing) => existing.count += 1,
                     None => node.endpoints.push(Endpoint {
                         endpoint: c.endpoint.clone(),
+                        denied: c.denied,
                         errno: c.failed_errno,
                         count: 1,
                     }),
@@ -479,8 +489,9 @@ fn shape(
             .map(|cs| {
                 tally(cs)
                     .into_iter()
-                    .map(|((endpoint, errno), count)| Endpoint {
+                    .map(|((endpoint, errno, denied), count)| Endpoint {
                         endpoint: endpoint.to_string(),
+                        denied,
                         errno,
                         count,
                     })
@@ -529,7 +540,7 @@ fn render_lines(node: &TreeNode, depth: usize, out: &mut Vec<String>) {
     for e in &node.endpoints {
         out.push(format!(
             "{indent}  -> {}",
-            edge(&e.endpoint, e.errno, e.count)
+            edge(&e.endpoint, e.errno, e.count, e.denied)
         ));
     }
     for k in &node.children {
@@ -559,10 +570,14 @@ fn verdict_of(failed: bool, enforced: bool, allowed: bool) -> &'static str {
 /// one call twice. Definite failures are counted but kept distinct from
 /// successes, since a refused connection is signal — it is egress the process
 /// intended — unlike an exec that never ran.
-fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<(&'a str, Option<i32>), usize> {
-    let mut t: BTreeMap<(&str, Option<i32>), usize> = BTreeMap::new();
+fn tally<'a>(cs: &[&'a ConnectNode]) -> BTreeMap<(&'a str, Option<i32>, bool), usize> {
+    let mut t: BTreeMap<(&str, Option<i32>, bool), usize> = BTreeMap::new();
     for c in cs.iter().filter(|c| !c.restarted) {
-        *t.entry((c.endpoint.as_str(), c.failed_errno)).or_default() += 1;
+        // `denied` is part of the key: an allowed and a refused connection to
+        // the same endpoint are different events, and merging them would hide
+        // the refusal behind a count.
+        *t.entry((c.endpoint.as_str(), c.failed_errno, c.denied))
+            .or_default() += 1;
     }
     t
 }
@@ -600,15 +615,17 @@ fn shorten(target: &str, width: usize) -> String {
 
 /// Render one endpoint line: destination, failure reason when there is one,
 /// and a repeat count.
-fn edge(endpoint: &str, err: Option<i32>, count: usize) -> String {
+fn edge(endpoint: &str, err: Option<i32>, count: usize, denied: bool) -> String {
     let times = if count > 1 {
         format!(" x{count}")
     } else {
         String::new()
     };
+    // A broker refusal leads, because it is the thing a reader is looking for.
+    let prefix = if denied { "DENIED " } else { "" };
     match err {
-        Some(e) => format!("{endpoint} ({}){times}", errno_label(e)),
-        None => format!("{endpoint}{times}"),
+        Some(e) => format!("{prefix}{endpoint} ({}){times}", errno_label(e)),
+        None => format!("{prefix}{endpoint}{times}"),
     }
 }
 
@@ -640,6 +657,7 @@ mod tests {
             failed_errno: None,
             restarted: false,
             comm: None,
+            denied: false,
         }
     }
 
@@ -1039,6 +1057,29 @@ mod tests {
             .unwrap();
         let head_at = t.lines.iter().position(|l| l.contains("head")).unwrap();
         assert!(head_at > miss_at + 1, "attached to the miss: {:?}", t.lines);
+    }
+
+    /// A refused connection is marked, and does not merge with an allowed one
+    /// to the same endpoint. Without this, a blocked exfiltration attempt reads
+    /// exactly like a successful fetch — in an artifact whose purpose is
+    /// showing what was stopped.
+    #[test]
+    fn a_denied_endpoint_is_marked_and_kept_separate() {
+        let mut ok = cn(600, None, "tcp 1.2.3.4:443", 1);
+        ok.comm = Some("curl".into());
+        let mut bad = cn(600, None, "tcp 1.2.3.4:443", 2);
+        bad.comm = Some("curl".into());
+        bad.denied = true;
+
+        let t = build_with_connects(&[], &[ok, bad], 0);
+        let edges: Vec<_> = t.lines.iter().filter(|l| l.contains("->")).collect();
+        assert_eq!(edges.len(), 2, "merged allow and deny: {:?}", edges);
+        assert!(edges.iter().any(|l| l.contains("DENIED")), "{:?}", edges);
+        assert!(
+            edges.iter().any(|l| !l.contains("DENIED")),
+            "lost the allow: {:?}",
+            edges
+        );
     }
 
     /// A connection whose owner the kernel named, but for which no exec record
