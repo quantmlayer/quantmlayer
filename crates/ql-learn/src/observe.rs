@@ -180,9 +180,21 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
     }
 
     // network — collect external endpoints for awareness; not domain-evaluated.
+    // "External" means it left the host. Link-local addresses did not: they are
+    // scoped to a single link and cannot be routed, so reporting one as an
+    // external endpoint overstates where the agent reached.
+    //
+    // IPv6 link-local (`fe80::/10`) was previously counted as external while
+    // IPv4's (`169.254.0.0/16`) was not — an asymmetry with real consequence on
+    // a dual-stack host, where IPv6 neighbour discovery and DHCPv6 traffic
+    // would have appeared as egress. `Ipv6Addr::is_unicast_link_local` is not
+    // stable on the pinned toolchain, so the prefix is matched directly.
     let is_external = |ip: &IpAddr| match ip {
         IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
-        IpAddr::V6(v6) => !v6.is_loopback(),
+        IpAddr::V6(v6) => {
+            let fe80 = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            !v6.is_loopback() && !fe80
+        }
     };
     for (ip, port) in &obs.connects {
         if is_external(ip) {
@@ -203,6 +215,32 @@ pub fn evaluate(obs: &Observation, profile: &Profile) -> ObserveReport {
 
 #[cfg(test)]
 mod tests {
+
+    /// Link-local addresses never left the host, so neither family counts as
+    /// external. IPv6's was previously counted while IPv4's was not — on a
+    /// dual-stack host that reported neighbour-discovery traffic as egress.
+    #[test]
+    fn link_local_is_not_external_in_either_family() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let ext = |ip: IpAddr| match ip {
+            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                let fe80 = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                !v6.is_loopback() && !fe80
+            }
+        };
+        // Link-local: not external.
+        assert!(!ext(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(!ext("fe80::1".parse::<Ipv6Addr>().unwrap().into()));
+        assert!(!ext("febf::1".parse::<Ipv6Addr>().unwrap().into()));
+        // Loopback: not external.
+        assert!(!ext(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!ext(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // Routable, including addresses just outside fe80::/10.
+        assert!(ext(IpAddr::V4(Ipv4Addr::new(151, 101, 2, 137))));
+        assert!(ext("2607:6bc0::10".parse::<Ipv6Addr>().unwrap().into()));
+        assert!(ext("fec0::1".parse::<Ipv6Addr>().unwrap().into()));
+    }
     use super::*;
     use ql_profile::{ExecDigest, HashAlgo};
 

@@ -258,6 +258,15 @@ log that `verify.py` checks, and neither file carries a hash of its own.
   undetermined. Calls the kernel restarted after a signal are collapsed, so a
   count is distinct calls rather than attempts.
 
+  **Name resolution may be invisible.** Endpoints come from `connect`, so a
+  resolver reached over UDP appears (`udp 8.8.8.8:53`) but one reached through a
+  local daemon over a unix socket — `systemd-resolved`, `nscd` — does not:
+  there is no `connect` to observe. On such a host a run shows the addresses an
+  agent reached with nothing about how it learned them, and **the absence of
+  DNS in a tree does not mean the agent resolved nothing**. Observed on a GCP
+  host: eight endpoints, no port-53 traffic at all. Capturing that path needs
+  the unix-socket traffic itself, which is not built.
+
   Caveats worth knowing: observe records
   the parent is read from `/proc` at
   the syscall stop, so a process re-parented after its parent exited reports
