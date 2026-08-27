@@ -287,7 +287,45 @@ int BPF_PROG(enforce_exec, struct linux_binprm *bprm, int ret)
         }
         e->allowed = allow;
         e->hashed = hashed;
-        bpf_get_current_comm(e->comm, sizeof(e->comm));
+        // The program being exec'd, not the one calling exec.
+        //
+        // `bprm_check_security` runs *before* the new image is installed, so
+        // `bpf_get_current_comm` here still returns the caller — every process
+        // in an enforce-mode tree was labelled `ql`, the launcher, rather than
+        // the binary that actually ran. The digest was right; only the name a
+        // reader sees was wrong, which is the worst kind of wrong in an
+        // artifact about provenance.
+        //
+        // `bprm->filename` is the path being executed. Take its basename, or
+        // fall back to the caller's comm if it cannot be read.
+        {
+            const char *fname = BPF_CORE_READ(bprm, filename);
+            char path[COMM_LEN] = {};
+            long n = 0;
+            if (fname)
+                n = bpf_probe_read_kernel_str(path, sizeof(path), fname);
+            if (n > 1) {
+                // Walk back to the last '/' to get the basename. Bounded by
+                // COMM_LEN so the verifier can prove termination.
+                int start = 0;
+                for (int i = 0; i < COMM_LEN - 1; i++) {
+                    if (path[i] == '\0')
+                        break;
+                    if (path[i] == '/')
+                        start = i + 1;
+                }
+                for (int i = 0; i < COMM_LEN - 1; i++) {
+                    int src = start + i;
+                    if (src >= COMM_LEN - 1)
+                        break;
+                    e->comm[i] = path[src];
+                    if (path[src] == '\0')
+                        break;
+                }
+            } else {
+                bpf_get_current_comm(e->comm, sizeof(e->comm));
+            }
+        }
         bpf_ringbuf_submit(e, 0);
     }
 
