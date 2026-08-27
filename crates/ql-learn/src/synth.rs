@@ -124,11 +124,15 @@ pub fn synthesize(obs: &Observation) -> SynthResult {
     }
 
     // --- Processes ---
+    // Only programs that actually ran. A PATH search `execve`s once per
+    // directory and most of those return ENOENT, so `execs` holds paths that
+    // never existed; allow-listing them is meaningless, and counting them as
+    // binaries we failed to hash suppressed `exec.enforce` on any project whose
+    // tooling walks a PATH. Observed on a real `npm install`: 16 of 26.
     let allow_exec: Vec<String> = obs
-        .execs
-        .iter()
+        .executed_paths()
+        .into_iter()
         .filter(|p| p.starts_with('/'))
-        .cloned()
         .collect();
 
     // --- Content-addressed exec ---

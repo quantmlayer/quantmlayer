@@ -275,6 +275,31 @@ impl Observation {
         }
     }
 
+    /// The programs that actually ran: every path with at least one `execve`
+    /// that did not fail.
+    ///
+    /// A PATH search calls `execve` once per directory and most of those return
+    /// `ENOENT`, so `execs` contains paths that never existed. Hashing those
+    /// produces a "could not hash" note per candidate and, worse, counts them
+    /// against the proportion of binaries resolved — which suppressed
+    /// `exec.enforce` on any project whose tooling walks a PATH. Observed on a
+    /// real `npm install`: 16 of 26 "executed binaries" had never run.
+    ///
+    /// Falls back to the full set when no event carries an outcome, so an
+    /// observation recorded before failure tracking behaves as it did.
+    pub fn executed_paths(&self) -> BTreeSet<String> {
+        if self.exec_events.is_empty() {
+            return self.execs.clone();
+        }
+        let mut ran: BTreeSet<String> = BTreeSet::new();
+        for ev in self.exec_events.iter().filter(|e| !e.failed) {
+            ran.insert(ev.path.clone());
+        }
+        // The root entry point is recorded before any exit stop is seen, so it
+        // is never marked failed; anything else absent here truly did not run.
+        ran
+    }
+
     /// Mark the most recent exec recorded for `pid` as failed.
     ///
     /// Called from the syscall *exit* stop, where the return value is known;
@@ -355,6 +380,40 @@ impl Observation {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local(),
             IpAddr::V6(v6) => !v6.is_loopback(),
         })
+    }
+}
+
+#[cfg(test)]
+mod executed_paths_tests {
+    use super::*;
+
+    /// A PATH-search candidate never ran, so it belongs in neither the exec
+    /// allow-list nor the count of binaries to resolve. Including them produced
+    /// a note per candidate and left `exec.enforce` off on any project whose
+    /// tooling walks a PATH.
+    #[test]
+    fn path_search_misses_are_not_executed_paths() {
+        let mut o = Observation::default();
+        o.record_exec("/usr/local/bin/node".into(), 10, None, 1);
+        o.mark_last_exec_failed(10);
+        o.record_exec("/usr/sbin/node".into(), 10, None, 1);
+        o.mark_last_exec_failed(10);
+        o.record_exec("/usr/bin/node".into(), 10, None, 1);
+
+        let ran = o.executed_paths();
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        assert!(ran.contains("/usr/bin/node"));
+        // The full set still holds every candidate; only the filtered view drops them.
+        assert_eq!(o.execs.len(), 3);
+    }
+
+    /// An observation with no per-event outcomes behaves as it did before
+    /// failure tracking existed, rather than reporting that nothing ran.
+    #[test]
+    fn an_observation_without_events_falls_back_to_the_set() {
+        let mut o = Observation::default();
+        o.execs.insert("/usr/bin/node".into());
+        assert_eq!(o.executed_paths().len(), 1);
     }
 }
 

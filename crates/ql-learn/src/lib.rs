@@ -54,7 +54,7 @@ pub fn learn(command: &[String]) -> Result<LearnOutcome> {
     // Turn the observed exec *paths* into content digests before synthesis, so
     // the learned profile can pin the agent's executable set by content. This
     // is the bridge to kernel-side content-addressed exec enforcement.
-    let (digests, mut notes) = digest::hash_executables(&observation.execs);
+    let (digests, mut notes) = digest::hash_executables(&observation.executed_paths());
     observation.exec_digests = digests;
 
     let SynthResult {
@@ -91,7 +91,7 @@ pub fn observe_trace(command: &[String]) -> Result<Observation> {
     let mut observation = trace::trace(command)?;
     let interpreters = shim::resolve_shim_interpreters(&observation.execs);
     observation.execs.extend(interpreters);
-    let (digests, _notes) = digest::hash_executables(&observation.execs);
+    let (digests, _notes) = digest::hash_executables(&observation.executed_paths());
     observation.exec_digests = digests;
     Ok(observation)
 }
