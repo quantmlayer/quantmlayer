@@ -492,6 +492,49 @@ impl ExecEnforcer {
     /// Best-effort by construction: if the kernel ring filled (a very busy
     /// cell), the producer dropped the overflow rather than blocking execs, so
     /// this returns what the ring retained.
+    /// Drain exec decisions and label each with the program that actually ran.
+    ///
+    /// The decision event is emitted at `bprm_check_security`, *before* the new
+    /// image is installed, so the comm it carries is the process that called
+    /// `execve` — the launcher, not the launched. Correcting that in-kernel
+    /// means parsing the path there, and a scan wide enough for real paths
+    /// exceeds the verifier's instruction budget outright.
+    ///
+    /// `sched_process_exec` fires after the commit and already streams the
+    /// committed argv, correlated to the same digest. `argv[0]` is what the
+    /// program calls itself, which is the conventional display name — `ps`
+    /// shows the same thing. **The digest remains the truth**; this only fixes
+    /// the label, and a program that lies about `argv[0]` changes what it is
+    /// called here and nothing about what was allowed.
+    pub fn drain_events_labelled(&self) -> Result<Vec<ExecRecord>, LsmError> {
+        let mut events = self.drain_events()?;
+        let argv = self.drain_argv().unwrap_or_default();
+        if argv.is_empty() {
+            return Ok(events);
+        }
+
+        // Key on (pid, digest): a pid can exec several times in a run, and the
+        // digest distinguishes those without needing ordering.
+        let mut names: std::collections::HashMap<(u32, String), String> =
+            std::collections::HashMap::new();
+        for a in &argv {
+            let Some(arg0) = a.argv.first() else { continue };
+            let base = arg0.rsplit('/').next().unwrap_or(arg0);
+            if base.is_empty() {
+                continue;
+            }
+            names.insert((a.pid, a.digest_hex.clone()), base.to_string());
+        }
+
+        for e in &mut events {
+            let Some(d) = &e.digest_hex else { continue };
+            if let Some(name) = names.get(&(e.pid, d.clone())) {
+                e.comm = name.clone();
+            }
+        }
+        Ok(events)
+    }
+
     pub fn drain_events(&self) -> Result<Vec<ExecRecord>, LsmError> {
         // Reference points captured once: every event's monotonic ktime is
         // mapped to wall-clock against these.

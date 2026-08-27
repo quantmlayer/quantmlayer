@@ -296,7 +296,9 @@ pub fn drain_exec_events() -> Vec<ql_lsm::ExecRecord> {
         .unwrap_or_else(|e| e.into_inner())
         .take();
     match enforcer {
-        Some(e) => e.drain_events().unwrap_or_default(),
+        // Labelled: the decision event's own comm names the launcher, not the
+        // launched. See `drain_events_labelled`.
+        Some(e) => e.drain_events_labelled().unwrap_or_default(),
         None => Vec::new(),
     }
 }
